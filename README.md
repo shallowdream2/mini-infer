@@ -1,311 +1,116 @@
-# Mini-Infer: High-Performance LLM Inference Engine 🚀
+# Mini-Infer
 
-<div align="center">
+这个文件用于说明项目的最终目标、当前状态、Ubuntu 工作方式和后续阶段边界。
 
-[![Python](https://img.shields.io/badge/Python-3.10%20%7C%203.11-blue.svg)](https://www.python.org/)
-[![CUDA](https://img.shields.io/badge/CUDA-11.8%2B-green.svg)](https://developer.nvidia.com/cuda-toolkit)
-[![License](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Triton](https://img.shields.io/badge/Triton-2.1+-orange.svg)](https://github.com/openai/triton)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg)](https://github.com/psf/black)
-[![Tests](https://github.com/psmarter/mini-infer/actions/workflows/tests.yml/badge.svg)](https://github.com/psmarter/mini-infer/actions/workflows/tests.yml)
-[![Lint](https://github.com/psmarter/mini-infer/actions/workflows/lint.yml/badge.svg)](https://github.com/psmarter/mini-infer/actions/workflows/lint.yml)
-[![GitHub stars](https://img.shields.io/github/stars/psmarter/mini-infer?style=social)](https://github.com/psmarter/mini-infer/stargazers)
-[![GitHub forks](https://img.shields.io/github/forks/psmarter/mini-infer?style=social)](https://github.com/psmarter/mini-infer/network/members)
+## 项目题目
 
-**A lightweight yet powerful LLM inference engine with PagedAttention**
+基于 PagedAttention 的高性能大模型推理引擎
 
-**基于PagedAttention的轻量级高性能大模型推理引擎**
+## 当前状态
 
-*Inspired by vLLM, optimized for learning and performance*
+当前仓库仍处于初级骨架阶段，正式的推理系统实现还没有开始。
 
-[English](#english) | [中文](#chinese)
+目前只保留了：
 
-</div>
+- 最小代码结构
+- 最小 smoke test
+- 最小 benchmark 入口
+- Claude Code 协作配置
 
----
+当前代码不能代表已经完成的 `PagedAttention`、`Continuous Batching` 或高性能推理实现。
 
-<a name="english"></a>
+## 当前默认前提
 
-## 🌟 Features
+- 当前协作默认假设：你已经位于 Ubuntu 24.04 项目终端内，而不是站在 Windows 侧做远程控制
+- 当前开发默认直接复用 [本地资料/环境配置/AI-Infra学习之旅-服务器环境配置.md](本地资料/环境配置/AI-Infra学习之旅-服务器环境配置.md) 中已经配置完成的 `ai-infra` 环境
+- 只做代码阅读、骨架开发和单元测试时，可以没有 GPU
+- 真实模型推理、benchmark、多卡实验仍然需要 CUDA GPU、模型权重和对应依赖
 
-### Core Capabilities
+## Ubuntu 快速开始
 
-- ⚡ **High Performance**: Target 85-90% of vLLM throughput
-- 💾 **Memory Efficient**: PagedAttention-based KV Cache management
-- 🔧 **Custom Kernels**: Optimized Triton implementations (5-8x faster than PyTorch)
-- 📊 **Continuous Batching**: Dynamic request scheduling for better throughput
-- 🎯 **Well-Tested**: Comprehensive unit tests (target 85%+ coverage)
-
-### Technical Highlights
-
-```python
-# Performance Targets
-RMSNorm Kernel:      5-8x speedup vs PyTorch
-Memory Utilization:  85%+ (PagedAttention)
-End-to-End:          80-90% of vLLM performance
-```
-
----
-
-## 🚀 Quick Start
-
-### Installation
+### 直接复用现有环境
 
 ```bash
-# Clone repository
-git clone https://github.com/psmarter/mini-infer.git
-cd mini-infer
-
-# Create virtual environment
-conda create -n mini-infer python=3.10
-conda activate mini-infer
-
-# Install dependencies (coming soon)
-pip install -r requirements.txt
+conda activate ai-infra
+python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())"
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py
 ```
 
-### Basic Usage (Preview)
-
-```python
-from mini_infer import LLMEngine
-from mini_infer.config import EngineConfig
-
-# Initialize engine
-config = EngineConfig(
-    model="meta-llama/Llama-2-7b-hf",
-    max_num_seqs=64,
-    block_size=16
-)
-engine = LLMEngine(config)
-
-# Generate
-prompts = ["Hello, how are you?"]
-outputs = engine.generate(prompts, max_tokens=100)
-print(outputs[0].text)
-```
-
----
-
-## 📊 Performance Benchmarks (Coming Soon)
-
-### Target Performance
-
-| Component | Baseline | Mini-Infer | Target Speedup |
-|-----------|----------|------------|----------------|
-| RMSNorm Kernel | PyTorch | Triton | 5-8x |
-| RoPE Kernel | PyTorch | Triton | 6-8x |
-| Memory Util | 40% | PagedAttention | 85%+ |
-| Throughput | Static Batch | Continuous Batch | 2-3x |
-
----
-
-## 🏗️ Architecture
-
-```
-┌─────────────────────────────────────┐
-│         LLM Engine                  │
-├─────────────────────────────────────┤
-│  ┌──────────┐    ┌──────────┐      │
-│  │Scheduler │───▶│Model     │      │
-│  │(C-Batch) │    │Runner    │      │
-│  └──────────┘    └──────────┘      │
-├─────────────────────────────────────┤
-│     Memory Management               │
-│  ┌──────────────────────────┐      │
-│  │  Block Manager           │      │
-│  │  (PagedAttention)        │      │
-│  └──────────────────────────┘      │
-├─────────────────────────────────────┤
-│     Custom Kernels (Triton)         │
-│  ┌───────┐ ┌────┐ ┌──────────┐    │
-│  │RMSNorm│ │RoPE│ │Attention │    │
-│  └───────┘ └────┘ └──────────┘    │
-└─────────────────────────────────────┘
-```
-
----
-
-## 📈 Roadmap
-
-### Phase 1: Foundation (Weeks 1-2) ✅
-
-- [x] Project structure
-- [x] Basic documentation
-- [ ] Development environment setup
-
-### Phase 2: Core Implementation (Weeks 3-8)
-
-- [ ] Triton kernels (RMSNorm, RoPE)
-- [ ] PagedAttention Block Manager
-- [ ] Continuous Batching Scheduler
-- [ ] End-to-end inference engine
-
-### Phase 3: Performance & Testing (Weeks 9-10)
-
-- [ ] Comprehensive benchmarks
-- [ ] Unit tests (85%+ coverage)
-- [ ] Performance optimization
-
-### Phase 4: Documentation & Polish (Weeks 11-12)
-
-- [ ] API documentation
-- [ ] Usage examples
-- [ ] Technical blog posts
-
----
-
-## 🤝 Contributing
-
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
----
-
-## 📄 License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
----
-
-## 🙏 Acknowledgments
-
-This project is inspired by and learns from:
-
-- [vLLM](https://github.com/vllm-project/vllm) - PagedAttention and continuous batching
-- [FlashAttention](https://github.com/Dao-AILab/flash-attention) - Efficient attention mechanisms
-- [Triton](https://github.com/openai/triton) - GPU programming framework
-
----
-
-<a name="chinese"></a>
-
-## 🌟 核心特性
-
-### 主要功能
-
-- ⚡ **高性能**: 目标达到vLLM 85-90%的吞吐量
-- 💾 **显存优化**: 基于PagedAttention的KV Cache管理
-- 🔧 **自定义算子**: 优化的Triton实现 (比PyTorch快5-8倍)
-- 📊 **连续批处理**: 动态请求调度，提升吞吐量
-- 🎯 **测试完善**: 完整的单元测试 (目标覆盖率85%+)
-
-### 技术亮点
-
-```python
-# 性能目标
-RMSNorm算子:     相比PyTorch加速5-8倍
-显存利用率:       85%+ (PagedAttention)
-端到端性能:       vLLM的80-90%
-```
-
----
-
-## 🚀 快速开始
-
-### 安装
+### 真实 GPU 运行与 benchmark
 
 ```bash
-# 克隆仓库
-git clone https://github.com/YOUR_USERNAME/mini-infer.git
-cd mini-infer
-
-# 创建虚拟环境
-conda create -n mini-infer python=3.10
-conda activate mini-infer
-
-# 安装依赖 (即将推出)
-pip install -r requirements.txt
+conda activate ai-infra
+nvidia-smi
+python benchmarks/benchmark_hf.py --model Qwen/Qwen2.5-7B-Instruct --batch-size 1 --max-new-tokens 32
 ```
 
-### 基础使用 (预览)
+- 如果当前环境里缺少项目依赖，再直接安装到现有 `ai-infra` 环境，不默认新建环境
+- 如果当前环境真的损坏，再回到环境文章中的对应步骤修复，而不是先新建一个并行环境
+- benchmark 前确认模型权重可访问，例如已完成 HuggingFace 登录或本地已有权重
+- 没有 Ubuntu + CUDA 实测数据时，不写性能结论
 
-```python
-from mini_infer import LLMEngine
-from mini_infer.config import EngineConfig
+## 最终目标
 
-# 初始化引擎
-config = EngineConfig(
-    model="meta-llama/Llama-2-7b-hf",
-    max_num_seqs=64,
-    block_size=16
-)
-engine = LLMEngine(config)
+在单机双 `RTX 4090` 环境下，面向 `Qwen2.5` 这一类 `decoder-only` 大模型，实现一个基于 `PagedAttention` 的高性能推理引擎。该引擎支持块化 `KV Cache`、`Block Table` 映射、`Prefill / Decode` 分离、`Continuous Batching` 和流式生成，并在真实 benchmark 中相较 `HuggingFace Transformers` baseline 展现更好的吞吐、显存利用率和并发承载能力。
 
-# 生成文本
-prompts = ["你好，最近怎么样？"]
-outputs = engine.generate(prompts, max_tokens=100)
-print(outputs[0].text)
+## 验收标准
+
+- 能稳定跑通单卡 `Qwen2.5-7B`
+- 支持多请求和不同长度 prompt 的并发生成
+- `KV Cache` 采用分页块管理，而不是简单连续缓存
+- 具备 `Prefill / Decode` 两条执行路径
+- 具备 `Continuous Batching` 调度器
+- 提供可复现 benchmark，至少覆盖 `throughput`、`TTFT`、`TPOT`、`peak memory`
+- 相较 `HuggingFace Transformers` baseline，在吞吐、显存峰值、并发承载能力中至少两项有明显收益
+
+## 开发与运行环境
+
+### 主开发环境
+
+- Ubuntu 24.04 LTS
+- bash
+- Python 3.10+
+
+### 目标运行环境
+
+- Ubuntu 24.04 LTS
+- 2 × NVIDIA GeForce RTX 4090
+
+### 约束
+
+- 当前默认已经在 Ubuntu 项目环境内工作，不再以 Windows Remote SSH 为前提
+- 真实模型运行、性能测试和多卡实验默认在 Ubuntu + CUDA 环境进行
+- 没有 Ubuntu GPU 实测数据时，不写性能结论
+
+## 阶段目标
+
+### 第一阶段
+
+- 完成单卡最小推理链路
+- 跑通真实模型加载和 `generate()`
+- 建立基础 benchmark
+
+### 第二阶段
+
+- 实现 `Paged KV Cache`
+- 实现 `Prefill / Decode` 分离
+- 实现 `Continuous Batching`
+
+### 第三阶段
+
+- 做单机双卡扩展
+- 优先考虑双卡 `replica` 提升总吞吐
+- 评估是否继续做 `TP=2`
+
+## 当前目录
+
+```text
+mini_infer/   核心代码骨架
+benchmarks/   benchmark 骨架
+tests/        最小测试骨架
+.claude/      Claude Code 规则、skills 和项目设置
+CLAUDE.md     Claude Code 项目级协作说明
+本地资料/     个人记录与知识整理，不上传 Git
 ```
-
----
-
-## 📊 性能基准测试 (即将推出)
-
-### 目标性能
-
-| 组件 | 基准 | Mini-Infer | 目标加速比 |
-|------|------|------------|-----------|
-| RMSNorm算子 | PyTorch | Triton | 5-8x |
-| RoPE算子 | PyTorch | Triton | 6-8x |
-| 显存利用率 | 40% | PagedAttention | 85%+ |
-| 吞吐量 | 静态批处理 | 连续批处理 | 2-3x |
-
----
-
-## 📈 开发路线图
-
-### 阶段1: 基础建设 (第1-2周) ✅
-
-- [x] 项目结构
-- [x] 基础文档
-- [ ] 开发环境配置
-
-### 阶段2: 核心实现 (第3-8周)
-
-- [ ] Triton算子 (RMSNorm, RoPE)
-- [ ] PagedAttention块管理器
-- [ ] 连续批处理调度器
-- [ ] 端到端推理引擎
-
-### 阶段3: 性能与测试 (第9-10周)
-
-- [ ] 完整的基准测试
-- [ ] 单元测试 (覆盖率85%+)
-- [ ] 性能优化
-
-### 阶段4: 文档与完善 (第11-12周)
-
-- [ ] API文档
-- [ ] 使用示例
-- [ ] 技术博客
-
----
-
-## 🤝 贡献指南
-
-欢迎贡献！请查看 [CONTRIBUTING.md](CONTRIBUTING.md) 了解详情。
-
----
-
-## 📄 开源协议
-
-本项目采用MIT协议 - 详见 [LICENSE](LICENSE) 文件。
-
----
-
-## 🙏 致谢
-
-本项目受以下优秀开源项目启发：
-
-- [vLLM](https://github.com/vllm-project/vllm) - PagedAttention和连续批处理
-- [FlashAttention](https://github.com/Dao-AILab/flash-attention) - 高效注意力机制
-- [Triton](https://github.com/openai/triton) - GPU编程框架
-
----
-
-<div align="center">
-
-**⭐ 如果这个项目对你有帮助，请给个Star! ⭐**
-
-**⭐ If you find this project helpful, please star it! ⭐**
-
-</div>

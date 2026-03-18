@@ -1,3 +1,4 @@
+# 这个文件定义 mini-infer 当前初级骨架的打包和测试基础配置。
 [build-system]
 requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -5,126 +6,23 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-infer"
 version = "0.1.0"
-description = "A high-performance LLM inference engine with PagedAttention"
+description = "Ubuntu-first scaffold for a future high-performance LLM inference engine"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = { text = "MIT" }
 authors = [
-    {name = "Smarter", email = "smarter.shh1104@gmail.com"}
-]
-keywords = [
-    "llm",
-    "inference",
-    "deep-learning",
-    "machine-learning",
-    "cuda",
-    "triton",
-    "pagedattention",
-    "pytorch"
-]
-classifiers = [
-    "Development Status :: 3 - Alpha",
-    "Intended Audience :: Developers",
-    "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    { name = "pc" }
 ]
 dependencies = [
-    "torch>=2.0.0",
-    "transformers>=4.35.0",
-    "triton>=2.1.0",
-    "numpy>=1.24.0",
-    "tqdm>=4.65.0",
+    "torch>=2.1.2",
+    "transformers>=4.36.2",
 ]
 
 [project.optional-dependencies]
 dev = [
-    "pytest>=7.4.0",
-    "pytest-cov>=4.1.0",
-    "black>=23.0.0",
-    "flake8>=6.0.0",
-    "mypy>=1.5.0",
-    "isort>=5.12.0",
-    "pre-commit>=3.0.0",
-]
-benchmark = [
-    "pandas>=2.0.0",
-    "matplotlib>=3.7.0",
-    "seaborn>=0.12.0",
-]
-all = [
-    "mini-infer[dev,benchmark]",
+    "pytest>=8.0.0",
 ]
 
-[project.urls]
-Homepage = "https://github.com/psmarter/mini-infer"
-Repository = "https://github.com/psmarter/mini-infer"
-Issues = "https://github.com/psmarter/mini-infer/issues"
-Documentation = "https://github.com/psmarter/mini-infer#readme"
-
-# Black configuration
-[tool.black]
-line-length = 100
-target-version = ['py310', 'py311']
-include = '\.pyi?$'
-extend-exclude = '''
-/(
-  # directories
-  \.eggs
-  | \.git
-  | \.hg
-  | \.mypy_cache
-  | \.tox
-  | \.venv
-  | _build
-  | buck-out
-  | build
-  | dist
-)/
-'''
-
-# Note: isort and mypy configurations removed for simplicity
-# Add them back when the project matures
-
-# pytest configuration
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
-python_classes = ["Test*"]
-python_functions = ["test_*"]
-addopts = [
-    "--verbose",
-    "--cov=mini_infer",
-    "--cov-report=term-missing",
-    "--cov-report=html",
-    "--cov-report=xml",
-    "--cov-fail-under=0",  # Will increase as tests are added
-]
-markers = [
-    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
-    "gpu: marks tests that require GPU (deselect with '-m \"not gpu\"')",
-    "integration: marks tests as integration tests",
-]
-
-# coverage configuration
-[tool.coverage.run]
-source = ["mini_infer"]
-omit = [
-    "*/tests/*",
-    "*/__init__.py",
-]
-
-[tool.coverage.report]
-exclude_lines = [
-    "pragma: no cover",
-    "def __repr__",
-    "raise AssertionError",
-    "raise NotImplementedError",
-    "if __name__ == .__main__.:",
-    "if TYPE_CHECKING:",
-    "class .*\\bProtocol\\):",
-    "@(abc\\.)?abstractmethod",
-]
