@@ -1,116 +1,153 @@
 # Mini-Infer
 
-这个文件用于说明项目的最终目标、当前状态、Ubuntu 工作方式和后续阶段边界。
+这个文件说明 mini-infer 项目的目标、实现状态、性能数据和快速上手方式。
 
-## 项目题目
+## 项目概述
 
-基于 PagedAttention 的高性能大模型推理引擎
+mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统，从零实现了以下核心机制：
 
-## 当前状态
+- **Paged KV Cache**：BlockTable + 空闲块池，消除连续 KV 缓存的显存碎片
+- **Prefill / Decode 分离**：Prefill 单独 forward，Decode 步合并成 batch
+- **Continuous Batching**：每步动态准入，充分复用 GPU batch 带宽
+- **双卡扩展**：Replica 数据并行 + Pipeline Parallel（HF device_map）测量
 
-当前仓库仍处于初级骨架阶段，正式的推理系统实现还没有开始。
+项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。
 
-目前只保留了：
+## 性能数据
 
-- 最小代码结构
-- 最小 smoke test
-- 最小 benchmark 入口
-- Claude Code 协作配置
+环境：Ubuntu 24.04，RTX 4090，Qwen2.5-7B-Instruct float16，transformers 4.43.4。
 
-当前代码不能代表已经完成的 `PagedAttention`、`Continuous Batching` 或高性能推理实现。
+### 单卡吞吐（vs HF baseline，max_new_tokens=128）
 
-## 当前默认前提
+| 实现 | batch=1 | batch=4 | batch=8 |
+|------|---------|---------|---------|
+| HF Transformers baseline | 56 tok/s | ~196 tok/s | ~409 tok/s |
+| Phase 1（串行 decode） | 56 tok/s | 53 tok/s | 56 tok/s |
+| Phase 2（Paged KV + Batch Decode） | ~49 tok/s | ~131 tok/s | 201 tok/s |
+| **Phase 3（向量化 gather + DynamicCache）** | 54 tok/s | 194 tok/s | **361 tok/s（88.4% HF）** |
 
-- 当前协作默认假设：你已经位于 Ubuntu 24.04 项目终端内，而不是站在 Windows 侧做远程控制
-- 当前开发默认直接复用 [本地资料/环境配置/AI-Infra学习之旅-服务器环境配置.md](本地资料/环境配置/AI-Infra学习之旅-服务器环境配置.md) 中已经配置完成的 `ai-infra` 环境
-- 只做代码阅读、骨架开发和单元测试时，可以没有 GPU
-- 真实模型推理、benchmark、多卡实验仍然需要 CUDA GPU、模型权重和对应依赖
+Phase 1 在 batch=1 时与 HF 持平，但串行 decode 导致 batch=8 时吞吐仅为 HF 的 1/7.3。
+Phase 2 引入 Batch Decode 后吞吐大幅提升，主要瓶颈转移到 `gather_batch_kv` 的逐请求 KV 复制。
+Phase 3 将 `gather_batch_kv` 改为 PyTorch advanced indexing 向量化，batch=8 吞吐 +79.8%，达到 HF 的 88.4%。
 
-## Ubuntu 快速开始
+### 双卡扩展（Phase 4，batch=8，max_new_tokens=128）
 
-### 直接复用现有环境
+| 模式 | Throughput | GPU0 峰值显存 | GPU1 峰值显存 |
+|------|-----------|------------|------------|
+| single（Phase 3 基线） | 361.4 tok/s | 16.42 GB | — |
+| replica（双卡 Replica） | 376.1 tok/s | 16.31 GB | 16.31 GB |
+| tp2（HF Pipeline Parallel） | 361.5 tok/s | 7.00 GB | 8.97 GB |
+
+Replica batch=8 仅 +4.1%：batch=8 拆成 4+4 后，每卡 batch=4 效率（194 tok/s × 2 = 388）而单卡 batch=8 已达 361（388 的 93%），scaling 空间只有 7%。
+PP 吞吐持平，价值在于每卡显存减半（支持装不进单卡的大模型）。
+
+## 架构设计
+
+```
+engine.py           LLMEngine：continuous batching 主循环
+  ├── scheduler.py      Scheduler：waiting/running 队列管理
+  ├── kv_cache.py       KVCacheManager：Paged KV Cache（BlockTable + FreeBlockPool）
+  └── model_runner.py   ModelRunner：prefill + batch decode 执行
+
+replica_engine.py   ReplicaEngine：双卡数据并行（ThreadPoolExecutor）
+tp_engine.py        TPEngine：HF Pipeline Parallel（测量用，device_map="balanced"）
+```
+
+**decode_batch 关键步骤：**
+1. `gather_batch_kv`：从 block tensor 聚合各请求的历史 KV（Phase 3 向量化）
+2. DynamicCache 构造 + input 准备
+3. `model_forward`：一次 batch forward，等价于同时推进所有 active 请求的 decode
+4. `write_decode_kv`：将新 token KV 写回 block tensor
+
+## 快速开始
+
+### 环境要求
+
+- Ubuntu 24.04 + CUDA（benchmark 需要 GPU）
+- Conda 环境 `ai-infra`（Python 3.10+，transformers 4.40+，PyTorch 2.x）
+
+### 单卡 benchmark
 
 ```bash
 conda activate ai-infra
-python -c "import torch; print(torch.__version__); print(torch.cuda.is_available()); print(torch.cuda.device_count())"
-python -m pip install --upgrade pip
-python -m pip install -e ".[dev]"
-python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py
+export MODEL=/path/to/Qwen2.5-7B-Instruct   # 本地根目录路径（避免 HF snapshot 问题）
+export HF_HUB_OFFLINE=1
+
+# HuggingFace baseline
+python benchmarks/benchmark_hf.py --model $MODEL --batch-size 8 --max-new-tokens 128
+
+# mini-infer
+python benchmarks/benchmark_mini.py --model $MODEL --batch-size 8 --max-new-tokens 128
 ```
 
-### 真实 GPU 运行与 benchmark
+### 双卡 benchmark
 
 ```bash
-conda activate ai-infra
-nvidia-smi
-python benchmarks/benchmark_hf.py --model Qwen/Qwen2.5-7B-Instruct --batch-size 1 --max-new-tokens 32
+# Replica 模式（双卡数据并行）
+python benchmarks/benchmark_multi_gpu.py --model $MODEL --mode replica
+
+# Pipeline Parallel 模式（HF device_map="balanced"）
+python benchmarks/benchmark_multi_gpu.py --model $MODEL --mode tp2
 ```
 
-- 如果当前环境里缺少项目依赖，再直接安装到现有 `ai-infra` 环境，不默认新建环境
-- 如果当前环境真的损坏，再回到环境文章中的对应步骤修复，而不是先新建一个并行环境
-- benchmark 前确认模型权重可访问，例如已完成 HuggingFace 登录或本地已有权重
-- 没有 Ubuntu + CUDA 实测数据时，不写性能结论
+### decode_batch profiling（Phase 5）
 
-## 最终目标
-
-在单机双 `RTX 4090` 环境下，面向 `Qwen2.5` 这一类 `decoder-only` 大模型，实现一个基于 `PagedAttention` 的高性能推理引擎。该引擎支持块化 `KV Cache`、`Block Table` 映射、`Prefill / Decode` 分离、`Continuous Batching` 和流式生成，并在真实 benchmark 中相较 `HuggingFace Transformers` baseline 展现更好的吞吐、显存利用率和并发承载能力。
-
-## 验收标准
-
-- 能稳定跑通单卡 `Qwen2.5-7B`
-- 支持多请求和不同长度 prompt 的并发生成
-- `KV Cache` 采用分页块管理，而不是简单连续缓存
-- 具备 `Prefill / Decode` 两条执行路径
-- 具备 `Continuous Batching` 调度器
-- 提供可复现 benchmark，至少覆盖 `throughput`、`TTFT`、`TPOT`、`peak memory`
-- 相较 `HuggingFace Transformers` baseline，在吞吐、显存峰值、并发承载能力中至少两项有明显收益
-
-## 开发与运行环境
-
-### 主开发环境
-
-- Ubuntu 24.04 LTS
-- bash
-- Python 3.10+
-
-### 目标运行环境
-
-- Ubuntu 24.04 LTS
-- 2 × NVIDIA GeForce RTX 4090
-
-### 约束
-
-- 当前默认已经在 Ubuntu 项目环境内工作，不再以 Windows Remote SSH 为前提
-- 真实模型运行、性能测试和多卡实验默认在 Ubuntu + CUDA 环境进行
-- 没有 Ubuntu GPU 实测数据时，不写性能结论
-
-## 阶段目标
-
-### 第一阶段
-
-- 完成单卡最小推理链路
-- 跑通真实模型加载和 `generate()`
-- 建立基础 benchmark
-
-### 第二阶段
-
-- 实现 `Paged KV Cache`
-- 实现 `Prefill / Decode` 分离
-- 实现 `Continuous Batching`
-
-### 第三阶段
-
-- 做单机双卡扩展
-- 优先考虑双卡 `replica` 提升总吞吐
-- 评估是否继续做 `TP=2`
-
-## 当前目录
-
-```text
-mini_infer/   核心代码骨架
-benchmarks/   benchmark 骨架
-tests/        最小测试骨架
-.claude/      Claude Code 规则、skills 和项目设置
-CLAUDE.md     Claude Code 项目级协作说明
-本地资料/     个人记录与知识整理，不上传 Git
+```bash
+# 依赖上方已设置的 MODEL 和 HF_HUB_OFFLINE=1
+python benchmarks/profile_decode.py --model $MODEL --batch-size 4 --decode-steps 20
 ```
+
+输出 `gather_batch_kv / model_forward / write_decode_kv` 各自的 CUDA 时间占比。
+
+### 单元测试（无 GPU）
+
+```bash
+python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py tests/test_replica_engine.py
+```
+
+## 项目结构
+
+```
+mini_infer/              核心推理代码
+  engine.py              LLMEngine + continuous batching 主循环
+  kv_cache.py            Paged KV Cache（BlockTable + FreeBlockPool）
+  model_runner.py        ModelRunner（prefill + batch decode，含 profiler 标签）
+  scheduler.py           请求调度器（waiting/running 队列）
+  config.py              EngineConfig 数据类
+  request.py             Request / RequestState / SamplingParams
+  replica_engine.py      ReplicaEngine（双卡数据并行）
+  tp_engine.py           TPEngine（HF Pipeline Parallel，测量用）
+
+benchmarks/
+  benchmark_hf.py        HuggingFace Transformers baseline
+  benchmark_mini.py      mini-infer 单卡 benchmark
+  benchmark_multi_gpu.py 双卡 benchmark（replica/tp2）
+  profile_decode.py      decode_batch 内部 profiling（Phase 5）
+
+tests/                   单元测试（dry_run，无 GPU）
+  test_smoke.py
+  test_kv_cache.py
+  test_scheduler.py
+  test_replica_engine.py
+
+.claude/                 Claude Code 协作配置
+CLAUDE.md                项目级协作规则
+本地资料/                实验记录、博客草稿、知识整理（不上传 Git）
+```
+
+## 开发阶段
+
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| Phase 1 | 单卡最小推理链路（真实模型加载、串行 decode、HF baseline 对比） | ✅ 完成 |
+| Phase 2 | Paged KV Cache + Prefill/Decode 分离 + Continuous Batching | ✅ 完成 |
+| Phase 3 | gather_batch_kv 向量化 + DynamicCache 迁移（batch=8 吞吐 +79.8%） | ✅ 完成 |
+| Phase 4 | 双卡扩展（Replica + HF Pipeline Parallel） | ✅ 完成 |
+| Phase 5 | Profiling + 技术总结 | ✅ 完成 |
+
+## 工作环境说明
+
+- 当前协作默认假设：已位于 Ubuntu 24.04 项目终端内
+- 当前开发复用 `ai-infra` Conda 环境，不默认新建环境
+- 真实模型推理、benchmark、多卡实验需要 CUDA GPU、模型权重和对应依赖
+- 模型加载建议使用 `HF_HUB_OFFLINE=1` + 本地绝对路径（避免 HF snapshot 缺失触发重下载）

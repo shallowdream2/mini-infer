@@ -11,3 +11,4 @@ dist/
 .vscode/
 htmlcov/
 .coverage
+.claude/settings.local.json

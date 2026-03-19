@@ -1,4 +1,4 @@
-# 这个文件定义 mini-infer 当前初级骨架的打包和测试基础配置。
+# 这个文件定义 mini-infer 的打包和测试基础配置。
 [build-system]
 requires = ["setuptools>=65.0", "wheel"]
 build-backend = "setuptools.build_meta"
@@ -14,14 +14,17 @@ authors = [
     { name = "pc" }
 ]
 dependencies = [
-    "torch>=2.1.2",
-    "transformers>=4.36.2",
+    "torch>=2.2.0",
+    "transformers>=4.40.0,<5.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["mini_infer*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

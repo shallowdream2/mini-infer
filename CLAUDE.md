@@ -4,32 +4,30 @@
 
 ## 项目定位
 
-这是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统项目，最终目标是实现：
+这是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学习项目，实现并验证了：
 
-- `Paged KV Cache`
-- `Block Table`
+- `Paged KV Cache`（BlockTable + FreeBlockPool + block tensor 池）
 - `Prefill / Decode` 分离
-- `Continuous Batching`
-- 真实 benchmark
+- `Continuous Batching`（动态准入调度）
+- 向量化 KV Gather（PyTorch advanced indexing）
+- 双卡扩展（Replica 数据并行 + HF Pipeline Parallel 测量）
+- 真实 benchmark（对照 HF Transformers baseline）
+
+**注意**：本项目实现的是 Paged KV Cache + DynamicCache 接口，**不是真正的 PagedAttention**（真正的 PagedAttention 需要 flash_attn 2.5+ 的 block_tables，让 attention kernel 直接从 block tensor 寻址，不需要 gather 到 dense tensor）。
 
 ## 当前状态
 
-当前仓库仍处于初级骨架阶段。
+5 个阶段已全部完成（2026-03-19）：
 
-- 核心代码大多是桩实现
-- benchmark 仍是骨架
-- 测试只覆盖最小 smoke 逻辑
-- 真实模型推理、真实 KV cache 和真实调度器尚未开始正式实现
+| 阶段 | 内容 | 状态 |
+|------|------|------|
+| Phase 1 | 单卡最小推理链路 | ✅ |
+| Phase 2 | Paged KV Cache + Batch Decode + Continuous Batching | ✅ |
+| Phase 3 | 向量化 gather_batch_kv + DynamicCache（batch=8 达到 HF 的 88.4%）| ✅ |
+| Phase 4 | 双卡扩展（Replica + HF PP）| ✅ |
+| Phase 5 | Profiling + 项目收尾 | ✅ |
 
-## 当前优先级
-
-1. 单卡真实模型推理链路
-2. `HuggingFace` baseline benchmark
-3. `Paged KV Cache`
-4. `Continuous Batching`
-5. 双卡扩展
-
-未被明确要求时，不要提前进入后续阶段。
+如果继续开发，下一步方向参考 `本地资料/Claude计划/00-长期路线图.md`。
 
 ## 环境事实
 
@@ -59,15 +57,17 @@
 
 核心代码位于：
 
-- `mini_infer/config.py`
-- `mini_infer/request.py`
-- `mini_infer/scheduler.py`
-- `mini_infer/kv_cache.py`
-- `mini_infer/model_runner.py`
-- `mini_infer/engine.py`
+- `mini_infer/config.py` — EngineConfig 数据类
+- `mini_infer/request.py` — Request / RequestState / SamplingParams
+- `mini_infer/scheduler.py` — 请求调度器（waiting/running 队列）
+- `mini_infer/kv_cache.py` — Paged KV Cache（BlockTable + FreeBlockPool）
+- `mini_infer/model_runner.py` — ModelRunner（prefill + batch decode，含 profiler 标签）
+- `mini_infer/engine.py` — LLMEngine（continuous batching 主循环）
+- `mini_infer/replica_engine.py` — ReplicaEngine（双卡数据并行）
+- `mini_infer/tp_engine.py` — TPEngine（HF Pipeline Parallel，测量用）
 
 测试位于 `tests/`。
-benchmark 位于 `benchmarks/`。
+benchmark 位于 `benchmarks/`（benchmark_hf.py / benchmark_mini.py / benchmark_multi_gpu.py / profile_decode.py）。
 skills 位于 `.claude/skills/`。
 规则位于 `.claude/rules/`。
 长期计划与个人记录位于 `本地资料/`。
@@ -78,6 +78,49 @@ skills 位于 `.claude/skills/`。
 - 需要显式调用时，在任务里直接点名对应 skill，例如 `infer-plan`、`infer-implement`、`infer-benchmark`
 - 对于阶段规划、阶段总结、知识沉淀和博客写作，默认优先复用已有 skill
 - 当某个 skill 变得复杂时，应继续在对应目录中补充模板、清单和辅助说明文件，而不是把所有要求堆回一个文档
+
+## 阶段工作流
+
+每个开发阶段必须按以下顺序至少执行一次每个 skill，不得跳过或乱序：
+
+```
+1. infer-plan       → 规划目标、范围、验收标准
+2. infer-implement  → 实现代码，最小验证（可多轮）
+3. infer-review     → 审查代码，发现问题回到 implement
+4. infer-benchmark  → 跑真实数据，记录结果
+5. infer-summarize  → 阶段总结，落盘里程碑文档
+6. infer-blog       → 博客草稿（可攒多阶段后集中写）
+7. infer-archive    → 核查并补全本地资料所有子目录，阶段正式收尾
+```
+
+**Claude 的行为要求：**
+- 每次对话开始时，如果用户在推进某个阶段，主动说明当前阶段处于哪一步
+- 用户完成某一步后，主动提示下一步应该执行哪个 skill
+- 如果用户跳步（如跳过 review 直接 benchmark），必须提醒缺失了哪一步
+- 不得在 infer-plan 完成前开始 infer-implement，不得在 infer-implement 完成前开始 infer-benchmark
+- `infer-archive` 是阶段收尾门控，只有 archive 完成后才能进入下一阶段的 infer-plan
+- **一次只执行一个 skill**：用户调用某个 skill 时，完成该 skill 后停止，不得自动串联下一步
+- **infer-review 只列问题，不改代码**：review 阶段的任何问题，留给用户调用 infer-implement 处理
+
+**Phase 1 已完成（2026-03-19）**：所有 7 步 ✓，串行推理链路跑通，benchmark 与 HF baseline 对比完成。
+
+**Phase 2 已完成（2026-03-19）**：所有 7 步 ✓，Paged KV Cache + Batch Decode + Continuous Batching 跑通，benchmark 与 HF baseline 对比完成。
+
+**Phase 3 已完成（2026-03-19）**：所有 7 步 ✓，向量化 gather_batch_kv + DynamicCache，batch=8 throughput 从 49.1% → 88.4% HF baseline。
+
+**Phase 4 已完成（2026-03-19）**：所有 7 步 ✓，Replica + HF PP 双卡扩展，Replica batch=8 +4.1%，PP 显存减半。
+
+**当前阶段进度（Phase 5）：**
+
+| 步骤 | skill | 状态 |
+|------|-------|------|
+| 1 | infer-plan | ✓ 完成 |
+| 2 | infer-implement | ✓ 完成 |
+| 3 | infer-review | ✓ 完成 |
+| 4 | infer-benchmark | ✓ 完成 |
+| 5 | infer-summarize | ✓ 完成 |
+| 6 | infer-blog | ✓ 完成 |
+| 7 | infer-archive | ✓ 完成 |
 
 ## 知识与内容产出
 
