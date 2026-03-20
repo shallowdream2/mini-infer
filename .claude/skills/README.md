@@ -46,7 +46,7 @@
 | Phase 6 | ✅ |
 | Phase 6.5 | ✅ |
 | Phase 7 | ✅ |
-| Phase 8 | 🔜 规划中 |
+| Phase 8 | 🔄 进行中（implement ✓，review 待）|
 
 ## 使用约定
 

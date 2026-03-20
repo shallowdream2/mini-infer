@@ -15,6 +15,7 @@
 - Preemption + Priority Scheduling（Phase 7，swap to CPU，优先级调度）
 - 双卡扩展（Replica 数据并行 + HF Pipeline Parallel 测量）
 - 真实 benchmark（对照 HF Transformers baseline，batch=8 达到 100% HF）
+- **OpenAI-compatible HTTP API**（Phase 8，FastAPI + SSE streaming，AsyncEngine continuous batching）
 
 ## 当前状态
 
@@ -28,7 +29,7 @@
 | Phase 6 | True PagedAttention（flash_attn block_tables，batch=8 达到 100% HF）| ✅ |
 | Phase 6.5 | Triton kernel（decode attention kernel，对比 flash_attn，大厂核心路线主线）| ✅ |
 | Phase 7 | Preemption + Priority Scheduling（swap to CPU，优先级调度）| ✅ |
-| Phase 8 | OpenAI-compatible HTTP API（FastAPI + streaming）| 🔜 规划中 |
+| Phase 8 | OpenAI-compatible HTTP API（FastAPI + streaming）| 🔄 进行中（implement ✓，review 待）|
 
 详细阶段计划参考 `本地资料/Claude计划/00-长期路线图.md`。
 
@@ -71,7 +72,10 @@
 - `mini_infer/kv_cache.py` — Paged KV Cache（BlockTable + FreeBlockPool）
 - `mini_infer/attention.py` — PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
 - `mini_infer/model_runner.py` — ModelRunner（prefill + batch decode，含 profiler 标签）
-- `mini_infer/engine.py` — LLMEngine（continuous batching 主循环）
+- `mini_infer/engine.py` — LLMEngine（continuous batching 主循环 + Phase 8 add_request/step 接口）
+- `mini_infer/async_engine.py` — AsyncEngine（后台线程 step loop + asyncio.Queue，Phase 8）
+- `mini_infer/openai_schema.py` — OpenAI Chat Completions API Pydantic 模型（Phase 8）
+- `mini_infer/server.py` — FastAPI HTTP server（Phase 8）
 - `mini_infer/replica_engine.py` — ReplicaEngine（双卡数据并行）
 - `mini_infer/pp_engine.py` — PPEngine（HF Pipeline Parallel，测量用）
 - `mini_infer/tp_engine.py` — 向后兼容别名（TPEngine = PPEngine）
@@ -106,11 +110,29 @@ skills 位于 `.claude/skills/`。
 9. 无模型权重时，明确说明，不伪造运行结果。（GPU 始终可用，不需要确认。）
 10. Phase 之间的空档期（上一 Phase archive 完成、下一 Phase 尚未 plan）：对话开始时说明"当前在 Phase N 和 Phase N+1 之间，下一步是 Phase N+1 的 infer-plan"，不要误判为 Phase N 仍在进行。
 
-**当前位置：Phase 7 已完成，下一步是 Phase 8 的 infer-plan。**
+**当前阶段进度（Phase 8）：**
 
 > 进度表说明：Phase 进行中时在此维护逐步骤进度表（Step 0-7）；Phase 完成（archive ✓）后删除进度表，历史记录见 `本地资料/里程碑总结/`。
 >
 > **Step 0 标记规则**：用户执行前置条件验证命令后，若反馈"OK"或"通过"，Claude 应立即将 Step 0 标为 ✓，**不需要用户手动修改进度表**。
+
+| 步骤 | skill | 状态 |
+|------|-------|------|
+| 0 | 前置条件验证（fastapi/uvicorn/openai 可导入 + 现有测试通过）| ✓ |
+| 1 | infer-plan | ✓ |
+| 2 | infer-implement | ⬜ |
+| 3 | infer-review | ✓ |
+| 4 | infer-benchmark | ⬜ |
+| 5 | infer-summarize | ⬜ |
+| 6 | infer-blog | ⬜ |
+| 7 | infer-archive | ⬜ |
+
+Phase 8 前置条件验证命令：
+```bash
+conda run -n ai-infra python -c "import fastapi, uvicorn, openai; print('ok')"
+conda run -n ai-infra python -c "from mini_infer import LLMEngine, EngineConfig; print('ok')"
+conda run -n ai-infra python -m pytest tests/test_smoke.py tests/test_engine.py tests/test_preemption.py -q
+```
 
 ## 知识与内容产出
 

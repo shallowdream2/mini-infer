@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-infer"
 version = "0.1.0"
-description = "Ubuntu-first scaffold for a future high-performance LLM inference engine"
+description = "面向 Qwen2.5 类 decoder-only 模型的推理系统学习项目，实现 Paged KV Cache、Continuous Batching、True PagedAttention、Preemption 和 OpenAI-compatible HTTP API"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
@@ -21,6 +21,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",  # Phase 8 async server tests
+    "httpx>=0.24.0",            # Phase 8 ASGI test client
+    "asgi-lifespan>=2.0",       # Phase 8 lifespan event triggering in tests
 ]
 # Phase 6+：True PagedAttention（需先单独安装：pip install "flash-attn>=2.5.0" --no-build-isolation）
 flash = [
@@ -30,6 +33,7 @@ flash = [
 serve = [
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
+    "asgi-lifespan>=2.0",  # 测试用，触发 ASGI lifespan 事件
 ]
 
 [tool.setuptools.packages.find]
@@ -38,3 +42,4 @@ include = ["mini_infer*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+asyncio_mode = "strict"
