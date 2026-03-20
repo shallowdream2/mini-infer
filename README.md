@@ -121,6 +121,17 @@ python benchmarks/profile_decode.py --model $MODEL --batch-size 8 --decode-steps
 
 Phase 6 输出只有 `model_forward` 标签，`gather_batch_kv` 和 `write_decode_kv` 已消除。
 
+### Preemption benchmark（Phase 7，支持 dry_run）
+
+```bash
+# 完整测试（需要 Qwen2.5-7B-Instruct 权重）
+export HF_HUB_OFFLINE=1
+conda run -n ai-infra python benchmarks/benchmark_preemption.py
+
+# dry_run 模式（无需模型权重，测试调度器延迟）
+conda run -n ai-infra python benchmarks/benchmark_preemption.py --dry-only
+```
+
 ### 单元测试（无 GPU）
 
 ```bash
@@ -128,6 +139,9 @@ python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache
 
 # Phase 6 GPU 测试（需要 2× RTX 4090）
 python -m pytest tests/test_paged_attention.py -v
+
+# Phase 7 preemption 测试（dry_run，无需 GPU）
+python -m pytest tests/test_preemption.py -v
 ```
 
 ## 项目结构
@@ -152,6 +166,7 @@ benchmarks/
   benchmark_flash.py     mini-infer Phase 6 benchmark（flash_attn block_table，含 --compare）
   benchmark_multi_gpu.py 双卡 benchmark（replica/tp2）
   benchmark_triton.py    Triton kernel latency 对比 benchmark（Phase 6.5）
+  benchmark_preemption.py Phase 7 preemption swap latency + 吞吐回归测试
   profile_decode.py      decode_batch 内部 profiling（Phase 6 更新版）
 
 tests/                   单元测试（dry_run，无 GPU）

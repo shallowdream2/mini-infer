@@ -9,11 +9,12 @@
 - `Paged KV Cache`（BlockTable + FreeBlockPool + block tensor 池）
 - `Prefill / Decode` 分离
 - `Continuous Batching`（动态准入调度）
-- 向量化 KV Gather（PyTorch advanced indexing）
+- 向量化 KV Gather（Phase 2-5，PyTorch advanced indexing）
+- **True PagedAttention**（Phase 6，flash_attn_with_kvcache + block_table，decode attention kernel 直接从 block tensor 寻址）
+- Triton decode attention kernel（Phase 6.5，对比 flash_attn）
+- Preemption + Priority Scheduling（Phase 7，swap to CPU，优先级调度）
 - 双卡扩展（Replica 数据并行 + HF Pipeline Parallel 测量）
-- 真实 benchmark（对照 HF Transformers baseline）
-
-**注意**：本项目实现的是 Paged KV Cache + DynamicCache 接口，**不是真正的 PagedAttention**（真正的 PagedAttention 需要 flash_attn 2.5+ 的 block_tables，让 attention kernel 直接从 block tensor 寻址，不需要 gather 到 dense tensor）。
+- 真实 benchmark（对照 HF Transformers baseline，batch=8 达到 100% HF）
 
 ## 当前状态
 
@@ -26,7 +27,7 @@
 | Phase 5 | Profiling + 项目收尾 | ✅ |
 | Phase 6 | True PagedAttention（flash_attn block_tables，batch=8 达到 100% HF）| ✅ |
 | Phase 6.5 | Triton kernel（decode attention kernel，对比 flash_attn，大厂核心路线主线）| ✅ |
-| Phase 7 | Preemption + Priority Scheduling（swap to CPU，优先级调度）| 🔄 进行中 |
+| Phase 7 | Preemption + Priority Scheduling（swap to CPU，优先级调度）| ✅ |
 | Phase 8 | OpenAI-compatible HTTP API（FastAPI + streaming）| 🔜 规划中 |
 
 详细阶段计划参考 `本地资料/Claude计划/00-长期路线图.md`。
@@ -76,7 +77,7 @@
 - `mini_infer/tp_engine.py` — 向后兼容别名（TPEngine = PPEngine）
 
 测试位于 `tests/`。
-benchmark 位于 `benchmarks/`（benchmark_hf.py / benchmark_mini.py / benchmark_multi_gpu.py / profile_decode.py）。
+benchmark 位于 `benchmarks/`（benchmark_hf.py / benchmark_mini.py / benchmark_flash.py / benchmark_multi_gpu.py / benchmark_triton.py / benchmark_preemption.py / profile_decode.py）。
 skills 位于 `.claude/skills/`。
 规则位于 `.claude/rules/`。
 长期计划与个人记录位于 `本地资料/`。
@@ -100,64 +101,16 @@ skills 位于 `.claude/skills/`。
 4. infer-benchmark 要求进度表 infer-implement 和 infer-review 均为 ✓，否则拒绝执行。
 5. infer-review 无阻塞问题：将 infer-implement 和 infer-review 均标 ✓；有阻塞问题：仅标 infer-review ✓，infer-implement 保持 ⬜。
 6. infer-review 只输出问题列表，不修改任何文件。
-7. infer-archive 完成后，将 CLAUDE.md "当前状态"表中本阶段改为 ✅。
+7. infer-archive 完成后：（a）将"当前状态"表中本阶段改为 ✅；（b）**删除**本阶段进度表（不移入 `<details>`）；（c）在下方"下一阶段"行更新为下一 Phase。
 8. 发现计划有根本性错误时，停下来修订计划，不得继续实现。
-9. 无 GPU 或无模型权重时，明确说明，不伪造运行结果。
+9. 无模型权重时，明确说明，不伪造运行结果。（GPU 始终可用，不需要确认。）
+10. Phase 之间的空档期（上一 Phase archive 完成、下一 Phase 尚未 plan）：对话开始时说明"当前在 Phase N 和 Phase N+1 之间，下一步是 Phase N+1 的 infer-plan"，不要误判为 Phase N 仍在进行。
 
-**当前阶段进度（Phase 7）：**
+**当前位置：Phase 7 已完成，下一步是 Phase 8 的 infer-plan。**
 
-> 说明：每个 skill 完成后应立即将对应步骤标为 ✓。进度表在 Phase 开始和 archive 完成时精确；中途如果 /clear 了对话，以此表为重建上下文的起点。
+> 进度表说明：Phase 进行中时在此维护逐步骤进度表（Step 0-7）；Phase 完成（archive ✓）后删除进度表，历史记录见 `本地资料/里程碑总结/`。
 >
 > **Step 0 标记规则**：用户执行前置条件验证命令后，若反馈"OK"或"通过"，Claude 应立即将 Step 0 标为 ✓，**不需要用户手动修改进度表**。
-
-| 步骤 | skill | 状态 |
-|------|-------|------|
-| 0 | 前置条件验证（mini_infer 可导入 + 现有测试通过）| ✓ |
-| 1 | infer-plan | ✓ |
-| 2 | infer-implement | ⬜ |
-| 3 | infer-review | ✓ |
-| 4 | infer-benchmark | ⬜ |
-| 5 | infer-summarize | ⬜ |
-| 6 | infer-blog | ⬜ |
-| 7 | infer-archive | ⬜ |
-
-Phase 7 前置条件验证命令：
-```bash
-python -c "from mini_infer import LLMEngine, EngineConfig; print('ok')"
-python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py tests/test_engine.py -q
-```
-
-<details>
-<summary>Phase 6.5 历史进度（已完成 ✓）</summary>
-
-| 步骤 | skill | 状态 |
-|------|-------|------|
-| 0 | 前置条件验证（triton 可用 + GPU JIT 执行）| ✓ |
-| 1 | infer-plan | ✓ |
-| 2 | infer-implement | ✓ |
-| 3 | infer-review | ✓ |
-| 4 | infer-benchmark | ✓ |
-| 5 | infer-summarize | ✓ |
-| 6 | infer-blog | ✓ |
-| 7 | infer-archive | ✓ |
-
-</details>
-
-<details>
-<summary>Phase 6 历史进度（已完成 ✓）</summary>
-
-| 步骤 | skill | 状态 |
-|------|-------|------|
-| 0 | 前置条件验证（flash_attn 升级 + block_table 参数验证）| ✓ |
-| 1 | infer-plan | ✓ |
-| 2 | infer-implement | ✓ |
-| 3 | infer-review | ✓ |
-| 4 | infer-benchmark | ✓ |
-| 5 | infer-summarize | ✓ |
-| 6 | infer-blog | ✓ |
-| 7 | infer-archive | ✓ |
-
-</details>
 
 ## 知识与内容产出
 
@@ -189,4 +142,4 @@ python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache
 - GPU 检查：`nvidia-smi`
 - 最小测试：`python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py`
 
-如果当前环境没有 Python、GPU、模型权重或 CUDA 条件，必须明确说明，不得伪造运行结果。
+如果缺少模型权重，必须明确说明，不得伪造运行结果。（GPU 始终可用。）

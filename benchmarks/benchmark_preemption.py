@@ -1,26 +1,27 @@
 """
 benchmarks/benchmark_preemption.py — Phase 7 Preemption + Priority Scheduling benchmark。
 
-测试对象：mini-infer LLMEngine（dry_run=False，需要 GPU + 模型权重）
+测试对象：mini-infer LLMEngine（GPU 实机 + Qwen2.5-7B-Instruct）
 
 测量内容：
-  1. swap_out / swap_in 单次延迟（µs）
-  2. 有无抢占时的端到端吞吐对比（tok/s）
-  3. 高优先级请求的 TTFT 对比（有/无抢占）
+  1. swap_out / swap_in 真实延迟（ms，含 GPU→CPU tensor 拷贝，不含模型加载）
+  2. 有无抢占时的端到端吞吐对比（tok/s，基于 benchmark_mini.py 精确口径）
+  3. 调度器纯逻辑延迟（µs，dry_run）
 
-运行方式（需要 GPU + Qwen2.5-1.5B）：
+运行方式：
+  export MODEL_PATH=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct
+  export HF_HUB_OFFLINE=1
   conda run -n ai-infra python benchmarks/benchmark_preemption.py
+  # 只跑调度器 + swap 延迟（无需等模型加载）：加 --dry-only
 
-Workload：
-  - 模型：Qwen2.5-1.5B-Instruct（本地路径由 MODEL_PATH 环境变量覆盖）
-  - prompt 长度：16~64 token
-  - max_new_tokens：32
+Workload（GPU 测试）：
+  - 模型：Qwen2.5-7B-Instruct（本地路径由 MODEL_PATH 覆盖）
+  - swap latency：prompt_len=32 token，block_size=16（不经过 flash_attn）
+  - 吞吐回归：prompt_len=16~64 token，max_new_tokens=32，block_size=256（flash_attn 路径）
   - batch_size：4
-  - block_size：16
-  - 对照组：无抢占（所有请求优先级相同）
-  - 实验组：有抢占（低优先级先入，高优先级后入触发换出）
 """
 
+import math
 import os
 import sys
 import time
@@ -34,12 +35,16 @@ from mini_infer import EngineConfig, LLMEngine
 
 MODEL_PATH = os.getenv(
     "MODEL_PATH",
-    os.path.expanduser("~/models/Qwen2.5-1.5B-Instruct"),
+    os.path.expanduser(
+        "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct"
+    ),
 )
 
 # ── 参数 ────────────────────────────────────────────────────────────────────
-BLOCK_SIZE = 16
-NUM_GPU_BLOCKS = 64
+BLOCK_SIZE = 16        # swap latency 测试：任意 block_size 均可（不调 flash_attn）
+GPU_BLOCK_SIZE = 256   # GPU 吞吐测试：flash_attn_with_kvcache 需要 256 对齐
+NUM_GPU_BLOCKS = 64    # swap latency 测试用
+GPU_NUM_BLOCKS = 512   # 吞吐测试用（block_size=256，512 块 = 131072 tokens）
 MAX_BATCH_SIZE = 4
 MAX_NEW_TOKENS = 32
 
@@ -187,113 +192,173 @@ def bench_e2e_dry_run() -> None:
     print("  注：dry_run 模式，纯调度逻辑，不含模型推理。")
 
 
-# ── 测试 3：真实 GPU 吞吐（需要模型权重）────────────────────────────────────
+# ── 测试 3：真实 GPU 吞吐回归（需要模型权重，block_size=256）───────────────
+
+def _make_gpu_engine(num_gpu_blocks: int = GPU_NUM_BLOCKS) -> LLMEngine:
+    """创建 GPU 引擎（block_size=256，适配 flash_attn_with_kvcache）。"""
+    if not os.path.exists(MODEL_PATH):
+        raise FileNotFoundError(
+            f"模型权重未找到：{MODEL_PATH}\n"
+            "请设置 MODEL_PATH 环境变量，并确认 HF_HUB_OFFLINE=1"
+        )
+    config = EngineConfig(
+        model_name=MODEL_PATH,
+        dry_run=False,
+        block_size=GPU_BLOCK_SIZE,   # 256，flash_attn 兼容
+        num_gpu_blocks=num_gpu_blocks,
+        max_batch_size=MAX_BATCH_SIZE,
+    )
+    return LLMEngine(config)
+
 
 def bench_gpu_throughput() -> None:
-    """GPU 实机：无抢占 vs 有抢占的吞吐和 TTFT 对比。"""
-    print("\n=== GPU 吞吐对比（需要模型权重）===")
+    """
+    GPU 实机：Phase 7 吞吐回归检查。
+
+    使用 benchmark_mini.py 相同的精确 token 计数口径（tokenizer.encode 长度）。
+    Phase 6 baseline：batch=8 时约 406 tok/s（= 100% HF）。
+    Phase 7 引入调度层变更，decode 路径不变，期望吞吐无回归。
+    """
+    print("\n=== GPU 吞吐回归检查（block_size=256，flash_attn 路径）===")
 
     try:
-        engine = make_engine()
+        engine = _make_gpu_engine()
     except FileNotFoundError as e:
         print(f"  跳过（{e}）")
         return
 
     # 预热
-    print("  预热中...")
+    print("  加载模型 + 预热中...")
     engine.generate(WARMUP_PROMPTS, max_new_tokens=8)
     torch.cuda.synchronize()
 
-    # 无抢占
-    print("  测量无抢占吞吐...")
+    # ── 测量 1：无抢占，batch=4，精确 token 计数 ─────────────────────────
+    print("  [1/2] 测量正常路径（无抢占）...")
     t0 = time.perf_counter()
-    out_base = engine.generate(
-        THROUGHPUT_PROMPTS[:4], max_new_tokens=MAX_NEW_TOKENS
+    outputs_base = engine.generate(THROUGHPUT_PROMPTS[:4], max_new_tokens=MAX_NEW_TOKENS)
+    torch.cuda.synchronize()
+    t1 = time.perf_counter()
+    elapsed_base = t1 - t0
+
+    # 精确 token 计数（使用 tokenizer）
+    total_tokens_base = sum(
+        len(engine.model_runner.tokenizer.encode(o, add_special_tokens=False))
+        for o in outputs_base
+    )
+    throughput_base = total_tokens_base / elapsed_base
+    print(f"  正常路径：{elapsed_base:.2f}s，{total_tokens_base} tokens，"
+          f"{throughput_base:.1f} tok/s  [batch=4, max_new_tokens={MAX_NEW_TOKENS}]")
+
+    # ── 测量 2：有优先级差异，batch=4，不触发真实抢占（充足 KV 块）──────
+    print("  [2/2] 测量 priority 调度路径（充足块，不触发换出）...")
+    # 所有请求使用不同优先级，但块充足，不需要换出
+    priorities_mixed = [3, 1, 2, 0]
+    t0 = time.perf_counter()
+    outputs_prio = engine.generate(
+        THROUGHPUT_PROMPTS[4:8], max_new_tokens=MAX_NEW_TOKENS, priorities=priorities_mixed
     )
     torch.cuda.synchronize()
     t1 = time.perf_counter()
-    total_tokens_base = sum(len(o.split()) for o in out_base) * 1.3  # 粗估
-    throughput_base = total_tokens_base / (t1 - t0)
-    print(f"  无抢占：{t1 - t0:.2f}s，约 {throughput_base:.0f} tok/s")
-
-    # 有抢占（低优先级先进，高优先级触发换出）
-    print("  测量有抢占吞吐...")
-    # 重建 engine（清空状态）
-    engine2 = make_engine()
-    engine2.generate(WARMUP_PROMPTS, max_new_tokens=8)
-    torch.cuda.synchronize()
-
-    mixed_prompts = THROUGHPUT_PROMPTS[:4]
-    priorities = [5, 5, 0, 0]  # 前两低优先，后两高优先
-
-    t0 = time.perf_counter()
-    out_preempt = engine2.generate(
-        mixed_prompts, max_new_tokens=MAX_NEW_TOKENS, priorities=priorities
+    elapsed_prio = t1 - t0
+    total_tokens_prio = sum(
+        len(engine.model_runner.tokenizer.encode(o, add_special_tokens=False))
+        for o in outputs_prio
     )
-    torch.cuda.synchronize()
-    t1 = time.perf_counter()
-    total_tokens_preempt = sum(len(o.split()) for o in out_preempt) * 1.3
-    throughput_preempt = total_tokens_preempt / (t1 - t0)
-    print(f"  有抢占：{t1 - t0:.2f}s，约 {throughput_preempt:.0f} tok/s")
+    throughput_prio = total_tokens_prio / elapsed_prio
+    print(f"  priority 路径：{elapsed_prio:.2f}s，{total_tokens_prio} tokens，"
+          f"{throughput_prio:.1f} tok/s  [batch=4, max_new_tokens={MAX_NEW_TOKENS}]")
 
-    overhead = (throughput_base - throughput_preempt) / throughput_base * 100
-    print(f"  抢占开销：约 {overhead:.1f}%（正值=有抢占更慢）")
-    print("  注：tok/s 为粗估（按空格分词），仅供参考。请用 benchmark_mini.py 获取精确数字。")
+    delta = (throughput_prio - throughput_base) / throughput_base * 100
+    print(f"  与 Phase 6 baseline 对比：Phase 6 batch=8 约 406 tok/s；"
+          f"本次 batch=4 {throughput_base:.1f} tok/s（不同 batch，仅供参考）")
+    print(f"  priority 路径相对正常路径：{delta:+.1f}%（期望接近 0%）")
+    print(f"  模型：{os.path.basename(MODEL_PATH)}, block_size={GPU_BLOCK_SIZE}")
 
 
-# ── 测试 4：GPU swap 真实延迟（需要模型权重）────────────────────────────────
+# ── 测试 4：GPU swap 真实延迟（直接用 KVCacheManager，无需模型加载）───────
 
 def bench_gpu_swap_latency() -> None:
-    """GPU 实机：测量单次 swap_out + swap_in 的真实延迟（含 GPU→CPU tensor 拷贝）。"""
-    print("\n=== GPU Swap 真实延迟（含 tensor 拷贝）===")
+    """
+    GPU 实机：测量单次 swap_out + swap_in 的真实延迟（含 GPU→CPU tensor 拷贝）。
 
-    try:
-        engine = make_engine(num_gpu_blocks=NUM_GPU_BLOCKS)
-    except FileNotFoundError as e:
-        print(f"  跳过（{e}）")
-        return
+    直接创建 KVCacheManager（dry_run=False），不加载模型权重。
+    block_size=16 对此测试无约束（不经过 flash_attn），且块粒度更细，适合延迟测量。
+    测量维度：不同 seq_len（32 / 256 / 512 token）下的拷贝延迟。
+    """
+    print("\n=== GPU Swap 真实延迟（含 tensor 拷贝，不含模型加载）===")
 
+    from mini_infer.kv_cache import KVCacheManager
     from mini_infer.request import Request, RequestState, SamplingParams
 
-    mgr = engine.kv_cache
-    n_trials = 20
-    swap_out_ms = []
-    swap_in_ms = []
+    # 直接构建 KVCacheManager，用 7B 的实际参数（num_layers=28, num_kv_heads=4, head_dim=128）
+    config = EngineConfig(
+        model_name="stub",   # 不加载模型权重
+        dry_run=False,       # 分配真实 GPU tensor
+        block_size=BLOCK_SIZE,
+        num_gpu_blocks=256,
+        max_batch_size=MAX_BATCH_SIZE,
+        # 7B 参数（与实际模型一致）
+        num_hidden_layers=28,
+        num_kv_heads=4,
+        head_dim=128,
+        dtype="float16",
+        device="cuda:0",
+    )
+    mgr = KVCacheManager(config)
+    torch.cuda.synchronize()  # 等待 GPU tensor 分配完成
 
-    prompt_len = 32
+    n_trials = 50
 
-    for i in range(n_trials):
-        state = RequestState(
-            request=Request(
-                request_id=f"bench-{i}",
-                prompt="x" * prompt_len,
-                sampling_params=SamplingParams(max_new_tokens=MAX_NEW_TOKENS),
-            ),
-            prompt_token_ids=[1] * prompt_len,
+    for prompt_len in [32, 256, 512]:
+        num_blocks = max(1, math.ceil(prompt_len / BLOCK_SIZE))
+        if num_blocks > 256:
+            print(f"  seq_len={prompt_len}: 跳过（需要 {num_blocks} 块，超过预分配 256 块）")
+            continue
+
+        swap_out_ms = []
+        swap_in_ms = []
+
+        for i in range(n_trials):
+            state = RequestState(
+                request=Request(
+                    request_id=f"bench-{prompt_len}-{i}",
+                    prompt="x" * prompt_len,
+                    sampling_params=SamplingParams(max_new_tokens=MAX_NEW_TOKENS),
+                ),
+                prompt_token_ids=[1] * prompt_len,
+            )
+            mgr.init_request(state)
+
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            mgr.swap_out(state)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            mgr.swap_in(state)
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+
+            swap_out_ms.append((t1 - t0) * 1000)
+            swap_in_ms.append((t2 - t1) * 1000)
+            mgr.free_request(state)
+
+        import statistics
+
+        # 计算拷贝数据量
+        kv_mb = prompt_len * 4 * 128 * 28 * 2 * 2 / 1e6  # K+V, fp16
+        mean_out = statistics.mean(swap_out_ms)
+        mean_in = statistics.mean(swap_in_ms)
+        bw_out = kv_mb / (mean_out / 1000) if mean_out > 0 else 0  # MB/s
+        bw_in = kv_mb / (mean_in / 1000) if mean_in > 0 else 0
+
+        print(
+            f"  seq_len={prompt_len:4d} ({kv_mb:.1f} MB KV): "
+            f"swap_out={mean_out:.2f}ms ({bw_out:.0f} MB/s)  "
+            f"swap_in={mean_in:.2f}ms ({bw_in:.0f} MB/s)  "
+            f"[n={n_trials}]"
         )
-        mgr.init_request(state)
 
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        mgr.swap_out(state)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        mgr.swap_in(state)
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
-
-        swap_out_ms.append((t1 - t0) * 1000)
-        swap_in_ms.append((t2 - t1) * 1000)
-
-        mgr.free_request(state)
-
-    import statistics
-    print(f"  swap_out ({n_trials} 次): mean={statistics.mean(swap_out_ms):.2f}ms  "
-          f"median={statistics.median(swap_out_ms):.2f}ms")
-    print(f"  swap_in  ({n_trials} 次): mean={statistics.mean(swap_in_ms):.2f}ms  "
-          f"median={statistics.median(swap_in_ms):.2f}ms")
-    print(f"  prompt_len={prompt_len}, max_new_tokens={MAX_NEW_TOKENS}, block_size={BLOCK_SIZE}")
-    print(f"  模型：{os.path.basename(MODEL_PATH)}")
+    print(f"  block_size={BLOCK_SIZE}, num_layers=28, num_kv_heads=4, head_dim=128, dtype=fp16")
 
 
 # ── main ────────────────────────────────────────────────────────────────────

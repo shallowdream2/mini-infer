@@ -1,14 +1,13 @@
 """
-Phase 2 调度器：在 Phase 1 基础上新增 continuous batching 所需的接口。
+请求调度器，支持 continuous batching（Phase 2）和 preemption / 优先级调度（Phase 7）。
 
-新增方法：
-  - has_waiting()：检查等待队列是否非空
-  - peek_next_waiting()：查看（不移除）下一个等待请求
-  - pop_next_waiting()：取出下一个等待请求（不加入 running，由调用方决定）
-  - add_to_running()：将请求加入 running dict
-  - get_running_states()：返回当前所有 running 请求列表
+核心接口：
+  waiting 队列管理：add_request, has_waiting, peek_next_waiting, pop_next_waiting
+  running 队列管理：add_to_running, get_running_states, finish_request
+  Preemption（Phase 7）：mark_swapped, has_swapped, move_swapped_to_running,
+                          get_lowest_priority_running, un_admit
 
-Phase 1 的 get_next_batch() 接口仍保留，供已有测试和向后兼容使用。
+get_next_batch() 为 Phase 1 遗留接口，仅供 test_scheduler.py 使用，新代码请勿调用。
 """
 
 from collections import deque
@@ -78,6 +77,16 @@ class Scheduler:
         except ValueError:
             pass
         self._running[state.request.request_id] = state
+
+    def un_admit(self, state: RequestState) -> None:
+        """
+        撤销准入：将请求从 running 移回 waiting 队尾（不走 swap_out 路径）。
+
+        仅用于刚准入但尚未 prefill 的请求（state.prefilled == False）。
+        放到队尾而非队头，避免与高优先级请求的循环抢占。
+        """
+        self._running.pop(state.request.request_id, None)
+        self._waiting.append(state)
 
     def get_lowest_priority_running(self) -> RequestState | None:
         """

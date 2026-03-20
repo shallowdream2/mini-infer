@@ -9,17 +9,21 @@ KVCacheManager 接口：
 
 Scheduler 接口：
   - mark_swapped 将请求从 running 移到 swapped
+  - un_admit 将刚准入未 prefill 的请求移回 waiting 队尾（不进入 swapped）
   - get_lowest_priority_running 返回优先级数值最大的请求
   - move_swapped_to_running 将请求从 swapped 移到 running
   - has_swapped / num_swapped 计数正确
 
 LLMEngine 端到端（dry_run）：
-  - KV 不足时触发抢占而非报错（低优先级请求被换出）
-  - 被换出请求最终完成生成（token 序列连续，与不换出时一致）
+  - KV 不足时触发抢占而非报错：
+    · 未 prefill 的低优先级请求：un_admit（撤销准入，回 waiting，不进入 swapped）
+    · 已 prefill 的低优先级请求：swap_out（KV 换到 CPU，进入 swapped 队列）
+  - 被抢占请求最终完成生成
   - 高优先级请求先完成
   - 相同优先级不触发抢占
   - generate(priorities=...) 参数长度不匹配时报 ValueError
   - 现有 test_engine.py 中 test_kv_exhaustion 场景：相同优先级无法抢占时仍然报错
+  - 注：已 prefill 请求的真实 swap 场景（GPU-to-CPU KV 拷贝语义）在 GPU 实机验证
 """
 
 import math
@@ -234,6 +238,21 @@ class TestSchedulerPreemption:
         assert not sched.has_swapped()
         assert sched.num_swapped() == 0
 
+    def test_un_admit_returns_to_waiting(self) -> None:
+        """un_admit 将请求从 running 移回 waiting 队尾（不进入 _swapped）。"""
+        sched = Scheduler(max_batch_size=4)
+        state = _make_state()
+        sched.add_request(state)          # 先入 waiting
+        sched.pop_next_waiting()          # 模拟准入：从 waiting 取出
+        sched.add_to_running(state)       # 加入 running
+
+        sched.un_admit(state)
+
+        assert state.request.request_id not in sched._running  # 从 running 移除
+        assert not sched.has_swapped()                         # 不进入 swapped
+        assert sched.has_waiting()                             # 回到 waiting
+        assert sched._waiting[-1] is state                     # 放在队尾
+
 
 # ---------------------------------------------------------------------------
 # LLMEngine: 端到端抢占场景
@@ -301,3 +320,20 @@ class TestEnginePreemption:
         outputs = engine.generate(["ab", "xy"], max_new_tokens=1, priorities=[5, 0])
         assert len(outputs) == 2
         assert engine.kv_cache.num_free_blocks() == 1  # 所有块归还
+
+    def test_never_prefilled_request_is_unadmitted_not_swapped(self) -> None:
+        """
+        刚准入但尚未 prefill 的低优先级请求被抢占时，走 un_admit 路径（不进入 _swapped）。
+
+        验证修复：blocking issue —— 之前 swap_out 会清空 KV 元数据导致 GPU 路径 KeyError。
+        un_admit 路径的正确行为：请求回到 waiting 队尾，GPU 块正常归还，不出现在 swapped 中。
+        """
+        engine = _make_engine(num_gpu_blocks=1, block_size=4, max_batch_size=2)
+        # 低优先级请求先进 waiting，高优先级后进 waiting
+        # 准入循环：先 admit 低优先级（未 prefill），高优先级来时触发 un_admit
+        outputs = engine.generate(["ab", "cd"], max_new_tokens=1, priorities=[10, 0])
+        assert len(outputs) == 2
+        # 关键验证：un_admit 路径不产生 swapped 请求
+        assert not engine.scheduler.has_swapped()
+        # 所有块归还
+        assert engine.kv_cache.num_free_blocks() == 1

@@ -112,9 +112,17 @@ class LLMEngine:
                             victim is not None
                             and victim.request.priority > next_state.request.priority
                         ):
-                            self.kv_cache.swap_out(victim)
-                            self.scheduler.mark_swapped(victim)
-                            continue  # 换出后重新检查空闲块数
+                            if not victim.prefilled:
+                                # 刚准入但尚未 prefill：撤销准入，块归还，放回 waiting 队尾
+                                # 不能走 swap_out：此时 KV 为零值，保存到 CPU 无意义且会破坏续写
+                                self.kv_cache.free_request(victim)
+                                self.scheduler.un_admit(victim)
+                                newly_admitted.remove(victim)
+                            else:
+                                # 已完成 prefill：KV 有效，换出到 CPU，加入换出队列
+                                self.kv_cache.swap_out(victim)
+                                self.scheduler.mark_swapped(victim)
+                            continue  # 腾出块后重新检查空闲块数
 
                         # 无法换出：若确实卡死则报错，否则等待
                         if self.scheduler.num_running() == 0 and not newly_admitted:

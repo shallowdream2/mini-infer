@@ -304,10 +304,11 @@ class KVCacheManager:
 
         if not self._dry_run:
             block_table = self._block_tables[request_id]
+            kv_dtype = self.k_cache[0].dtype  # 保持与 GPU cache 相同的 dtype（fp16/bf16），避免 2× 内存浪费
             cpu_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
             for l in range(self.num_layers):
-                k_cpu = torch.zeros(seq_len, self.num_kv_heads, self.head_dim)
-                v_cpu = torch.zeros(seq_len, self.num_kv_heads, self.head_dim)
+                k_cpu = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=kv_dtype)
+                v_cpu = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=kv_dtype)
                 for blk_idx, phys_blk in enumerate(block_table):
                     start = blk_idx * self.block_size
                     end = min(start + self.block_size, seq_len)
