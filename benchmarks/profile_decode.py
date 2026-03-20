@@ -1,10 +1,13 @@
 """
-benchmarks/profile_decode.py — Phase 5 Profiling
+benchmarks/profile_decode.py — Phase 6 Profiling（True PagedAttention）
 
 对 mini-infer decode_batch 内部的关键操作进行 torch.profiler 分析，输出：
-  - gather_batch_kv：从 KV block tensor 聚合当前 batch 的 KV（Phase 3 向量化版本）
-  - model_forward：Transformer batch forward
-  - write_decode_kv：将新 token 的 KV 写回 block tensor
+  - model_forward：flash_attn_with_kvcache batch forward（含 in-place KV 写入）
+
+Phase 6 变化（相比 Phase 5）：
+  - decode_batch 已切换到 True PagedAttention 路径，gather_batch_kv / write_decode_kv
+    标签不再存在；整个 decode 步骤合并为一次 model_forward。
+  - block_size 必须为 256 的倍数（flash_attn kernel 约束），默认使用 256。
 
 用法：
     HF_HUB_OFFLINE=1 python benchmarks/profile_decode.py \\
@@ -39,8 +42,9 @@ _PROMPTS = [
     "Continuous batching improves throughput by",
 ]
 
-# decode_batch 中三个被 record_function 标注的关键操作
-_KEY_OPS = {"gather_batch_kv", "model_forward", "write_decode_kv"}
+# Phase 6 decode_batch 中被 record_function 标注的关键操作
+# （Phase 5 的 gather_batch_kv / write_decode_kv 已在 Phase 6 中移除）
+_KEY_OPS = {"model_forward"}
 
 
 def main() -> None:
@@ -64,8 +68,10 @@ def main() -> None:
         model_name=args.model,
         device=args.device,
         dtype="float16",
-        num_gpu_blocks=2048,
-        block_size=16,
+        # block_size=256 时每块是 Phase 5(block_size=16) 的 16 倍大
+        # 200 块 × 256 token = 51200 token 容量，profile 场景（batch≤8, steps≤30）完全够用
+        num_gpu_blocks=200,
+        block_size=256,
     )
 
     print(f"[profiler] 加载模型: {args.model}")
@@ -87,7 +93,7 @@ def main() -> None:
         engine.generate(prompts, max_new_tokens=args.decode_steps)
         torch.cuda.synchronize(args.device)
 
-    # ── 提取三个关键标签 ─────────────────────────────────────────────────────
+    # ── 提取关键标签 ────────────────────────────────────────────────────────
     avgs = prof.key_averages()
     results = [avg for avg in avgs if avg.key in _KEY_OPS]
     total_cuda_us = sum(avg.cuda_time_total for avg in results)
@@ -113,7 +119,7 @@ def main() -> None:
         )
 
     print("-" * 72)
-    print(f"{'三段合计':<22} {'':>8} {total_cuda_us / 1000:>12.2f}")
+    print(f"{'model_forward 合计':<22} {'':>8} {total_cuda_us / 1000:>12.2f}")
     print("=" * 72)
 
     # ── 完整 top-20 表（供详细调试）────────────────────────────────────────

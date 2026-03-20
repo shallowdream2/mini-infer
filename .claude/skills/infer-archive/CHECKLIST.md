@@ -42,3 +42,6 @@
 ### benchmark 脚本基础验证（每阶段必查）
 - [ ] 本阶段新增的 benchmark / profiling 脚本：在 dry_run 或无 GPU 环境下能完整构造 EngineConfig（防止字段名拼写错误等低级 bug 只能在 GPU 运行时才暴露）
 - [ ] 验证方法：`python -c "from mini_infer.config import EngineConfig; <按脚本里的参数构造>"` 不报 TypeError
+
+### skills/README.md 同步（每阶段必查）
+- [ ] `.claude/skills/README.md` 中本阶段的进度表已更新为全部 ✓（与 CLAUDE.md 保持一致）

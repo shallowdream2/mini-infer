@@ -1,10 +1,11 @@
 """
-Phase 4 ReplicaEngine 和 TPEngine 的单元测试。覆盖范围：
+Phase 4 ReplicaEngine 和 PPEngine 的单元测试。覆盖范围：
   - ReplicaEngine 分发：偶数 / 奇数索引请求分到正确引擎
   - ReplicaEngine 顺序：合并结果与输入顺序一致
   - ReplicaEngine 边界：单条请求、奇数条请求（某引擎分到空 batch）
   - ReplicaEngine 校验：两个 config 设备相同时抛出 ValueError
-  - TPEngine dry_run：smoke test，不加载真实模型
+  - PPEngine dry_run：smoke test，不加载真实模型
+    注：PPEngine 是 Pipeline Parallel 引擎（device_map="balanced"），不是 Tensor Parallel
 
 所有测试使用 dry_run=True，不依赖 GPU 或模型权重。
 """
@@ -12,8 +13,8 @@ Phase 4 ReplicaEngine 和 TPEngine 的单元测试。覆盖范围：
 import pytest
 
 from mini_infer.config import EngineConfig
+from mini_infer.pp_engine import PPEngine
 from mini_infer.replica_engine import ReplicaEngine
-from mini_infer.tp_engine import TPEngine
 
 
 def _make_config(device: str) -> EngineConfig:
@@ -67,13 +68,13 @@ class TestReplicaEngine:
         assert len(outputs) == 1
 
 
-# ── TPEngine 测试 ───────────────────────────────────────────────────────────
+# ── PPEngine 测试（Pipeline Parallel）──────────────────────────────────────
 
-class TestTPEngine:
+class TestPPEngine:
     def test_dry_run_smoke(self) -> None:
-        """dry_run 模式下 TPEngine 可构造并调用 generate，不加载真实模型。"""
+        """dry_run 模式下 PPEngine 可构造并调用 generate，不加载真实模型。"""
         cfg = EngineConfig(model_name="stub", device="cpu", dry_run=True)
-        engine = TPEngine(cfg)
+        engine = PPEngine(cfg)
         outputs = engine.generate(["hello", "world"], max_new_tokens=4)
         assert len(outputs) == 2
         for out in outputs:
@@ -82,5 +83,5 @@ class TestTPEngine:
     def test_dry_run_requires_no_gpu(self) -> None:
         """dry_run 模式下不应触发 GPU 检查。"""
         cfg = EngineConfig(model_name="stub", device="cuda:0", dry_run=True)
-        engine = TPEngine(cfg)  # 不应 raise RuntimeError
+        engine = PPEngine(cfg)  # 不应 raise RuntimeError
         assert engine.model is None

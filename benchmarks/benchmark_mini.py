@@ -1,5 +1,6 @@
-"""这个文件实现 mini-infer Phase 3 引擎的 benchmark，对标 benchmark_hf.py 的同款 prompt 和指标。
-当前阶段（Phase 3）：向量化 gather_batch_kv + DynamicCache + 混合长度 benchmark。
+"""这个文件实现 mini-infer 引擎的 benchmark，对标 benchmark_hf.py 的同款 prompt 和指标。
+当前阶段（Phase 6）：True PagedAttention（flash_attn_with_kvcache + block_table），
+  消除 gather_batch_kv / write_decode_kv，block_size 必须为 256 的倍数（flash_attn 约束）。
 运行环境：默认在 Ubuntu 项目环境中执行；如使用 CUDA 设备，需要已就绪的 GPU 和模型权重。
 
 测量指标：
@@ -66,14 +67,14 @@ def benchmark_mini(
         device=device,
         dtype=dtype,
         max_batch_size=batch_size,
-        block_size=16,
+        block_size=256,
         num_gpu_blocks=num_gpu_blocks,
         num_hidden_layers=num_hidden_layers,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
     )
 
-    print(f"初始化 LLMEngine (Phase 3): {model_name}")
+    print(f"初始化 LLMEngine (Phase 6): {model_name}")
     engine = LLMEngine(config)
 
     prompts = PROMPTS[:batch_size]
@@ -118,7 +119,7 @@ def benchmark_mini(
     peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
 
     return BenchmarkResult(
-        engine_phase="mini-infer-phase3",
+        engine_phase="mini-infer-phase6",
         model_name=model_name,
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
@@ -179,7 +180,7 @@ def benchmark_mini_mixed(
         device=device,
         dtype=dtype,
         max_batch_size=max_batch,
-        block_size=16,
+        block_size=256,
         num_gpu_blocks=num_gpu_blocks,
         num_hidden_layers=num_hidden_layers,
         num_kv_heads=num_kv_heads,
@@ -220,7 +221,7 @@ def benchmark_mini_mixed(
     peak_mem_gb = torch.cuda.max_memory_allocated() / 1e9 if torch.cuda.is_available() else 0.0
 
     return MixedBenchmarkResult(
-        engine_phase="mini-infer-phase3-mixed",
+        engine_phase="mini-infer-phase6-mixed",
         model_name=model_name,
         num_requests=len(prompts),
         total_time_s=total_time,
@@ -233,7 +234,7 @@ def benchmark_mini_mixed(
 
 
 def print_result(result: BenchmarkResult) -> None:
-    print("\n========== mini-infer Phase 3 Benchmark ==========")
+    print("\n========== mini-infer Phase 6 Benchmark ==========")
     print(f"引擎:           {result.engine_phase}")
     print(f"模型:           {result.model_name}")
     print(f"batch_size:     {result.batch_size}")
@@ -247,7 +248,7 @@ def print_result(result: BenchmarkResult) -> None:
 
 
 def print_mixed_result(result: MixedBenchmarkResult) -> None:
-    print("\n========== mini-infer Phase 3 Mixed Benchmark ==========")
+    print("\n========== mini-infer Phase 6 Mixed Benchmark ==========")
     print(f"引擎:           {result.engine_phase}")
     print(f"模型:           {result.model_name}")
     print(f"请求数:         {result.num_requests}（短 prompt {result.short_prompt_count} + 长 prompt {result.long_prompt_count}）")
@@ -259,7 +260,7 @@ def print_mixed_result(result: MixedBenchmarkResult) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="mini-infer Phase 3 benchmark")
+    parser = argparse.ArgumentParser(description="mini-infer Phase 6 benchmark")
     parser.add_argument("--model", type=str, default="Qwen/Qwen2.5-7B-Instruct")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--max-new-tokens", type=int, default=128)

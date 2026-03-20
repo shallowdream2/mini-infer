@@ -17,8 +17,6 @@
 
 ## 当前状态
 
-5 个阶段已全部完成（2026-03-19）：
-
 | 阶段 | 内容 | 状态 |
 |------|------|------|
 | Phase 1 | 单卡最小推理链路 | ✅ |
@@ -26,8 +24,12 @@
 | Phase 3 | 向量化 gather_batch_kv + DynamicCache（batch=8 达到 HF 的 88.4%）| ✅ |
 | Phase 4 | 双卡扩展（Replica + HF PP）| ✅ |
 | Phase 5 | Profiling + 项目收尾 | ✅ |
+| Phase 6 | True PagedAttention（flash_attn block_tables，batch=8 达到 100% HF）| ✅ |
+| Phase 6.5 | Triton kernel（decode attention kernel，对比 flash_attn，大厂核心路线主线）| ✅ |
+| Phase 7 | Preemption + Priority Scheduling（swap to CPU，优先级调度）| 🔄 进行中 |
+| Phase 8 | OpenAI-compatible HTTP API（FastAPI + streaming）| 🔜 规划中 |
 
-如果继续开发，下一步方向参考 `本地资料/Claude计划/00-长期路线图.md`。
+详细阶段计划参考 `本地资料/Claude计划/00-长期路线图.md`。
 
 ## 环境事实
 
@@ -35,7 +37,19 @@
 - 当前项目默认直接复用 `本地资料/环境配置/AI-Infra学习之旅-服务器环境配置.md` 中已经配置好的 `ai-infra` 环境
 - 主开发环境是 Ubuntu 24.04 + bash + Python 3.10+
 - 真实运行和 benchmark 环境是 Ubuntu 24.04 + 2 × RTX 4090
-- 真实模型推理、多卡实验和性能数据默认来自 Ubuntu 实机环境，而不是 Windows 侧远程会话
+
+**当前已安装关键版本（2026-03-20）：**
+
+| 包 | 版本 | 备注 |
+|----|------|------|
+| PyTorch | 2.1.2+cu121 | CUDA 12.1 |
+| transformers | 4.43.4 | >= 4.40.0 ✓ |
+| flash_attn | **2.5.9.post1** | ✅ block_table 可用（Phase 6 已用） |
+| Python | 3.10 | — |
+
+**关键约束：**
+- PyTorch SDPA flash_sdp 已启用 → HF 模型推理时已在用 FlashAttention kernel
+- flash_attn 2.5.9.post1 的 `flash_attn_with_kvcache` 已有 `block_table` 参数，Phase 6 已使用
 
 ## 工作方式
 
@@ -46,13 +60,6 @@
 - 上下文过长或任务切换明显时，建议用户使用 `/clear`
 - 阶段性工作完成后，应产出总结、知识沉淀或博客草稿，而不是只停留在代码层
 
-## 文件头规则
-
-- 每个新建或修改的文件，都必须在开头说明当前文件的作用和功能
-- 对支持注释或文档字符串的格式，直接使用文件头注释或模块文档字符串
-- 对 Markdown 文件，标题下第一段必须说明用途
-- 对 JSON 这类不支持注释的格式，使用首个可读字段如 `$comment` 说明用途
-
 ## 代码范围
 
 核心代码位于：
@@ -61,10 +68,12 @@
 - `mini_infer/request.py` — Request / RequestState / SamplingParams
 - `mini_infer/scheduler.py` — 请求调度器（waiting/running 队列）
 - `mini_infer/kv_cache.py` — Paged KV Cache（BlockTable + FreeBlockPool）
+- `mini_infer/attention.py` — PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
 - `mini_infer/model_runner.py` — ModelRunner（prefill + batch decode，含 profiler 标签）
 - `mini_infer/engine.py` — LLMEngine（continuous batching 主循环）
 - `mini_infer/replica_engine.py` — ReplicaEngine（双卡数据并行）
-- `mini_infer/tp_engine.py` — TPEngine（HF Pipeline Parallel，测量用）
+- `mini_infer/pp_engine.py` — PPEngine（HF Pipeline Parallel，测量用）
+- `mini_infer/tp_engine.py` — 向后兼容别名（TPEngine = PPEngine）
 
 测试位于 `tests/`。
 benchmark 位于 `benchmarks/`（benchmark_hf.py / benchmark_mini.py / benchmark_multi_gpu.py / profile_decode.py）。
@@ -81,46 +90,74 @@ skills 位于 `.claude/skills/`。
 
 ## 阶段工作流
 
-每个开发阶段必须按以下顺序至少执行一次每个 skill，不得跳过或乱序：
+每个阶段依次执行 7 步：infer-plan → infer-implement → infer-review → infer-benchmark → infer-summarize → infer-blog → infer-archive。步骤细节见 `.claude/rules/workflow.md`。
 
-```
-1. infer-plan       → 规划目标、范围、验收标准
-2. infer-implement  → 实现代码，最小验证（可多轮）
-3. infer-review     → 审查代码，发现问题回到 implement
-4. infer-benchmark  → 跑真实数据，记录结果
-5. infer-summarize  → 阶段总结，落盘里程碑文档
-6. infer-blog       → 博客草稿（可攒多阶段后集中写）
-7. infer-archive    → 核查并补全本地资料所有子目录，阶段正式收尾
-```
+**行为规则（每次对话必须遵守）**
 
-**Claude 的行为要求：**
-- 每次对话开始时，如果用户在推进某个阶段，主动说明当前阶段处于哪一步
-- 用户完成某一步后，主动提示下一步应该执行哪个 skill
-- 如果用户跳步（如跳过 review 直接 benchmark），必须提醒缺失了哪一步
-- 不得在 infer-plan 完成前开始 infer-implement，不得在 infer-implement 完成前开始 infer-benchmark
-- `infer-archive` 是阶段收尾门控，只有 archive 完成后才能进入下一阶段的 infer-plan
-- **一次只执行一个 skill**：用户调用某个 skill 时，完成该 skill 后停止，不得自动串联下一步
-- **infer-review 只列问题，不改代码**：review 阶段的任何问题，留给用户调用 infer-implement 处理
+1. 对话开始时，说明当前步骤并主动引导下一步。
+2. 一次只执行一个 skill，完成后等待用户指令。
+3. Step 0 ✓ 前不得进入 infer-implement；infer-plan 可在 Step 0 前运行以输出验证命令。
+4. infer-benchmark 要求进度表 infer-implement 和 infer-review 均为 ✓，否则拒绝执行。
+5. infer-review 无阻塞问题：将 infer-implement 和 infer-review 均标 ✓；有阻塞问题：仅标 infer-review ✓，infer-implement 保持 ⬜。
+6. infer-review 只输出问题列表，不修改任何文件。
+7. infer-archive 完成后，将 CLAUDE.md "当前状态"表中本阶段改为 ✅。
+8. 发现计划有根本性错误时，停下来修订计划，不得继续实现。
+9. 无 GPU 或无模型权重时，明确说明，不伪造运行结果。
 
-**Phase 1 已完成（2026-03-19）**：所有 7 步 ✓，串行推理链路跑通，benchmark 与 HF baseline 对比完成。
+**当前阶段进度（Phase 7）：**
 
-**Phase 2 已完成（2026-03-19）**：所有 7 步 ✓，Paged KV Cache + Batch Decode + Continuous Batching 跑通，benchmark 与 HF baseline 对比完成。
-
-**Phase 3 已完成（2026-03-19）**：所有 7 步 ✓，向量化 gather_batch_kv + DynamicCache，batch=8 throughput 从 49.1% → 88.4% HF baseline。
-
-**Phase 4 已完成（2026-03-19）**：所有 7 步 ✓，Replica + HF PP 双卡扩展，Replica batch=8 +4.1%，PP 显存减半。
-
-**当前阶段进度（Phase 5）：**
+> 说明：每个 skill 完成后应立即将对应步骤标为 ✓。进度表在 Phase 开始和 archive 完成时精确；中途如果 /clear 了对话，以此表为重建上下文的起点。
+>
+> **Step 0 标记规则**：用户执行前置条件验证命令后，若反馈"OK"或"通过"，Claude 应立即将 Step 0 标为 ✓，**不需要用户手动修改进度表**。
 
 | 步骤 | skill | 状态 |
 |------|-------|------|
-| 1 | infer-plan | ✓ 完成 |
-| 2 | infer-implement | ✓ 完成 |
-| 3 | infer-review | ✓ 完成 |
-| 4 | infer-benchmark | ✓ 完成 |
-| 5 | infer-summarize | ✓ 完成 |
-| 6 | infer-blog | ✓ 完成 |
-| 7 | infer-archive | ✓ 完成 |
+| 0 | 前置条件验证（mini_infer 可导入 + 现有测试通过）| ✓ |
+| 1 | infer-plan | ✓ |
+| 2 | infer-implement | ⬜ |
+| 3 | infer-review | ✓ |
+| 4 | infer-benchmark | ⬜ |
+| 5 | infer-summarize | ⬜ |
+| 6 | infer-blog | ⬜ |
+| 7 | infer-archive | ⬜ |
+
+Phase 7 前置条件验证命令：
+```bash
+python -c "from mini_infer import LLMEngine, EngineConfig; print('ok')"
+python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py tests/test_engine.py -q
+```
+
+<details>
+<summary>Phase 6.5 历史进度（已完成 ✓）</summary>
+
+| 步骤 | skill | 状态 |
+|------|-------|------|
+| 0 | 前置条件验证（triton 可用 + GPU JIT 执行）| ✓ |
+| 1 | infer-plan | ✓ |
+| 2 | infer-implement | ✓ |
+| 3 | infer-review | ✓ |
+| 4 | infer-benchmark | ✓ |
+| 5 | infer-summarize | ✓ |
+| 6 | infer-blog | ✓ |
+| 7 | infer-archive | ✓ |
+
+</details>
+
+<details>
+<summary>Phase 6 历史进度（已完成 ✓）</summary>
+
+| 步骤 | skill | 状态 |
+|------|-------|------|
+| 0 | 前置条件验证（flash_attn 升级 + block_table 参数验证）| ✓ |
+| 1 | infer-plan | ✓ |
+| 2 | infer-implement | ✓ |
+| 3 | infer-review | ✓ |
+| 4 | infer-benchmark | ✓ |
+| 5 | infer-summarize | ✓ |
+| 6 | infer-blog | ✓ |
+| 7 | infer-archive | ✓ |
+
+</details>
 
 ## 知识与内容产出
 
@@ -131,13 +168,7 @@ skills 位于 `.claude/skills/`。
 - `本地资料/博客草稿/`
 - `本地资料/实验记录/`
 
-技术博客必须满足：
-
-- 有明确问题背景，而不是空泛概述
-- 有真实设计取舍，而不是纯概念堆砌
-- 有实验、代码或运行证据支撑
-- 有失败点、坑点和反思
-- 语言专业、克制、可发表
+博客质量标准见 `infer-blog` skill 及其 `QUALITY_CHECKLIST.md`。
 
 ## 开发规则
 

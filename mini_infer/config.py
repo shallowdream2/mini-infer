@@ -12,7 +12,9 @@ class EngineConfig:
     dtype: str = "float16"
     max_batch_size: int = 8
     max_model_len: int = 2048
-    block_size: int = 16
+    # flash_attn_with_kvcache 要求 block_size 必须是 256 的倍数（内核约束）
+    # 256 tokens/block × 200 blocks = 51200 token 容量，适合大多数场景
+    block_size: int = 256
     # KV cache 块数量（预分配 GPU tensor pool 大小）
     num_gpu_blocks: int = 200
     # 模型架构参数（必须与实际加载的模型匹配）

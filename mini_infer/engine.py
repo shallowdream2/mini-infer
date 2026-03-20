@@ -1,18 +1,22 @@
 """
-Phase 2 推理引擎：实现 continuous batching 调度循环。
+Phase 7 推理引擎：在 Phase 2 continuous batching 基础上，新增 Preemption + Priority Scheduling。
 
-与 Phase 1 的核心区别：
-  - Phase 1：等待整个 batch 全部跑完再拉新请求（静态 batch）
-  - Phase 2：每个 decode step 后检查是否有新请求可以加入，立即接入运行中的 batch
-    （continuous batching）。这意味着运行中的不同请求可能处于不同的 decode 步骤。
+Phase 7 新增机制：
+  - generate() 接受 priorities 参数，每个请求可设置独立优先级（数值越小优先级越高）
+  - 准入循环：KV 空间不足时，先尝试换出 running 中优先级最低的请求（swap_out），
+    而不是直接报错——只有真的无法腾出空间（无可换出对象且 running 为空）才抛 RuntimeError
+  - swap_in 恢复：每步末尾（清理完成请求后）尝试将 swapped 请求换回 GPU，
+    有足够空闲块时加回 running，下一步参与 decode
+  - 主循环条件扩展：has_swapped() 时继续循环，直到所有换出请求都完成
 
 主循环结构（每次迭代）：
-  1. 准入：从 waiting 队列尽量接入新请求（受 max_batch_size 和 KV block 可用数量限制）
-  2. Prefill：对新接入的请求做 prefill forward，写 KV 到 block tensor
-  3. Batch decode：把所有 running 请求合并成一次 GPU forward（不再是串行 for 循环）
-  4. 清理：将已完成请求从 running 中移除，释放 KV block
+  1. 准入：接入等待请求，块不足时尝试抢占低优先级 running 请求
+  2. Prefill：对新接入的请求做 prefill
+  3. Batch decode：一次 forward 处理所有 running 请求
+  4. 清理：移除已完成请求，释放 KV 块
+  5. Swap_in：有空闲块时将 swapped 请求换回，加入 running
 
-异常处理：try/finally 确保异常时 KV 块也能被归还，避免 GPU 显存泄漏（Phase 1 缺失这一点）。
+异常处理：运行请求的 GPU 块正常归还；换出请求的 CPU KV 清除以释放内存。
 """
 
 import math
@@ -26,7 +30,7 @@ from .scheduler import Scheduler
 
 
 class LLMEngine:
-    """提供 generate 接口，实现 continuous batching 推理调度。"""
+    """提供 generate 接口，实现 continuous batching + preemption 推理调度。"""
 
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
@@ -34,19 +38,29 @@ class LLMEngine:
         self.scheduler = Scheduler(max_batch_size=config.max_batch_size)
         self.model_runner = ModelRunner(config=config, kv_cache=self.kv_cache)
 
-    def generate(self, prompts: list[str], max_new_tokens: int = 128) -> list[str]:
+    def generate(
+        self,
+        prompts: list[str],
+        max_new_tokens: int = 128,
+        priorities: list[int] | None = None,
+    ) -> list[str]:
         """
         批量生成，返回与输入 prompts 顺序一致的输出文本列表。
 
-        采用 continuous batching：新请求在现有请求 decode 过程中动态加入，
-        充分复用每次 batch forward 的 GPU 带宽。
+        priorities: 每个 prompt 的调度优先级（0 = 最高，数值越大优先级越低）。
+                    若为 None，所有请求优先级为 0（与 Phase 2 行为一致）。
         """
+        if priorities is not None and len(priorities) != len(prompts):
+            raise ValueError(f"priorities 长度 {len(priorities)} 与 prompts 长度 {len(prompts)} 不一致")
+
         states: list[RequestState] = []
-        for prompt in prompts:
+        for i, prompt in enumerate(prompts):
+            priority = priorities[i] if priorities is not None else 0
             request = Request(
                 request_id=str(uuid4()),
                 prompt=prompt,
                 sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+                priority=priority,
             )
             state = RequestState(
                 request=request,
@@ -58,8 +72,12 @@ class LLMEngine:
         outputs: dict[str, str] = {}
 
         try:
-            while self.scheduler.has_waiting() or self.scheduler.num_running() > 0:
-                # ── 1. 准入：接入尽可能多的等待请求 ────────────────────────
+            while (
+                self.scheduler.has_waiting()
+                or self.scheduler.num_running() > 0
+                or self.scheduler.has_swapped()
+            ):
+                # ── 1. 准入：接入尽可能多的等待请求，块不足时尝试抢占 ──────────
                 newly_admitted: list[RequestState] = []
                 while (
                     self.scheduler.has_waiting()
@@ -68,27 +86,45 @@ class LLMEngine:
                     next_state = self.scheduler.peek_next_waiting()
                     assert next_state is not None
 
-                    # 保守估计所需 block 数：prompt + 最大输出
                     prompt_len = len(next_state.prompt_token_ids)
                     max_out = next_state.request.sampling_params.max_new_tokens
                     blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
 
-                    if self.kv_cache.num_free_blocks() < blocks_needed:
-                        # 显存不足：如果同时没有其他请求在跑，则无法通过等待来释放块
-                        # 直接报错，避免无限循环
+                    # 快速路径：即使清空所有 GPU 块也装不下，直接报错
+                    if blocks_needed > self.config.num_gpu_blocks:
+                        raise RuntimeError(
+                            f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块"
+                            f"（prompt={prompt_len} + max_new_tokens={max_out}），"
+                            f"超过系统总块数 {self.config.num_gpu_blocks}。"
+                            f"请增大 num_gpu_blocks 或减小 max_new_tokens。"
+                        )
+
+                    if self.kv_cache.num_free_blocks() >= blocks_needed:
+                        # 正常准入
+                        state = self.scheduler.pop_next_waiting()
+                        self.kv_cache.init_request(state)
+                        self.scheduler.add_to_running(state)
+                        newly_admitted.append(state)
+                    else:
+                        # 块不足：尝试换出优先级更低的 running 请求
+                        victim = self.scheduler.get_lowest_priority_running()
+                        if (
+                            victim is not None
+                            and victim.request.priority > next_state.request.priority
+                        ):
+                            self.kv_cache.swap_out(victim)
+                            self.scheduler.mark_swapped(victim)
+                            continue  # 换出后重新检查空闲块数
+
+                        # 无法换出：若确实卡死则报错，否则等待
                         if self.scheduler.num_running() == 0 and not newly_admitted:
                             raise RuntimeError(
                                 f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块"
-                                f"（prompt={prompt_len} token + max_new_tokens={max_out}），"
-                                f"但当前仅有 {self.kv_cache.num_free_blocks()} 个空闲块（总计 {self.config.num_gpu_blocks} 块）。"
-                                f"请增大 num_gpu_blocks 或减小 max_new_tokens。"
+                                f"（prompt={prompt_len} + max_new_tokens={max_out}），"
+                                f"但当前仅有 {self.kv_cache.num_free_blocks()} 个空闲块，"
+                                f"且没有优先级更低的 running 请求可换出。"
                             )
-                        break  # 有其他请求在跑，等待它们释放块
-
-                    state = self.scheduler.pop_next_waiting()
-                    self.kv_cache.init_request(state)
-                    self.scheduler.add_to_running(state)
-                    newly_admitted.append(state)
+                        break  # 有 running 请求，等待它们完成后释放块
 
                 # ── 2. Prefill：对新接入的请求做 prefill ─────────────────────
                 if newly_admitted:
@@ -110,8 +146,21 @@ class LLMEngine:
                         self.kv_cache.free_request(state)
                         self.scheduler.finish_request(state)
 
+                # ── 5. 换入：将 swapped 请求换回 GPU（有足够块时）────────────
+                for swapped_state in self.scheduler.get_swapped_states():
+                    if self.scheduler.num_running() >= self.config.max_batch_size:
+                        break
+                    needed = max(
+                        1, math.ceil(swapped_state.swapped_seq_len / self.config.block_size)
+                    )
+                    if self.kv_cache.num_free_blocks() >= needed:
+                        self.kv_cache.swap_in(swapped_state)
+                        self.scheduler.move_swapped_to_running(swapped_state)
+                    else:
+                        break  # FIFO：第一个换不回来则停止
+
         except Exception:
-            # 异常时归还所有 running 请求的 KV 块，防止显存泄漏
+            # 异常时归还所有 running 请求的 GPU 块，防止显存泄漏
             for state in self.scheduler.get_running_states():
                 try:
                     self.kv_cache.free_request(state)
@@ -121,6 +170,9 @@ class LLMEngine:
                         f"warning: free_request failed for {state.request.request_id!r}: {free_exc}",
                         file=sys.stderr,
                     )
+            # 清除 swapped 请求的 CPU KV，释放 CPU 内存
+            for state in self.scheduler.get_swapped_states():
+                state.cpu_kv = None
             raise
 
         return [outputs.get(state.request.request_id, "") for state in states]

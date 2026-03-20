@@ -2,7 +2,9 @@
 Phase 4 双卡 benchmark。对比三种推理配置在 2 × RTX 4090 上的性能：
   - single：单卡 LLMEngine（Phase 3 基线，cuda:0）
   - replica：双卡 ReplicaEngine（cuda:0 + cuda:1，数据并行）
-  - tp2：双卡 TPEngine（device_map="balanced"，HF Pipeline Parallel）
+  - pp：双卡 PPEngine（device_map="balanced"，HF Pipeline Parallel）
+    注：PP = Pipeline Parallel（不同层在不同 GPU），不是 Tensor Parallel（同层 all-reduce）
+    tp2 是 pp 的旧别名，两者等价。
 
 测量指标：
   - Throughput（tok/s）：所有请求输出 token 总数 / 总耗时
@@ -12,7 +14,7 @@ Phase 4 双卡 benchmark。对比三种推理配置在 2 × RTX 4090 上的性�
 运行方式：
   python benchmarks/benchmark_multi_gpu.py --mode single  --model /path/to/model
   python benchmarks/benchmark_multi_gpu.py --mode replica --model /path/to/model
-  python benchmarks/benchmark_multi_gpu.py --mode tp2     --model /path/to/model
+  python benchmarks/benchmark_multi_gpu.py --mode pp      --model /path/to/model
 """
 
 import argparse
@@ -22,8 +24,8 @@ from dataclasses import dataclass
 import torch
 
 from mini_infer import EngineConfig, LLMEngine
+from mini_infer.pp_engine import PPEngine
 from mini_infer.replica_engine import ReplicaEngine
-from mini_infer.tp_engine import TPEngine
 
 # 与 benchmark_mini.py 保持一致的 prompt 集合（8 条）
 PROMPTS = [
@@ -45,7 +47,7 @@ QWEN_HEAD_DIM = 128
 
 @dataclass
 class MultiGPUBenchmarkResult:
-    mode: str          # "single" / "replica" / "tp2"
+    mode: str          # "single" / "replica" / "pp"
     model_name: str
     batch_size: int
     max_new_tokens: int
@@ -53,8 +55,8 @@ class MultiGPUBenchmarkResult:
     throughput_tok_s: float
     ttft_ms: float
     # single/replica：mini-infer engine.generate(max_new_tokens=1) 的首 token 延迟
-    # tp2：HF model.generate(max_new_tokens=1) 的端到端延迟，含 PP 层间传输和 HF sampling 开销
-    # 两种口径可比较趋势，但 tp2 通常偏高（HF overhead），不宜直接数值对比
+    # pp：HF model.generate(max_new_tokens=1) 的端到端延迟，含 PP 层间传输和 HF sampling 开销
+    # 两种口径可比较趋势，但 pp 通常偏高（HF overhead），不宜直接数值对比
     peak_mem_gpu0_gb: float
     peak_mem_gpu1_gb: float
 
@@ -197,9 +199,9 @@ def benchmark_replica(
     )
 
 
-# ── TP=2（HF Pipeline Parallel）benchmark ───────────────────────────────────
+# ── PP（HF Pipeline Parallel）benchmark ─────────────────────────────────────
 
-def benchmark_tp2(
+def benchmark_pp(
     model_name: str,
     batch_size: int = 8,
     max_new_tokens: int = 128,
@@ -210,15 +212,15 @@ def benchmark_tp2(
         device="cuda:0",
         dtype=dtype,
     )
-    print(f"[tp2] 初始化 TPEngine（device_map='balanced'）: {model_name}")
-    engine = TPEngine(config)
+    print(f"[pp] 初始化 PPEngine（device_map='balanced'，Pipeline Parallel）: {model_name}")
+    engine = PPEngine(config)
     prompts = PROMPTS[:batch_size]
 
-    print("[tp2] 热身（1 条请求，4 token）...")
+    print("[pp] 热身（1 条请求，4 token）...")
     _ = engine.generate(prompts[:1], max_new_tokens=4)
     _sync_all()
 
-    # tp2 模式：TTFT 单独测单条请求
+    # pp 模式：TTFT 单独测单条请求
     _reset_peak_memory()
     t_ttft = time.perf_counter()
     _ = engine.generate(prompts[:1], max_new_tokens=1)
@@ -234,7 +236,7 @@ def benchmark_tp2(
 
     total_tokens = _count_tokens(engine.tokenizer, outputs)
     return MultiGPUBenchmarkResult(
-        mode="tp2",
+        mode="pp",
         model_name=model_name,
         batch_size=batch_size,
         max_new_tokens=max_new_tokens,
@@ -260,9 +262,10 @@ def print_result(result: MultiGPUBenchmarkResult) -> None:
     print(f"TTFT（近似）:   {ttft_str}")
     print(f"Peak Mem GPU0:  {result.peak_mem_gpu0_gb:.2f} GB")
     print(f"Peak Mem GPU1:  {result.peak_mem_gpu1_gb:.2f} GB")
-    if result.mode == "tp2":
-        print("注：tp2 使用 HF model.generate()（Pipeline Parallel），无自定义 KV cache。")
+    if result.mode == "pp":
+        print("注：pp 使用 HF model.generate()（Pipeline Parallel），无自定义 KV cache。")
         print("     TTFT 含 HF sampling loop 和 PP 层间激活传输开销，与 single/replica 口径不同。")
+        print("     PP ≠ TP：PP 是不同层在不同 GPU；TP（Tensor Parallel）是同层按 head 切分 + all-reduce。")
     print("=============================================================\n")
 
 
@@ -274,9 +277,9 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         type=str,
-        choices=["single", "replica", "tp2"],
+        choices=["single", "replica", "pp", "tp2"],
         default="replica",
-        help="推理模式：single（单卡）/ replica（双卡数据并行）/ tp2（双卡 HF PP）",
+        help="推理模式：single（单卡）/ replica（双卡数据并行）/ pp（双卡 HF Pipeline Parallel，tp2 为旧别名）",
     )
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=128)
@@ -300,8 +303,8 @@ def main() -> None:
             dtype=args.dtype,
             num_gpu_blocks=args.num_gpu_blocks,
         )
-    else:  # tp2
-        result = benchmark_tp2(
+    else:  # pp or tp2 (alias)
+        result = benchmark_pp(
             model_name=args.model,
             batch_size=args.batch_size,
             max_new_tokens=args.max_new_tokens,

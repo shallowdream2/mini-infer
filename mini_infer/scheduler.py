@@ -17,7 +17,7 @@ from .request import RequestState
 
 
 class Scheduler:
-    """提供等待队列到运行队列的批次调度能力，Phase 2 支持 continuous batching。"""
+    """提供等待队列到运行队列的批次调度能力，Phase 2 支持 continuous batching，Phase 7 支持抢占。"""
 
     def __init__(self, max_batch_size: int) -> None:
         if max_batch_size <= 0:
@@ -25,6 +25,7 @@ class Scheduler:
         self.max_batch_size = max_batch_size
         self._waiting: deque[RequestState] = deque()
         self._running: dict[str, RequestState] = {}
+        self._swapped: deque[RequestState] = deque()  # Phase 7：已换出到 CPU 的请求
 
     def add_request(self, state: RequestState) -> None:
         self._waiting.append(state)
@@ -50,6 +51,42 @@ class Scheduler:
 
     def get_running_states(self) -> list[RequestState]:
         return list(self._running.values())
+
+    # ------------------------------------------------------------------
+    # Phase 7：Preemption 接口
+    # ------------------------------------------------------------------
+
+    def mark_swapped(self, state: RequestState) -> None:
+        """将请求从 running 移到 swapped 队列（swap_out 后调用）。"""
+        self._running.pop(state.request.request_id, None)
+        self._swapped.append(state)
+
+    def has_swapped(self) -> bool:
+        return bool(self._swapped)
+
+    def num_swapped(self) -> int:
+        return len(self._swapped)
+
+    def get_swapped_states(self) -> list[RequestState]:
+        """按换出顺序（FIFO）返回所有换出请求。"""
+        return list(self._swapped)
+
+    def move_swapped_to_running(self, state: RequestState) -> None:
+        """将请求从 swapped 移到 running（swap_in 后调用，跳过 prefill 直接参与 decode）。"""
+        try:
+            self._swapped.remove(state)
+        except ValueError:
+            pass
+        self._running[state.request.request_id] = state
+
+    def get_lowest_priority_running(self) -> RequestState | None:
+        """
+        返回 running 中优先级最低的请求（priority 数值最大）。
+        若 running 为空返回 None。优先级相同时返回最早加入的请求（dict 插入顺序）。
+        """
+        if not self._running:
+            return None
+        return max(self._running.values(), key=lambda s: s.request.priority)
 
     # ------------------------------------------------------------------
     # 共用接口

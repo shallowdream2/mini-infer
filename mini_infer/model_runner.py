@@ -1,18 +1,23 @@
 """
-Phase 3/5 模型执行器。
+Phase 3/5/6 模型执行器。
+
+Phase 6 变化（相比 Phase 5）：
+  - decode_batch() 切换到 True PagedAttention 路径：
+      - 删除 gather_batch_kv / DynamicCache / write_decode_kv
+      - 改用 kv_cache.ensure_next_slot + build_block_tables + PagedDecodeContext
+      - flash_attn_with_kvcache 直接从 block tensor 寻址，in-place 写入新 KV
+  - __init__() 调用 patch_model_for_paged_decode() 永久 patch Qwen2 attention 层
+  - prefill() 路径不变（仍用 DynamicCache，patch 在 prefill 时自动回退原始 HF forward）
 
 Phase 5 变化（相比 Phase 3）：
-  - decode_batch() 内三个关键段添加 torch.profiler.record_function 标签：
-    "gather_batch_kv" / "model_forward" / "write_decode_kv"
-  - 标签在 profiler 未激活时为 no-op，不影响正常推理性能
+  - decode_batch() 内三个关键段添加 torch.profiler.record_function 标签
 
 Phase 3 变化（相比 Phase 2）：
-  - decode_batch() 改用 DynamicCache 替代 tuple 格式的 past_key_values，
-    消除 transformers 4.40+ 的弃用警告，兼容后续版本
+  - decode_batch() 改用 DynamicCache 替代 tuple 格式的 past_key_values
 
 Phase 2 已有的设计：
   - prefill() 写完 past_key_values 后，将 KV 写入 KVCacheManager 的 block tensor
-  - decode_batch() 从 block tensor 聚合 KV（左填充对齐），一次 batch forward，写回新 KV
+  - decode_batch() batch 所有活跃请求做一次 GPU forward
 
 dry_run=True 时保留桩实现，不加载真实模型，供无 GPU 的单元测试使用。
 """
@@ -103,6 +108,10 @@ class ModelRunner:
             )
             self.model.eval()
 
+            # Phase 6：永久 patch attention 层，decode 时走 paged attention 路径
+            from .attention import patch_model_for_paged_decode
+            self._paged_ctx = patch_model_for_paged_decode(self.model, self.kv_cache)
+
     def prefill(self, states: list[RequestState]) -> None:
         """
         对每个请求独立跑 prefill forward，从 prefill logits 采样第一个 token，
@@ -139,15 +148,17 @@ class ModelRunner:
 
     def decode_batch(self, states: list[RequestState]) -> None:
         """
-        Batch decode：把所有未完成请求合并成一次 GPU forward，而非串行 for 循环。
+        Batch decode（Phase 6 True PagedAttention 路径）：
+        flash_attn_with_kvcache 直接从 block tensor 寻址，无 gather / DynamicCache / write_kv。
 
         算法：
-          1. 从 block tensor 聚合每个请求的 KV（左填充到 max_seq_len）
-          2. 构造 past_key_values（HF 格式）和 attention_mask（左填充区域为 0）
-          3. 一次 model forward，batch_size = 活跃请求数
-          4. 在 del 大张量前提取 logits 和新 KV
-          5. 把新 token 的 KV 写回 block tensor
-          6. 从 logits 采样下一个 token，更新请求状态
+          1. ensure_next_slot：确保下一写入位置已有物理块
+          2. build_block_tables：构造 block_table / cache_seqlens 张量
+          3. _paged_ctx.set：注入上下文，触发 patched attention 层走 paged 路径
+          4. model.forward（无 past_key_values，无 attention_mask）：
+             flash_attn_with_kvcache 在每层 in-place 写入新 KV，并完成 attention 计算
+          5. advance_seq_lens：递增各请求的 seq_len（KV 已由 flash_attn 写入）
+          6. 采样下一个 token，更新请求状态
         """
         active = [s for s in states if not s.finished]
         if not active:
@@ -168,56 +179,51 @@ class ModelRunner:
             return
 
         request_ids = [s.request.request_id for s in active]
-        batch_size = len(active)
 
-        # 1. 从 block tensor 聚合 KV，left-pad 对齐到 max_seq_len
-        with torch.profiler.record_function("gather_batch_kv"):
-            k_batch, v_batch, seq_lens = self.kv_cache.gather_batch_kv(request_ids)
-        max_seq_len = max(seq_lens)
-        num_layers = len(k_batch)
+        # Phase 6 True PagedAttention 路径：
+        # 1. 确保每个请求的下一个写入位置已有物理块（原 write_decode_kv 的块分配职责）
+        self.kv_cache.ensure_next_slot(request_ids)
 
-        # 2. 构造 DynamicCache：pre-populate with gathered KV（替代 tuple，消除弃用警告）
-        cache = DynamicCache()
-        for l in range(num_layers):
-            cache.update(k_batch[l], v_batch[l], l)
+        # 2. 构造 flash_attn 所需张量
+        block_table, cache_seqlens = self.kv_cache.build_block_tables(request_ids)
 
-        # 3. 构造 input_ids：每个请求最后生成的 token，shape [batch, 1]
+        # 3. input_ids：每个请求最后生成的 token，shape [batch, 1]
         last_tokens = [s.generated_token_ids[-1] for s in active]
         input_ids = torch.tensor(
             [[t] for t in last_tokens], dtype=torch.long, device=self.config.device
         )
 
-        # 4. 构造 attention_mask：shape [batch, max_seq_len + 1]
-        # 左填充区域为 0，真实 token 区域 + 新 token 位置为 1
-        attn_mask = torch.zeros(
-            batch_size, max_seq_len + 1, dtype=torch.long, device=self.config.device
-        )
-        for b, seq_len in enumerate(seq_lens):
-            attn_mask[b, max_seq_len - seq_len:] = 1
+        # 4. position_ids：新 token 的真实位置 = 当前 cache 长度
+        #    形状 [batch, 1]，供各层 attention patched_forward 做 RoPE
+        position_ids = cache_seqlens.long().unsqueeze(1)
 
-        # 5. 一次 batch forward（past_key_values 传 DynamicCache，model 会 in-place append 新 KV）
-        with torch.profiler.record_function("model_forward"):
-            with torch.no_grad():
-                out = self.model(
-                    input_ids=input_ids,
-                    past_key_values=cache,
-                    attention_mask=attn_mask,
-                    use_cache=True,
-                )
+        # 5. 注入 paged context，触发所有 attention 层走 paged 路径
+        #    max_kv_len 在此处做唯一一次 .item() 同步，避免 28 层各同步一次（性能关键）
+        max_kv_len = int(cache_seqlens.max().item()) + 1
+        self._paged_ctx.set(block_table, cache_seqlens, max_kv_len)
 
-        # 6. 提取新 token KV 和 logits
-        # forward 后 out.past_key_values.key_cache[l] shape: [batch, num_kv_heads, max_seq_len+1, head_dim]
-        # 最后位置（-1）是本次新 token 的 KV
-        k_new = [out.past_key_values.key_cache[l][:, :, -1, :].clone() for l in range(num_layers)]
-        v_new = [out.past_key_values.value_cache[l][:, :, -1, :].clone() for l in range(num_layers)]
-        logits_batch = out.logits[:, 0, :].clone()  # [batch, vocab_size]
+        # 6. 一次 batch forward（无 past_key_values，无 attention_mask；
+        #    flash_attn_with_kvcache 通过 block_table+cache_seqlens 管理 KV）
+        try:
+            with torch.profiler.record_function("model_forward"):
+                with torch.no_grad():
+                    out = self.model(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        use_cache=False,
+                    )
 
-        # 写回 block tensor，并释放大张量
-        with torch.profiler.record_function("write_decode_kv"):
-            self.kv_cache.write_decode_kv(request_ids, k_new, v_new)
-        del k_batch, v_batch, cache, out, k_new, v_new
+            logits_batch = out.logits[:, 0, :].clone()  # [batch, vocab_size]
+            del out
 
-        # 7. 采样下一个 token，更新请求状态
+            # 7. flash_attn 已 in-place 写入新 KV，只需递增 seq_len
+            self.kv_cache.advance_seq_lens(request_ids)
+        finally:
+            # 无论 forward 是否抛出异常，都必须清除 paged context
+            # 否则下一次 prefill 会误走 decode 路径
+            self._paged_ctx.clear()
+
+        # 8. 采样下一个 token，更新请求状态
         for b, state in enumerate(active):
             next_token_id = _sample_token(logits_batch[b], state.request.sampling_params)
             state.append_generated(next_token_id, "")

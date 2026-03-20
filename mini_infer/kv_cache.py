@@ -1,5 +1,10 @@
 """
-Phase 3 Paged KV Cache 管理器。
+Phase 3 / Phase 6 Paged KV Cache 管理器。
+
+Phase 6 新增接口（True PagedAttention）：
+  - ensure_next_slot()：decode 前预分配下一 token 的物理块
+  - build_block_tables()：构造 flash_attn_with_kvcache 所需的 block_table / cache_seqlens 张量
+  - advance_seq_lens()：flash_attn in-place 写完 KV 后递增 _seq_lens
 
 Phase 3 优化：gather_batch_kv() 从嵌套 Python 循环改为向量化 advanced indexing，
 减少 Python 解释器开销，所有 block gather 操作合并为单次 CUDA kernel 调用。
@@ -281,6 +286,74 @@ class KVCacheManager:
             self._seq_lens[rid] += 1
 
     # ------------------------------------------------------------------
+    # Phase 7：Preemption — GPU ↔ CPU KV 换出 / 换入
+    # ------------------------------------------------------------------
+
+    def swap_out(self, state: "RequestState") -> None:
+        """
+        将请求的 GPU KV 拷贝到 CPU，释放 GPU 物理块。
+
+        执行后：
+          - state.swapped_seq_len = 换出时的 seq_len（用于 swap_in 重建块分配）
+          - state.cpu_kv = [(k_cpu_l0, v_cpu_l0), ...]（真实模式，dry_run 下为 None）
+          - GPU 物理块已归还到 _free_blocks
+        """
+        request_id = state.request.request_id
+        seq_len = self._seq_lens[request_id]
+        state.swapped_seq_len = seq_len
+
+        if not self._dry_run:
+            block_table = self._block_tables[request_id]
+            cpu_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
+            for l in range(self.num_layers):
+                k_cpu = torch.zeros(seq_len, self.num_kv_heads, self.head_dim)
+                v_cpu = torch.zeros(seq_len, self.num_kv_heads, self.head_dim)
+                for blk_idx, phys_blk in enumerate(block_table):
+                    start = blk_idx * self.block_size
+                    end = min(start + self.block_size, seq_len)
+                    n = end - start
+                    if n <= 0:
+                        break
+                    k_cpu[start:end] = self.k_cache[l][phys_blk, :n].cpu()
+                    v_cpu[start:end] = self.v_cache[l][phys_blk, :n].cpu()
+                cpu_kv.append((k_cpu, v_cpu))
+            state.cpu_kv = cpu_kv
+
+        # 释放 GPU 块（dry_run 下只做元数据清理）
+        self.free_request(state)
+
+    def swap_in(self, state: "RequestState") -> None:
+        """
+        将 CPU KV 拷贝回 GPU，重新分配物理块，恢复请求的 KV cache 状态。
+
+        执行后：
+          - GPU 物理块已重新分配，block_table 和 seq_len 已恢复
+          - state.cpu_kv = None（CPU 副本已释放）
+        """
+        request_id = state.request.request_id
+        seq_len = state.swapped_seq_len
+        num_blocks = max(1, math.ceil(seq_len / self.block_size))
+
+        # 重新分配 GPU 块
+        self._block_tables[request_id] = [self._allocate_block() for _ in range(num_blocks)]
+        self._seq_lens[request_id] = seq_len
+
+        if not self._dry_run and state.cpu_kv is not None:
+            block_table = self._block_tables[request_id]
+            for l in range(self.num_layers):
+                k_cpu, v_cpu = state.cpu_kv[l]
+                for blk_idx, phys_blk in enumerate(block_table):
+                    start = blk_idx * self.block_size
+                    end = min(start + self.block_size, seq_len)
+                    n = end - start
+                    if n <= 0:
+                        break
+                    self.k_cache[l][phys_blk, :n] = k_cpu[start:end].to(self.device)
+                    self.v_cache[l][phys_blk, :n] = v_cpu[start:end].to(self.device)
+
+        state.cpu_kv = None
+
+    # ------------------------------------------------------------------
     # 查询接口（向后兼容）
     # ------------------------------------------------------------------
 
@@ -295,6 +368,61 @@ class KVCacheManager:
 
     def total_allocated_blocks(self) -> int:
         return sum(len(b) for b in self._block_tables.values())
+
+    # ------------------------------------------------------------------
+    # Phase 6：True PagedAttention（flash_attn block_tables）接口
+    # ------------------------------------------------------------------
+
+    def ensure_next_slot(self, request_ids: list[str]) -> None:
+        """
+        确保每个请求下一个 decode 位置已有物理块。
+        必须在 build_block_tables() 之前调用，否则 block_table 会缺失新 token 对应的块。
+        """
+        for rid in request_ids:
+            token_pos = self._seq_lens[rid]
+            block_idx = token_pos // self.block_size
+            if block_idx >= len(self._block_tables[rid]):
+                self._block_tables[rid].append(self._allocate_block())
+
+    def build_block_tables(
+        self,
+        request_ids: list[str],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        为 flash_attn_with_kvcache 构造 block_table 和 cache_seqlens 张量。
+
+        返回：
+            block_table:   [batch, max_blocks_per_seq] int32，padding 填 0
+            cache_seqlens: [batch] int32，新 token 写入前各请求的 cache 长度
+
+        注意：调用前必须先调用 ensure_next_slot()，确保下一写入位置的块已分配。
+        """
+        batch_size = len(request_ids)
+        max_num_blocks = max(len(self._block_tables[rid]) for rid in request_ids)
+
+        block_table = torch.zeros(
+            batch_size, max_num_blocks, dtype=torch.int32, device=self.device
+        )
+        for b, rid in enumerate(request_ids):
+            blocks = self._block_tables[rid]
+            block_table[b, : len(blocks)] = torch.tensor(
+                blocks, dtype=torch.int32, device=self.device
+            )
+
+        cache_seqlens = torch.tensor(
+            [self._seq_lens[rid] for rid in request_ids],
+            dtype=torch.int32,
+            device=self.device,
+        )
+        return block_table, cache_seqlens
+
+    def advance_seq_lens(self, request_ids: list[str]) -> None:
+        """
+        flash_attn_with_kvcache 已 in-place 写入新 token KV 后，递增各请求的 seq_len。
+        替代 write_decode_kv 的 seq_len 更新部分（GPU KV 写入由 flash_attn 完成）。
+        """
+        for rid in request_ids:
+            self._seq_lens[rid] += 1
 
     # ------------------------------------------------------------------
     # 废弃接口（保留以减少测试迁移成本，不再有实际功能）

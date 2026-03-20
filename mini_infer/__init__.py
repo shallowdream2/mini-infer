@@ -2,15 +2,17 @@
 
 from .config import EngineConfig
 from .engine import LLMEngine
+from .pp_engine import PPEngine
 from .replica_engine import ReplicaEngine
 from .request import Request, RequestState, SamplingParams
-from .tp_engine import TPEngine
+from .tp_engine import TPEngine  # 向后兼容别名，TPEngine = PPEngine
 
 __all__ = [
     "EngineConfig",
     "LLMEngine",
+    "PPEngine",
     "ReplicaEngine",
-    "TPEngine",
+    "TPEngine",  # 向后兼容，新代码请使用 PPEngine
     "Request",
     "RequestState",
     "SamplingParams",

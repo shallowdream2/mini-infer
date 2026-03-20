@@ -27,6 +27,7 @@ class Request:
     request_id: str
     prompt: str
     sampling_params: SamplingParams
+    priority: int = 0  # 调度优先级：数值越小优先级越高（0 = 最高）
 
 
 @dataclass(slots=True)
@@ -40,6 +41,11 @@ class RequestState:
     prefilled: bool = False
     finished: bool = False
     finish_reason: str | None = None
+    # Phase 7：preemption 支持
+    # swap_out 时将 GPU KV 拷贝到 CPU，存储于此；swap_in 时清除
+    cpu_kv: list | None = None
+    # swap_out 时记录的 seq_len（含 prompt + 已生成 token 数），供 swap_in 重建块分配
+    swapped_seq_len: int = 0
 
     def append_generated(self, token_id: int, token_text: str) -> None:
         self.generated_token_ids.append(token_id)
