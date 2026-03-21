@@ -25,6 +25,8 @@ class EngineConfig:
     head_dim: int = 128
     tokenizer_name: str | None = None  # 若为 None，则使用 model_name
     dry_run: bool = False  # 为 True 时使用桩实现，不加载真实模型，供无 GPU 或单元测试使用
+    # Phase 9：Chunked Prefill。0 = 禁用（向后兼容）；正整数 = 每步 prefill 的 token 数上限
+    chunk_prefill_size: int = 0
 
     def __post_init__(self) -> None:
         if self.max_batch_size <= 0:
@@ -45,3 +47,5 @@ class EngineConfig:
             raise ValueError("num_kv_heads 必须大于 0")
         if self.head_dim <= 0:
             raise ValueError("head_dim 必须大于 0")
+        if self.chunk_prefill_size < 0:
+            raise ValueError("chunk_prefill_size 不能小于 0")

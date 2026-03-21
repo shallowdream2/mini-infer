@@ -44,4 +44,7 @@
 - [ ] 验证方法：`python -c "from mini_infer.config import EngineConfig; <按脚本里的参数构造>"` 不报 TypeError
 
 ### skills/README.md 同步（每阶段必查）
-- [ ] `.claude/skills/README.md` 中本阶段的进度表已更新为全部 ✓（与 CLAUDE.md 保持一致）
+- [ ] `.claude/skills/README.md` 中本阶段对应行的状态已改为 ✅
+  - 注意：CLAUDE.md 的进度表在 infer-archive 完成后会被删除（行为规则 7）
+  - skills/README.md 保留各阶段完成状态，是独立的历史记录，以 ✅/⬜ 标注各阶段完成情况
+  - 两者语义不同：CLAUDE.md 进度表跟踪**当前阶段**的 7 个步骤，skills/README.md 跟踪**所有阶段**的整体完成情况

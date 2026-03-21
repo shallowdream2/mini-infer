@@ -28,9 +28,11 @@ Codex 侧 `infer-*` skills 与 `mini-infer-*` skills 是适配层，不再单独
 - `README.md`：项目目标、架构、命令、当前状态
 - `本地资料/Claude计划/00-长期路线图.md`：阶段路线图、未来阶段、验收口径
 - `本地资料/环境配置/服务器开发与运行流程.md`：日常开发方式
-- `本地资料/环境配置/phase1-env-notes.md`、`phase4-env-notes.md`、`phase6-env-notes.md`：真实环境坑点与版本事实
+- `本地资料/环境配置/phase1-env-notes.md`、`phase4-env-notes.md`、`phase6-env-notes.md`、`phase8-env-notes.md`：真实环境坑点与版本事实
 - `本地资料/实验记录/`：真实 benchmark 和 profiling 数据
 - `本地资料/里程碑总结/`：阶段复盘、问题和下一步
+
+带日期的开发日志、里程碑总结和实验记录默认按历史快照处理；判断当前状态和未来计划时，优先以 `README.md`、`CLAUDE.md` 和 `本地资料/Claude计划/00-长期路线图.md` 为准。
 
 ## 项目事实
 
@@ -44,7 +46,7 @@ mini-infer 是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学
 - Triton decode attention kernel
 - `Preemption + Priority Scheduling`
 - 双卡扩展（Replica + HF Pipeline Parallel 测量）
-- `OpenAI-compatible HTTP API`
+- `OpenAI Chat Completions 子集兼容 HTTP API`
 
 项目代码主入口：
 
@@ -72,7 +74,7 @@ mini-infer 是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学
 - 默认假设 GPU 可用；不要反复询问 GPU 是否存在
 - 如果缺少模型权重，必须明确说明缺的是哪个模型，不得伪造运行结果
 
-已验证的关键版本快照（2026-03-20）：
+已验证的关键版本快照（2026-03-21）：
 
 - `torch 2.1.2+cu121`
 - `transformers 4.43.4`

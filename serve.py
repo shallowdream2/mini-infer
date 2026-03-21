@@ -2,8 +2,8 @@
 Phase 8 启动脚本。
 
 用法：
-  python serve.py --model /path/to/Qwen2.5-0.5B-Instruct
-  python serve.py --model /path/to/Qwen2.5-0.5B-Instruct --port 8000 --host 0.0.0.0
+  python serve.py --model /path/to/Qwen2.5-7B-Instruct
+  python serve.py --model /path/to/Qwen2.5-7B-Instruct --port 8000 --host 0.0.0.0
   python serve.py --dry-run   # 无模型权重时测试服务器
 
 参数：
@@ -26,7 +26,7 @@ from mini_infer.server import app
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="mini-infer OpenAI-compatible server")
+    parser = argparse.ArgumentParser(description="mini-infer Chat Completions subset-compatible server")
     parser.add_argument("--model", type=str, default="", help="模型目录路径")
     parser.add_argument("--host", type=str, default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)

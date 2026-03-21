@@ -47,6 +47,14 @@
 | Phase 6.5 | ✅ |
 | Phase 7 | ✅ |
 | Phase 8 | ✅ |
+| Phase 9 | ✅ |
+| Phase 10 | ⬜ |
+| Phase 11 | ⬜ |
+| Phase 12 | ⬜ |
+| Phase 12.5 | ⬜ |
+| Phase 13 | ⬜ |
+| Phase 14 | ⬜ |
+| Phase 15 | ⬜ |
 
 ## 使用约定
 

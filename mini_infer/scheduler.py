@@ -1,11 +1,15 @@
 """
-请求调度器，支持 continuous batching（Phase 2）和 preemption / 优先级调度（Phase 7）。
+请求调度器，支持 continuous batching（Phase 2）、preemption / 优先级调度（Phase 7）
+和 chunked prefill（Phase 9）。
 
 核心接口：
   waiting 队列管理：add_request, has_waiting, peek_next_waiting, pop_next_waiting
   running 队列管理：add_to_running, get_running_states, finish_request
   Preemption（Phase 7）：mark_swapped, has_swapped, move_swapped_to_running,
                           get_lowest_priority_running, un_admit
+  Chunked Prefill（Phase 9）：add_to_prefilling, has_prefilling, num_prefilling,
+                               get_prefilling_states, get_next_prefilling,
+                               move_prefilling_to_running, remove_from_prefilling
 
 get_next_batch() 为 Phase 1 遗留接口，仅供 test_scheduler.py 使用，新代码请勿调用。
 """
@@ -25,6 +29,7 @@ class Scheduler:
         self._waiting: deque[RequestState] = deque()
         self._running: dict[str, RequestState] = {}
         self._swapped: deque[RequestState] = deque()  # Phase 7：已换出到 CPU 的请求
+        self._prefilling: dict[str, RequestState] = {}  # Phase 9：chunked prefill 进行中
 
     def add_request(self, state: RequestState) -> None:
         self._waiting.append(state)
@@ -98,11 +103,77 @@ class Scheduler:
         return max(self._running.values(), key=lambda s: s.request.priority)
 
     # ------------------------------------------------------------------
+    # Phase 9：Chunked Prefill 接口
+    # ------------------------------------------------------------------
+
+    def add_to_prefilling(self, state: RequestState) -> None:
+        """将请求加入 PREFILLING 队列（KV 块已通过 init_request 分配）。"""
+        self._prefilling[state.request.request_id] = state
+
+    def has_prefilling(self) -> bool:
+        return bool(self._prefilling)
+
+    def num_prefilling(self) -> int:
+        return len(self._prefilling)
+
+    def get_prefilling_states(self) -> list[RequestState]:
+        return list(self._prefilling.values())
+
+    def get_next_prefilling(self) -> RequestState | None:
+        """返回当前 PREFILLING 中的（唯一一个）请求，供 engine 推进 chunk。"""
+        if self._prefilling:
+            return next(iter(self._prefilling.values()))
+        return None
+
+    def move_prefilling_to_running(self, state: RequestState) -> None:
+        """最后一个 chunk 完成后，将请求从 PREFILLING 移到 RUNNING。"""
+        self._prefilling.pop(state.request.request_id, None)
+        self._running[state.request.request_id] = state
+
+    def remove_from_prefilling(self, state: RequestState) -> None:
+        """将请求从 PREFILLING 移回 WAITING（被抢占时调用）。
+
+        ⚠️  调用方（engine）还必须同步执行以下操作，否则会产生状态污染：
+              1. state.prefilled_tokens = 0      — 重置 chunk 进度
+              2. engine._prefilling_caches.pop(rid, None) — 丢弃中间 DynamicCache
+              3. kv_cache.free_request(state)    — 释放已分配的 GPU 块
+          当前 engine 的抢占路径（preemption）只针对 _running 中的请求，
+          PREFILLING 请求不在 _running 里，因此该方法目前不会被 engine 调用。
+          若将来需要支持 PREFILLING 抢占，请先在 engine 中实现以上三步再调用此方法。
+        """
+        self._prefilling.pop(state.request.request_id, None)
+        state.prefilled_tokens = 0  # 重置 chunk 进度，防止重新准入时从错误位置继续
+        self._waiting.append(state)
+
+    # ------------------------------------------------------------------
     # 共用接口
     # ------------------------------------------------------------------
 
     def finish_request(self, state: RequestState) -> None:
         self._running.pop(state.request.request_id, None)
+
+    def remove_request(self, request_id: str) -> RequestState | None:
+        """
+        从 waiting / prefilling / running / swapped 中移除指定请求。
+
+        供 AsyncEngine 超时、断连或错误恢复时主动取消请求使用。
+        返回被移除的 RequestState；若不存在则返回 None。
+        """
+        state = self._running.pop(request_id, None)
+        if state is not None:
+            return state
+
+        # Phase 9：也检查 prefilling 队列
+        state = self._prefilling.pop(request_id, None)
+        if state is not None:
+            return state
+
+        for queue in (self._waiting, self._swapped):
+            for state in queue:
+                if state.request.request_id == request_id:
+                    queue.remove(state)
+                    return state
+        return None
 
     def num_waiting(self) -> int:
         return len(self._waiting)

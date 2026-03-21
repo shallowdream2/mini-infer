@@ -1,7 +1,7 @@
 """
-Phase 8 OpenAI-compatible API schema。
+Phase 8 OpenAI Chat Completions 子集兼容 schema。
 
-定义与 OpenAI Chat Completions API 兼容的请求/响应 Pydantic 模型，
+定义 mini-infer 当前支持的 Chat Completions 受限子集请求/响应 Pydantic 模型，
 供 server.py 的路由层使用。
 
 覆盖接口：
@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, conlist
 
 
 # ---------------------------------------------------------------------------
@@ -28,14 +28,14 @@ class ChatMessage(BaseModel):
 
 
 class ChatCompletionRequest(BaseModel):
-    model: str
-    messages: list[ChatMessage]
+    model: str = Field(min_length=1)
+    messages: conlist(ChatMessage, min_items=1)
     stream: bool = False
-    max_tokens: int = 128
-    temperature: float = 0.0
-    top_p: float = 1.0
-    # 以下字段接受但不处理（SDK 兼容性）
-    n: int = 1
+    max_tokens: int = Field(default=128, ge=1)
+    temperature: float = Field(default=0.0, ge=0.0)
+    top_p: float = Field(default=1.0, gt=0.0, le=1.0)
+    # 以下字段保留在 schema 中用于基础 SDK 兼容；当前服务仅支持默认值
+    n: int = Field(default=1, ge=1, le=1)
     presence_penalty: float = 0.0
     frequency_penalty: float = 0.0
     stop: list[str] | str | None = None

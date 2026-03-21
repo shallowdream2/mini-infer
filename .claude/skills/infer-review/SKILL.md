@@ -38,6 +38,7 @@ argument-hint: [审查范围]
 - **只列问题，不改代码**：review 阶段只输出问题清单和总结，不得直接 Edit 或 Write 任何文件
 - 修复留给 infer-implement；review 与 implement 是两个独立步骤，不得合并执行
 - 如果发现问题后忍不住想直接改——停下来，把问题写进清单，等用户调用 infer-implement
+- **缺失测试或断言偏弱**：归入"建议修复"清单，描述清楚缺什么测试/为什么偏弱，由后续 infer-implement 补写；不应因此阻塞 infer-benchmark（除非缺少测试导致核心路径完全无法验证）
 
 ## 检查优先级
 

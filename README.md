@@ -13,9 +13,12 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **True PagedAttention**：flash_attn_with_kvcache block_table，decode attention 直接从 block tensor 寻址
 - **Triton Decode Kernel**：手写 Triton attention kernel（online softmax + GQA），对比 flash_attn
 - **Preemption + Priority Scheduling**：GPU KV swap to CPU，优先级调度，低优先级请求主动让出 GPU 块
-- **OpenAI-compatible HTTP API**：FastAPI + SSE streaming，AsyncEngine 实现跨 HTTP 请求的 continuous batching
+- **OpenAI Chat Completions 子集兼容 HTTP API**：FastAPI + SSE streaming，AsyncEngine 实现跨 HTTP 请求的 continuous batching
+- **Chunked Prefill**：长 prompt 拆分 chunk 投送，decode 请求不被长 prefill 饿死（ITL spike −57%~−67%）
 
 项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。
+
+**权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
 
 ## 性能数据
 
@@ -49,48 +52,22 @@ PP 吞吐持平，价值在于每卡显存减半（支持装不进单卡的大�
 注：此处 PP = Pipeline Parallel（HF device_map="balanced"，不同层在不同 GPU），不是 Tensor Parallel（同层 all-reduce）。
 说明：上表保留 Phase 4 的历史测量结果；当前 `benchmarks/benchmark_multi_gpu.py` 为了对齐主线 paged decode 路径，single/replica 默认使用 `block_size=256`、`num_gpu_blocks=200`。
 
-## 架构设计
+## 架构概览
 
 ```
-engine.py           LLMEngine：continuous batching 主循环 + Phase 8 add_request/step 接口
-  ├── scheduler.py      Scheduler：waiting/running/swapped 队列管理（Phase 7 preemption）
+engine.py           LLMEngine：continuous batching 主循环（Phase 8 HTTP 接口，Phase 9 chunked prefill）
+  ├── scheduler.py      Scheduler：waiting/running/swapped/prefilling 队列（Phase 7 preemption，Phase 9）
   ├── kv_cache.py       KVCacheManager：Paged KV Cache（BlockTable + FreeBlockPool + swap_out/in）
   ├── attention.py      PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
   └── model_runner.py   ModelRunner：prefill + batch decode 执行
 
-async_engine.py     AsyncEngine：后台线程 step loop + asyncio.Queue，供 HTTP server 使用
-server.py           FastAPI HTTP server：GET /v1/models，POST /v1/chat/completions
-openai_schema.py    OpenAI Chat Completions API Pydantic 模型
-serve.py            CLI 启动脚本（argparse + uvicorn）
-
-replica_engine.py   ReplicaEngine：双卡数据并行（ThreadPoolExecutor）
-tp_engine.py        TPEngine：HF Pipeline Parallel（测量用，device_map="balanced"）
+async_engine.py     AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
+server.py / serve.py  FastAPI HTTP server + CLI 启动（Phase 8）
+replica_engine.py   ReplicaEngine：双卡数据并行
+tp_engine.py        TPEngine：HF Pipeline Parallel（测量用）
 ```
 
-**decode_batch 关键步骤（Phase 6，True PagedAttention）：**
-1. `ensure_next_slot`：确保下一个 decode 位置有物理块
-2. `build_block_tables`：构建 block_table / cache_seqlens
-3. `paged_ctx.set`：注入共享状态（含预计算的 max_kv_len，避免 28 层各做一次 `.item()`）
-4. `model_forward`：28 层 patched attention 直接从 block tensor 寻址（flash_attn_with_kvcache）
-5. `advance_seq_lens`：递增各请求的逻辑序列长度计数器
-
-**Preemption 调度流程（Phase 7）：**
-1. 高优先级请求准入时若 KV 块不足，换出最低优先级的 running 请求
-2. 被换出的请求若已 prefill（KV 有效）：`swap_out` → CPU 存储，加入 swapped 队列
-3. 被换出的请求若未 prefill：直接释放 KV 块，放回 waiting 队尾（避免保存无效 KV）
-4. 有空闲块时：从 swapped 队列 `swap_in`，重新加入 running
-
-**HTTP API 并发架构（Phase 8）：**
-```
-HTTP 请求 A ─┐
-HTTP 请求 B ─┤─→ LLMEngine.add_request() → 共享 Scheduler
-HTTP 请求 C ─┘        ↓
-                 后台线程 step loop（LLMEngine.step()）
-                       ↓ decode_batch([A, B, C])
-                 asyncio.Queue (per request)
-                       ↓ call_soon_threadsafe
-                 async generator（per HTTP connection）
-```
+详细架构说明、关键步骤和状态机参见 `CLAUDE.md`。
 
 ## 快速开始
 
@@ -113,10 +90,10 @@ export HF_HUB_OFFLINE=1
 # HuggingFace baseline
 conda run -n ai-infra python benchmarks/benchmark_hf.py --model $MODEL --batch-size 8 --max-new-tokens 128
 
-# mini-infer Phase 3（向量化 gather + DynamicCache）
+# mini-infer 当前主线单卡 benchmark（Phase 6 路径，含 TTFT/TPOT）
 conda run -n ai-infra python benchmarks/benchmark_mini.py --model $MODEL --batch-size 8 --max-new-tokens 128
 
-# mini-infer Phase 6（True PagedAttention，flash_attn block_table，双 GPU 对比）
+# mini-infer vs HF baseline（True PagedAttention，flash_attn block_table，双 GPU 对比）
 conda run -n ai-infra python benchmarks/benchmark_flash.py --model $MODEL --batch-size 8 --max-new-tokens 128 \
     --device cuda:0 --num-gpu-blocks 200 --compare --hf-device cuda:1
 ```
@@ -187,6 +164,22 @@ curl http://localhost:8000/v1/chat/completions \
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"mini-infer","messages":[{"role":"user","content":"你好"}],"stream":true,"max_tokens":64}'
+
+# OpenAI Python SDK（如 shell 中存在代理变量，先清掉）
+env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u http_proxy -u https_proxy \
+  conda run -n ai-infra python -c "from openai import OpenAI; client = OpenAI(base_url='http://127.0.0.1:8000/v1', api_key='none'); resp = client.chat.completions.create(model='mini-infer', messages=[{'role':'user','content':'hello'}], max_tokens=8); print(resp.choices[0].message.content)"
+
+# 直接 uvicorn 启动（未注入 config 时默认回退到 dry_run）
+uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
+
+# 真实模型也可通过环境变量启动
+MINI_INFER_MODEL=$MODEL uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
+
+# HTTP benchmark（Phase 8）
+conda run -n ai-infra python benchmarks/benchmark_server.py --model $MODEL
+
+# Chunked Prefill benchmark（Phase 9）
+conda run -n ai-infra python benchmarks/benchmark_chunked_prefill.py --model $MODEL --chunk-size 256
 ```
 
 ### 单元测试（无 GPU）
@@ -201,6 +194,9 @@ conda run -n ai-infra python -m pytest tests/test_preemption.py -v
 # Phase 8 HTTP server 测试（dry_run，无需 GPU）
 conda run -n ai-infra python -m pytest tests/test_server.py -v
 
+# Phase 9 Chunked Prefill 测试（dry_run，无需 GPU）
+conda run -n ai-infra python -m pytest tests/test_chunked_prefill.py -v
+
 # Phase 6 GPU 测试（需要 2× RTX 4090）
 conda run -n ai-infra python -m pytest tests/test_paged_attention.py -v
 ```
@@ -211,11 +207,11 @@ conda run -n ai-infra python -m pytest tests/test_paged_attention.py -v
 mini_infer/              核心推理代码
   config.py              EngineConfig 数据类
   request.py             Request / RequestState / SamplingParams
-  scheduler.py           请求调度器（waiting/running/swapped 队列，Phase 7 preemption）
+  scheduler.py           请求调度器（waiting/running/swapped/prefilling 队列，Phase 7/9）
   kv_cache.py            Paged KV Cache（BlockTable + FreeBlockPool + swap_out/in）
   attention.py           PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
   model_runner.py        ModelRunner（prefill + batch decode，含 profiler 标签）
-  engine.py              LLMEngine：continuous batching 主循环 + Phase 8 step 接口
+  engine.py              LLMEngine：continuous batching 主循环（Phase 8 HTTP 接口，Phase 9 chunked prefill）
   async_engine.py        AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
   openai_schema.py       OpenAI Chat Completions API Pydantic 模型（Phase 8）
   server.py              FastAPI HTTP server（Phase 8）
@@ -228,11 +224,13 @@ serve.py                 HTTP server CLI 启动脚本（Phase 8）
 
 benchmarks/
   benchmark_hf.py        HuggingFace Transformers baseline
-  benchmark_mini.py      mini-infer 单卡 benchmark（Phase 3）
-  benchmark_flash.py     mini-infer Phase 6 benchmark（flash_attn block_table，含 --compare）
+  benchmark_mini.py      mini-infer 当前主线单卡 benchmark（Phase 6 路径，含 TTFT/TPOT）
+  benchmark_flash.py     mini-infer vs HF baseline benchmark（Phase 6，含 --compare）
   benchmark_multi_gpu.py 双卡 benchmark（replica/pp）
   benchmark_triton.py    Triton kernel latency 对比 benchmark（Phase 6.5）
   benchmark_preemption.py Phase 7 preemption swap latency + 吞吐回归测试
+  benchmark_server.py    Phase 8 HTTP API benchmark（TTFT/TPOT/并发吞吐）
+  benchmark_chunked_prefill.py  Phase 9 Chunked Prefill benchmark（ITL spike / TTFT 对比）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
 
 tests/
@@ -243,6 +241,7 @@ tests/
   test_engine.py           LLMEngine 主循环集成测试（dry_run，含 KV 耗尽、块回收、顺序保证）
   test_preemption.py       Phase 7 preemption + priority scheduling 测试（dry_run）
   test_server.py           Phase 8 HTTP server 测试（ASGI TestClient，dry_run）
+  test_chunked_prefill.py  Phase 9 Chunked Prefill 测试（dry_run，状态机 + 端到端 + KV 无泄漏）
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
@@ -265,13 +264,14 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 6 | True PagedAttention（flash_attn block_table，消除 gather/write_kv，batch=8 达到 100% HF）| ✅ 完成 |
 | Phase 6.5 | Triton decode attention kernel（online softmax，GQA，roofline 分析）| ✅ 完成 |
 | Phase 7 | Preemption + Priority Scheduling（GPU↔CPU KV swap，优先级调度）| ✅ 完成 |
-| Phase 8 | OpenAI-compatible HTTP API（FastAPI + SSE streaming，AsyncEngine）| 🔄 进行中 |
+| Phase 8 | OpenAI Chat Completions 子集兼容 HTTP API（FastAPI + SSE streaming，AsyncEngine）| ✅ 完成 |
+| Phase 9 | Chunked Prefill（长 prefill 不阻塞 decode，ITL spike −57% @ chunk=256）| ✅ 完成 |
+| Phase 10 | Prefix Caching（RadixAttention，KV 前缀共享）| ⬜ 计划中 |
+| Phase 11 | Speculative Decoding（draft+target 双模型推理加速）| ⬜ 计划中 |
+| Phase 12 | CUDA Graph（decode_batch 静态捕获，消除 Python dispatch 开销）| ⬜ 计划中 |
+| Phase 12.5 | Flash Decoding（Split-K，长序列 attention 并行化）| ⬜ 计划中 |
+| Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce）| ⬜ 计划中 |
+| Phase 14 | MLA（Multi-head Latent Attention，DeepSeek 架构）| ⬜ 计划中 |
+| Phase 15 | PD 解耦（Disaggregated Prefill/Decode）| ⬜ 计划中 |
 
-## 工作环境说明
-
-- 当前协作默认假设：已位于 Ubuntu 24.04 项目终端内
-- 当前开发复用 `ai-infra` Conda 环境，不默认新建环境
-- 真实模型推理、benchmark、多卡实验需要 CUDA GPU、模型权重和对应依赖
-- 模型加载建议使用 `HF_HUB_OFFLINE=1` + 本地绝对路径（避免 HF snapshot 缺失触发重下载）
-- Phase 8 HTTP server 测试（`test_server.py`）使用 dry_run 模式，无需 GPU 或模型权重
-- Codex 迁移资产位于 `CODEX.md` 和 `.codex/`；真正安装到 `~/.codex/skills/` 仍然是本机手动步骤
+后续阶段验收口径详见 `CLAUDE.md`。

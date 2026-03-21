@@ -1,5 +1,11 @@
 """
-Phase 3/5/6 模型执行器。
+Phase 3/5/6/9 模型执行器。
+
+Phase 9 新增（相比 Phase 6）：
+  - prefill_chunk(state, token_start, token_end, past_cache, is_last_chunk)：
+      对 prompt_token_ids[token_start:token_end] 做部分 prefill
+      非最后 chunk：返回积累的 DynamicCache（供下一 chunk 使用）
+      最后一个 chunk：写入 block tensor，采样第一个 token，设 prefilled=True，返回 None
 
 Phase 6 变化（相比 Phase 5）：
   - decode_batch() 切换到 True PagedAttention 路径：
@@ -145,6 +151,57 @@ class ModelRunner:
                 state.mark_finished("eos")
             elif len(state.generated_token_ids) >= state.request.sampling_params.max_new_tokens:
                 state.mark_finished("length")
+
+    def prefill_chunk(
+        self,
+        state: RequestState,
+        token_start: int,
+        token_end: int,
+        past_cache,
+        is_last_chunk: bool,
+    ):
+        """
+        Phase 9：对 prompt_token_ids[token_start:token_end] 做部分 prefill。
+
+        past_cache: 上一 chunk 返回的 DynamicCache（第一个 chunk 传 None）。
+        is_last_chunk=False：返回积累的 DynamicCache，不采样 token，不设 prefilled=True。
+        is_last_chunk=True：写入 block tensor，采样第一个 token，设 prefilled=True，返回 None。
+
+        调用方职责：
+          - 非最后 chunk：保存返回值供下一次调用使用
+          - 最后 chunk：丢弃返回值（None），并将请求移入 running
+        """
+        state.prefilled_tokens = token_end
+
+        if self.config.dry_run:
+            if is_last_chunk:
+                state.append_generated(1, " [1]")
+                state.prefilled = True
+                if len(state.generated_token_ids) >= state.request.sampling_params.max_new_tokens:
+                    state.mark_finished("length")
+            return None
+
+        chunk_ids = state.prompt_token_ids[token_start:token_end]
+        input_ids = torch.tensor([chunk_ids], dtype=torch.long, device=self.config.device)
+
+        if past_cache is None:
+            past_cache = DynamicCache()
+
+        with torch.no_grad():
+            out = self.model(input_ids=input_ids, past_key_values=past_cache, use_cache=True)
+
+        if is_last_chunk:
+            self.kv_cache.write_prefill_kv(state.request.request_id, out.past_key_values)
+            next_token_id = _sample_token(out.logits[0, -1], state.request.sampling_params)
+            state.append_generated(next_token_id, "")
+            state.prefilled = True
+            if next_token_id == self.eos_token_id:
+                state.mark_finished("eos")
+            elif len(state.generated_token_ids) >= state.request.sampling_params.max_new_tokens:
+                state.mark_finished("length")
+            return None
+        else:
+            return out.past_key_values  # 积累的 DynamicCache，供下一 chunk 使用
 
     def decode_batch(self, states: list[RequestState]) -> None:
         """

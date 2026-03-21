@@ -50,11 +50,13 @@ asyncio_mode = "strict"
 
 ## 代理环境注意事项
 
-服务器环境有 `ALL_PROXY` 环境变量，会影响 OpenAI SDK 客户端直连本地服务：
+服务器环境存在代理变量（如 `ALL_PROXY` / `HTTP_PROXY` / `HTTPS_PROXY`），会影响 OpenAI SDK 客户端直连本地服务。
+
+已验证可行的调用方式：
 
 ```bash
-# 测试本地服务时绕过代理
-env -u ALL_PROXY python -c "from openai import OpenAI; ..."
+env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u http_proxy -u https_proxy \
+  conda run -n ai-infra python -c "from openai import OpenAI; client = OpenAI(base_url='http://127.0.0.1:8000/v1', api_key='none'); resp = client.chat.completions.create(model='mini-infer', messages=[{'role':'user','content':'hello'}], max_tokens=8); print(resp.choices[0].message.content)"
 ```
 
-这是 Phase 8 验收标准 2（OpenAI SDK 调用）仅"部分达成"的原因。
+结论：问题在本机代理环境，而不是 API 格式本身。Phase 8 的 OpenAI SDK 基础调用现已验证通过，但仍需遵守当前接口是 Chat Completions 受限子集这一边界。

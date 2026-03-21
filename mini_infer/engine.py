@@ -1,5 +1,5 @@
 """
-Phase 7/8 推理引擎。
+Phase 7/8/9 推理引擎。
 
 Phase 7：continuous batching + preemption + priority scheduling（generate() 接口）。
 
@@ -11,12 +11,19 @@ Phase 8 新增：单步接口，供 AsyncEngine / HTTP 服务使用：
   - has_unfinished_requests() → bool
   - is_finished(request_id) → bool
 
+Phase 9 新增：Chunked Prefill（chunk_prefill_size > 0 时启用）：
+  - 长 prompt 请求分多步 prefill，每步只处理 chunk_prefill_size 个 token
+  - PREFILLING 状态介于 WAITING 和 RUNNING 之间，一次最多 1 个请求处于该状态
+  - 中间 DynamicCache 保存在 _prefilling_caches（CPU 内存），最后一个 chunk 后写入 block tensor
+  - generate() 和 step() 两条路径均支持，chunk_prefill_size=0 时行为与 Phase 8 完全一致
+
 注意：generate() 和 add_request/step() 使用同一个 scheduler/kv_cache，
 不得同时混用——同一时刻只用一种接口。
 
 主循环结构（每次 step 迭代）：
   1. 准入：接入尽可能多的等待请求，块不足时尝试抢占低优先级 running 请求
-  2. Prefill：对新接入的请求做 prefill
+     （chunk_prefill_size > 0 时：准入到 PREFILLING 而非直接 RUNNING）
+  2. Prefill：对新接入的请求做 prefill（或推进当前 PREFILLING 请求的一个 chunk）
   3. Batch decode：一次 forward 处理所有 running 请求
   4. 清理：移除已完成请求，释放 KV 块
   5. Swap_in：有空闲块时将 swapped 请求换回，加入 running
@@ -47,12 +54,16 @@ class LLMEngine:
         self.model_runner = ModelRunner(config=config, kv_cache=self.kv_cache)
         # Phase 8：单步接口的请求状态追踪（request_id → RequestState）
         self._step_states: dict[str, RequestState] = {}
+        # Phase 9：chunked prefill 时保存中间 DynamicCache（request_id → DynamicCache | None）
+        self._prefilling_caches: dict[str, object] = {}
 
     def generate(
         self,
         prompts: list[str],
         max_new_tokens: int = 128,
         priorities: list[int] | None = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> list[str]:
         """
         批量生成，返回与输入 prompts 顺序一致的输出文本列表。
@@ -69,7 +80,11 @@ class LLMEngine:
             request = Request(
                 request_id=str(uuid4()),
                 prompt=prompt,
-                sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+                sampling_params=SamplingParams(
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                    top_p=top_p,
+                ),
                 priority=priority,
             )
             state = RequestState(
@@ -84,71 +99,129 @@ class LLMEngine:
         try:
             while (
                 self.scheduler.has_waiting()
+                or self.scheduler.has_prefilling()
                 or self.scheduler.num_running() > 0
                 or self.scheduler.has_swapped()
             ):
-                # ── 1. 准入：接入尽可能多的等待请求，块不足时尝试抢占 ──────────
-                newly_admitted: list[RequestState] = []
-                while (
-                    self.scheduler.has_waiting()
-                    and self.scheduler.num_running() < self.config.max_batch_size
-                ):
-                    next_state = self.scheduler.peek_next_waiting()
-                    assert next_state is not None
-
-                    prompt_len = len(next_state.prompt_token_ids)
-                    max_out = next_state.request.sampling_params.max_new_tokens
-                    blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
-
-                    # 快速路径：即使清空所有 GPU 块也装不下，直接报错
-                    if blocks_needed > self.config.num_gpu_blocks:
-                        raise RuntimeError(
-                            f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块"
-                            f"（prompt={prompt_len} + max_new_tokens={max_out}），"
-                            f"超过系统总块数 {self.config.num_gpu_blocks}。"
-                            f"请增大 num_gpu_blocks 或减小 max_new_tokens。"
-                        )
-
-                    if self.kv_cache.num_free_blocks() >= blocks_needed:
-                        # 正常准入
-                        state = self.scheduler.pop_next_waiting()
-                        self.kv_cache.init_request(state)
-                        self.scheduler.add_to_running(state)
-                        newly_admitted.append(state)
-                    else:
-                        # 块不足：尝试换出优先级更低的 running 请求
-                        victim = self.scheduler.get_lowest_priority_running()
-                        if (
-                            victim is not None
-                            and victim.request.priority > next_state.request.priority
-                        ):
-                            if not victim.prefilled:
-                                # 刚准入但尚未 prefill：撤销准入，块归还，放回 waiting 队尾
-                                # 不能走 swap_out：此时 KV 为零值，保存到 CPU 无意义且会破坏续写
-                                self.kv_cache.free_request(victim)
-                                self.scheduler.un_admit(victim)
-                                newly_admitted.remove(victim)
-                            else:
-                                # 已完成 prefill：KV 有效，换出到 CPU，加入换出队列
-                                self.kv_cache.swap_out(victim)
-                                self.scheduler.mark_swapped(victim)
-                            continue  # 腾出块后重新检查空闲块数
-
-                        # 无法换出：若确实卡死则报错，否则等待
-                        if self.scheduler.num_running() == 0 and not newly_admitted:
+                if self.config.chunk_prefill_size > 0:
+                    # ── Chunked Prefill 路径（Phase 9）────────────────────────
+                    # 1a. 若无正在进行的 prefill，从 waiting 准入一个请求到 PREFILLING
+                    if (
+                        not self.scheduler.has_prefilling()
+                        and self.scheduler.has_waiting()
+                        and (self.scheduler.num_running() + self.scheduler.num_prefilling())
+                            < self.config.max_batch_size
+                    ):
+                        next_state = self.scheduler.peek_next_waiting()
+                        assert next_state is not None
+                        prompt_len = len(next_state.prompt_token_ids)
+                        max_out = next_state.request.sampling_params.max_new_tokens
+                        blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
+                        if blocks_needed > self.config.num_gpu_blocks:
                             raise RuntimeError(
                                 f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块"
                                 f"（prompt={prompt_len} + max_new_tokens={max_out}），"
-                                f"但当前仅有 {self.kv_cache.num_free_blocks()} 个空闲块，"
-                                f"且没有优先级更低的 running 请求可换出。"
+                                f"超过系统总块数 {self.config.num_gpu_blocks}。"
                             )
-                        break  # 有 running 请求，等待它们完成后释放块
+                        if self.kv_cache.num_free_blocks() >= blocks_needed:
+                            state = self.scheduler.pop_next_waiting()
+                            self.kv_cache.init_request(state)
+                            self.scheduler.add_to_prefilling(state)
+                        else:
+                            victim = self.scheduler.get_lowest_priority_running()
+                            if (
+                                victim is not None
+                                and victim.request.priority > next_state.request.priority
+                            ):
+                                if not victim.prefilled:
+                                    self.kv_cache.free_request(victim)
+                                    self.scheduler.un_admit(victim)
+                                else:
+                                    self.kv_cache.swap_out(victim)
+                                    self.scheduler.mark_swapped(victim)
+                                # 腾出块后立即尝试准入
+                                if self.kv_cache.num_free_blocks() >= blocks_needed:
+                                    state = self.scheduler.pop_next_waiting()
+                                    self.kv_cache.init_request(state)
+                                    self.scheduler.add_to_prefilling(state)
 
-                # ── 2. Prefill：对新接入的请求做 prefill ─────────────────────
-                if newly_admitted:
-                    self.model_runner.prefill(newly_admitted)
+                    # 2a. 推进当前 PREFILLING 请求的一个 chunk
+                    pf_state = self.scheduler.get_next_prefilling()
+                    if pf_state is not None:
+                        rid = pf_state.request.request_id
+                        t_start = pf_state.prefilled_tokens
+                        t_end = min(
+                            t_start + self.config.chunk_prefill_size,
+                            len(pf_state.prompt_token_ids),
+                        )
+                        is_last = (t_end == len(pf_state.prompt_token_ids))
+                        cache = self._prefilling_caches.get(rid)
+                        new_cache = self.model_runner.prefill_chunk(
+                            pf_state, t_start, t_end, cache, is_last
+                        )
+                        if is_last:
+                            self._prefilling_caches.pop(rid, None)
+                            self.scheduler.move_prefilling_to_running(pf_state)
+                        else:
+                            self._prefilling_caches[rid] = new_cache
 
-                # ── 3. Batch decode：一次 forward 处理所有 running 请求 ──────
+                else:
+                    # ── 原始路径（Phase 8 行为，chunk_prefill_size == 0）────────
+                    # 1. 准入：接入尽可能多的等待请求，块不足时尝试抢占
+                    newly_admitted: list[RequestState] = []
+                    while (
+                        self.scheduler.has_waiting()
+                        and self.scheduler.num_running() < self.config.max_batch_size
+                    ):
+                        next_state = self.scheduler.peek_next_waiting()
+                        assert next_state is not None
+
+                        prompt_len = len(next_state.prompt_token_ids)
+                        max_out = next_state.request.sampling_params.max_new_tokens
+                        blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
+
+                        if blocks_needed > self.config.num_gpu_blocks:
+                            raise RuntimeError(
+                                f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块"
+                                f"（prompt={prompt_len} + max_new_tokens={max_out}），"
+                                f"超过系统总块数 {self.config.num_gpu_blocks}。"
+                                f"请增大 num_gpu_blocks 或减小 max_new_tokens。"
+                            )
+
+                        if self.kv_cache.num_free_blocks() >= blocks_needed:
+                            state = self.scheduler.pop_next_waiting()
+                            self.kv_cache.init_request(state)
+                            self.scheduler.add_to_running(state)
+                            newly_admitted.append(state)
+                        else:
+                            victim = self.scheduler.get_lowest_priority_running()
+                            if (
+                                victim is not None
+                                and victim.request.priority > next_state.request.priority
+                            ):
+                                if not victim.prefilled:
+                                    self.kv_cache.free_request(victim)
+                                    self.scheduler.un_admit(victim)
+                                    newly_admitted.remove(victim)
+                                else:
+                                    self.kv_cache.swap_out(victim)
+                                    self.scheduler.mark_swapped(victim)
+                                continue
+
+                            if self.scheduler.num_running() == 0 and not newly_admitted:
+                                raise RuntimeError(
+                                    f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块"
+                                    f"（prompt={prompt_len} + max_new_tokens={max_out}），"
+                                    f"但当前仅有 {self.kv_cache.num_free_blocks()} 个空闲块，"
+                                    f"且没有优先级更低的 running 请求可换出。"
+                                )
+                            break
+
+                    # 2. Prefill
+                    if newly_admitted:
+                        self.model_runner.prefill(newly_admitted)
+
+                # ── 3. Batch decode：两条路径共用 ────────────────────────────
                 running = self.scheduler.get_running_states()
                 if running:
                     self.model_runner.decode_batch(running)
@@ -156,17 +229,19 @@ class LLMEngine:
                 # ── 4. 清理完成的请求 ────────────────────────────────────────
                 for state in list(running):
                     if state.finished:
-                        outputs[state.request.request_id] = (
-                            self.model_runner.tokenizer.decode(
-                                state.generated_token_ids, skip_special_tokens=True
-                            )
+                        state.decoded_text = self.model_runner.tokenizer.decode(
+                            state.generated_token_ids, skip_special_tokens=True
                         )
+                        outputs[state.request.request_id] = state.decoded_text
                         self.kv_cache.free_request(state)
                         self.scheduler.finish_request(state)
 
                 # ── 5. 换入：将 swapped 请求换回 GPU（有足够块时）────────────
+                # 注意：检查时同时计入 num_prefilling()，防止 PREFILLING 请求完成后
+                # 导致 running + 1 超出 max_batch_size（chunked prefill 场景下的边界条件）
                 for swapped_state in self.scheduler.get_swapped_states():
-                    if self.scheduler.num_running() >= self.config.max_batch_size:
+                    if (self.scheduler.num_running() + self.scheduler.num_prefilling()
+                            >= self.config.max_batch_size):
                         break
                     needed = max(
                         1, math.ceil(swapped_state.swapped_seq_len / self.config.block_size)
@@ -188,6 +263,17 @@ class LLMEngine:
                         f"warning: free_request failed for {state.request.request_id!r}: {free_exc}",
                         file=sys.stderr,
                     )
+            # Phase 9：归还 PREFILLING 请求的 GPU 块
+            for state in self.scheduler.get_prefilling_states():
+                try:
+                    self.kv_cache.free_request(state)
+                except Exception as free_exc:
+                    import sys
+                    print(
+                        f"warning: free_request failed for {state.request.request_id!r}: {free_exc}",
+                        file=sys.stderr,
+                    )
+            self._prefilling_caches.clear()
             # 清除 swapped 请求的 CPU KV，释放 CPU 内存
             for state in self.scheduler.get_swapped_states():
                 state.cpu_kv = None
@@ -208,6 +294,8 @@ class LLMEngine:
         max_new_tokens: int = 128,
         priority: int = 0,
         request_id: str | None = None,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
     ) -> str:
         """
         将单个请求加入等待队列，返回 request_id。
@@ -224,7 +312,11 @@ class LLMEngine:
         request = Request(
             request_id=request_id,
             prompt=prompt,
-            sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
+            sampling_params=SamplingParams(
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+            ),
             priority=priority,
         )
         state = RequestState(
@@ -244,10 +336,38 @@ class LLMEngine:
         """
         self._step_states.pop(request_id, None)
 
+    def get_finish_reason(self, request_id: str) -> str | None:
+        """返回请求的内部结束原因（如 length / eos）。"""
+        state = self._step_states.get(request_id)
+        return state.finish_reason if state is not None else None
+
+    def cancel_request(self, request_id: str) -> bool:
+        """
+        主动取消请求，并回收其 KV / CPU swap 资源。
+
+        返回值：
+          - True: 成功找到并移除了该请求
+          - False: 请求不存在或已清理
+        """
+        state = self._step_states.pop(request_id, None)
+        if state is None:
+            return False
+
+        removed = self.scheduler.remove_request(request_id)
+        state = removed if removed is not None else state
+
+        if request_id in self.kv_cache._block_tables:
+            self.kv_cache.free_request(state)
+        state.cpu_kv = None
+        # Phase 9：清除中间 prefill cache
+        self._prefilling_caches.pop(request_id, None)
+        return removed is not None
+
     def has_unfinished_requests(self) -> bool:
-        """True 当且仅当有 waiting、running 或 swapped 请求。"""
+        """True 当且仅当有 waiting、prefilling、running 或 swapped 请求。"""
         return (
             self.scheduler.has_waiting()
+            or self.scheduler.has_prefilling()
             or self.scheduler.num_running() > 0
             or self.scheduler.has_swapped()
         )
@@ -267,63 +387,131 @@ class LLMEngine:
         new_tokens: dict[str, list[str]] = {}
 
         try:
-            # ── 1. 准入（与 generate() 相同逻辑）────────────────────────
-            newly_admitted: list[RequestState] = []
-            while (
-                self.scheduler.has_waiting()
-                and self.scheduler.num_running() < self.config.max_batch_size
-            ):
-                next_state = self.scheduler.peek_next_waiting()
-                assert next_state is not None
+            # just_prefilled：本步刚完成 prefill（整体 prefill 或最后一个 chunk）进入 running 的请求。
+            # 供下方 pre_lens 逻辑将其初始 pre 置 0，使 prefill 采样的第一个 token 被捕获进入 new_tokens。
+            just_prefilled: list[RequestState] = []
 
-                prompt_len = len(next_state.prompt_token_ids)
-                max_out = next_state.request.sampling_params.max_new_tokens
-                blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
-
-                if blocks_needed > self.config.num_gpu_blocks:
-                    raise RuntimeError(
-                        f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块，"
-                        f"超过系统总块数 {self.config.num_gpu_blocks}。"
-                    )
-
-                if self.kv_cache.num_free_blocks() >= blocks_needed:
-                    state = self.scheduler.pop_next_waiting()
-                    self.kv_cache.init_request(state)
-                    self.scheduler.add_to_running(state)
-                    newly_admitted.append(state)
-                else:
-                    victim = self.scheduler.get_lowest_priority_running()
-                    if (
-                        victim is not None
-                        and victim.request.priority > next_state.request.priority
-                    ):
-                        if not victim.prefilled:
-                            self.kv_cache.free_request(victim)
-                            self.scheduler.un_admit(victim)
-                            newly_admitted.remove(victim)
-                        else:
-                            self.kv_cache.swap_out(victim)
-                            self.scheduler.mark_swapped(victim)
-                        continue
-
-                    if self.scheduler.num_running() == 0 and not newly_admitted:
+            if self.config.chunk_prefill_size > 0:
+                # ── Chunked Prefill 路径（Phase 9）────────────────────────────
+                # 1a. 若无正在进行的 prefill，从 waiting 准入一个请求到 PREFILLING
+                if (
+                    not self.scheduler.has_prefilling()
+                    and self.scheduler.has_waiting()
+                    and (self.scheduler.num_running() + self.scheduler.num_prefilling())
+                        < self.config.max_batch_size
+                ):
+                    next_state = self.scheduler.peek_next_waiting()
+                    assert next_state is not None
+                    prompt_len = len(next_state.prompt_token_ids)
+                    max_out = next_state.request.sampling_params.max_new_tokens
+                    blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
+                    if blocks_needed > self.config.num_gpu_blocks:
                         raise RuntimeError(
-                            f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个块，"
-                            f"仅有 {self.kv_cache.num_free_blocks()} 个空闲块，无法换出。"
+                            f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块，"
+                            f"超过系统总块数 {self.config.num_gpu_blocks}。"
                         )
-                    break
+                    if self.kv_cache.num_free_blocks() >= blocks_needed:
+                        state = self.scheduler.pop_next_waiting()
+                        self.kv_cache.init_request(state)
+                        self.scheduler.add_to_prefilling(state)
+                    else:
+                        victim = self.scheduler.get_lowest_priority_running()
+                        if (
+                            victim is not None
+                            and victim.request.priority > next_state.request.priority
+                        ):
+                            if not victim.prefilled:
+                                self.kv_cache.free_request(victim)
+                                self.scheduler.un_admit(victim)
+                            else:
+                                self.kv_cache.swap_out(victim)
+                                self.scheduler.mark_swapped(victim)
+                            if self.kv_cache.num_free_blocks() >= blocks_needed:
+                                state = self.scheduler.pop_next_waiting()
+                                self.kv_cache.init_request(state)
+                                self.scheduler.add_to_prefilling(state)
 
-            # ── 2. Prefill ──────────────────────────────────────────────
-            if newly_admitted:
-                self.model_runner.prefill(newly_admitted)
+                # 2a. 推进当前 PREFILLING 请求的一个 chunk
+                pf_state = self.scheduler.get_next_prefilling()
+                if pf_state is not None:
+                    rid = pf_state.request.request_id
+                    t_start = pf_state.prefilled_tokens
+                    t_end = min(
+                        t_start + self.config.chunk_prefill_size,
+                        len(pf_state.prompt_token_ids),
+                    )
+                    is_last = (t_end == len(pf_state.prompt_token_ids))
+                    cache = self._prefilling_caches.get(rid)
+                    new_cache = self.model_runner.prefill_chunk(
+                        pf_state, t_start, t_end, cache, is_last
+                    )
+                    if is_last:
+                        self._prefilling_caches.pop(rid, None)
+                        self.scheduler.move_prefilling_to_running(pf_state)
+                        just_prefilled.append(pf_state)
+                    else:
+                        self._prefilling_caches[rid] = new_cache
+
+            else:
+                # ── 原始路径（Phase 8 行为，chunk_prefill_size == 0）──────────
+                # 1. 准入（与 generate() 相同逻辑）
+                newly_admitted: list[RequestState] = []
+                while (
+                    self.scheduler.has_waiting()
+                    and self.scheduler.num_running() < self.config.max_batch_size
+                ):
+                    next_state = self.scheduler.peek_next_waiting()
+                    assert next_state is not None
+
+                    prompt_len = len(next_state.prompt_token_ids)
+                    max_out = next_state.request.sampling_params.max_new_tokens
+                    blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
+
+                    if blocks_needed > self.config.num_gpu_blocks:
+                        raise RuntimeError(
+                            f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块，"
+                            f"超过系统总块数 {self.config.num_gpu_blocks}。"
+                        )
+
+                    if self.kv_cache.num_free_blocks() >= blocks_needed:
+                        state = self.scheduler.pop_next_waiting()
+                        self.kv_cache.init_request(state)
+                        self.scheduler.add_to_running(state)
+                        newly_admitted.append(state)
+                    else:
+                        victim = self.scheduler.get_lowest_priority_running()
+                        if (
+                            victim is not None
+                            and victim.request.priority > next_state.request.priority
+                        ):
+                            if not victim.prefilled:
+                                self.kv_cache.free_request(victim)
+                                self.scheduler.un_admit(victim)
+                                newly_admitted.remove(victim)
+                            else:
+                                self.kv_cache.swap_out(victim)
+                                self.scheduler.mark_swapped(victim)
+                            continue
+
+                        if self.scheduler.num_running() == 0 and not newly_admitted:
+                            raise RuntimeError(
+                                f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个块，"
+                                f"仅有 {self.kv_cache.num_free_blocks()} 个空闲块，无法换出。"
+                            )
+                        break
+
+                # 2. Prefill
+                if newly_admitted:
+                    self.model_runner.prefill(newly_admitted)
+                    just_prefilled = newly_admitted
 
             # ── 3. Decode（收集前记录 pre_lens，捕获 prefill + decode 两阶段的新 token）
             running = self.scheduler.get_running_states()
             pre_lens: dict[str, int] = {
                 s.request.request_id: len(s.generated_token_ids) for s in running
             }
-            # 对刚 prefill 的请求：从 0 开始计，使 prefill token 也进入 new_tokens
-            for s in newly_admitted:
+            # 对刚完成 prefill 进入 running 的请求：pre 置 0，使 prefill 采样的第一个 token 被捕获
+            for s in just_prefilled:
                 pre_lens[s.request.request_id] = 0
 
             if running:
@@ -351,6 +539,7 @@ class LLMEngine:
                     new_text = self.model_runner.tokenizer.decode(
                         tok_ids[:curr], skip_special_tokens=True
                     )
+                    state.decoded_text = new_text
                     delta = new_text[len(old_text):]
                     if delta:
                         new_tokens[rid] = [delta]
@@ -362,8 +551,11 @@ class LLMEngine:
                     self.scheduler.finish_request(state)
 
             # ── 6. Swap_in ───────────────────────────────────────────────
+            # 注意：检查时同时计入 num_prefilling()，防止 PREFILLING 请求完成后
+            # 导致 running + 1 超出 max_batch_size（chunked prefill 场景下的边界条件）
             for swapped_state in self.scheduler.get_swapped_states():
-                if self.scheduler.num_running() >= self.config.max_batch_size:
+                if (self.scheduler.num_running() + self.scheduler.num_prefilling()
+                        >= self.config.max_batch_size):
                     break
                 needed = max(
                     1, math.ceil(swapped_state.swapped_seq_len / self.config.block_size)
@@ -384,6 +576,17 @@ class LLMEngine:
                         f"warning: free_request failed for {state.request.request_id!r}: {free_exc}",
                         file=sys.stderr,
                     )
+            # Phase 9：归还 PREFILLING 请求的 GPU 块
+            for state in self.scheduler.get_prefilling_states():
+                try:
+                    self.kv_cache.free_request(state)
+                except Exception as free_exc:
+                    import sys
+                    print(
+                        f"warning: free_request failed for {state.request.request_id!r}: {free_exc}",
+                        file=sys.stderr,
+                    )
+            self._prefilling_caches.clear()
             for state in self.scheduler.get_swapped_states():
                 state.cpu_kv = None
             raise

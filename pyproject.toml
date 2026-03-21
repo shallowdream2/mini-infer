@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-infer"
 version = "0.1.0"
-description = "面向 Qwen2.5 类 decoder-only 模型的推理系统学习项目，实现 Paged KV Cache、Continuous Batching、True PagedAttention、Preemption 和 OpenAI-compatible HTTP API"
+description = "面向 Qwen2.5 类 decoder-only 模型的推理系统学习项目，实现 Paged KV Cache、Continuous Batching、True PagedAttention、Preemption 和 Chat Completions 子集兼容 HTTP API"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -1,7 +1,7 @@
 """
-Phase 8 OpenAI-compatible HTTP server。
+Phase 8 OpenAI Chat Completions 子集兼容 HTTP server。
 
-提供与 OpenAI Chat Completions API 兼容的接口：
+提供 mini-infer 当前支持的 Chat Completions 受限子集接口：
   GET  /v1/models
   POST /v1/chat/completions（streaming + non-streaming）
 
@@ -9,7 +9,10 @@ Phase 8 OpenAI-compatible HTTP server。
   python serve.py --model /path/to/model
 
 或直接通过 uvicorn：
+  # 未注入 app.state.engine_config 时，默认回退到 dry_run 配置
   uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
+  # 如需真实模型，可先设置环境变量
+  MINI_INFER_MODEL=/path/to/model uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
 
 启动时全局初始化 AsyncEngine，所有请求共享同一 step loop，
 实现 continuous batching（多并发 HTTP 请求被合并进同一 decode_batch）。
@@ -17,6 +20,7 @@ Phase 8 OpenAI-compatible HTTP server。
 
 from __future__ import annotations
 
+import os
 import time
 from contextlib import asynccontextmanager
 from typing import AsyncGenerator
@@ -24,6 +28,7 @@ from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from .async_engine import AsyncEngine
 from .config import EngineConfig
@@ -48,9 +53,68 @@ _engine: AsyncEngine | None = None
 _model_id: str = "mini-infer"
 
 
+def _parse_env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _default_engine_config() -> EngineConfig:
+    model_name = os.getenv("MINI_INFER_MODEL", "dry")
+    dry_run = _parse_env_bool("MINI_INFER_DRY_RUN", model_name == "dry")
+    return EngineConfig(
+        model_name=model_name,
+        device=os.getenv("MINI_INFER_DEVICE", "cuda:0"),
+        dtype=os.getenv("MINI_INFER_DTYPE", "float16"),
+        dry_run=dry_run,
+        max_batch_size=int(os.getenv("MINI_INFER_MAX_BATCH_SIZE", "8")),
+        num_gpu_blocks=int(os.getenv("MINI_INFER_NUM_GPU_BLOCKS", "200")),
+        block_size=int(os.getenv("MINI_INFER_BLOCK_SIZE", "256")),
+    )
+
+
+def _model_to_json(model: BaseModel) -> str:
+    if hasattr(model, "model_dump_json"):
+        return model.model_dump_json(exclude_none=True)
+    return model.json(exclude_none=True)
+
+
+def _normalize_finish_reason(reason: str | None) -> str:
+    if reason in {None, "eos", "stop"}:
+        return "stop"
+    if reason == "length":
+        return "length"
+    return "stop"
+
+
+def _validate_request(request: ChatCompletionRequest) -> None:
+    if request.model != _model_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Model {request.model!r} not found. Available model: {_model_id!r}.",
+        )
+    unsupported: list[str] = []
+    if request.stop not in (None, "", []):
+        unsupported.append("stop")
+    if request.presence_penalty != 0.0:
+        unsupported.append("presence_penalty")
+    if request.frequency_penalty != 0.0:
+        unsupported.append("frequency_penalty")
+    if unsupported:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported request fields: {', '.join(unsupported)}",
+        )
+
+
 def get_engine() -> AsyncEngine:
     if _engine is None:
         raise HTTPException(status_code=503, detail="Engine not initialized")
+    try:
+        _engine.ensure_healthy()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     return _engine
 
 
@@ -62,7 +126,10 @@ def get_engine() -> AsyncEngine:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     global _engine
-    config: EngineConfig = app.state.engine_config  # type: ignore[attr-defined]
+    config = getattr(app.state, "engine_config", None)
+    if config is None:
+        config = _default_engine_config()
+        app.state.engine_config = config  # type: ignore[attr-defined]
     _engine = AsyncEngine(config)
     await _engine.start()
     yield
@@ -95,6 +162,7 @@ async def list_models() -> ModelList:
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):  # type: ignore[return]
     engine = get_engine()
+    _validate_request(request)
     prompt = engine.format_prompt(request.messages)
 
     if request.stream:
@@ -116,7 +184,12 @@ async def _non_stream(
     prompt: str,
     request: ChatCompletionRequest,
 ) -> ChatCompletionResponse:
-    text = await engine.generate(prompt, max_new_tokens=request.max_tokens)
+    text, finish_reason = await engine.generate_with_reason(
+        prompt,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+    )
     completion_id = f"chatcmpl-{uuid4().hex[:8]}"
     tokenizer = engine.tokenizer
     prompt_tokens = len(tokenizer.encode(prompt, add_special_tokens=False))
@@ -128,7 +201,7 @@ async def _non_stream(
             ChatCompletionChoice(
                 index=0,
                 message=ChatCompletionMessage(role="assistant", content=text),
-                finish_reason="stop",
+                finish_reason=_normalize_finish_reason(finish_reason),
             )
         ],
         usage=Usage(
@@ -151,6 +224,7 @@ async def _stream_generator(
 ) -> AsyncGenerator[str, None]:
     completion_id = f"chatcmpl-{uuid4().hex[:8]}"
     created = int(time.time())
+    finish_reason = "stop"
 
     # 第一个 chunk：role only
     first_chunk = ChatCompletionChunk(
@@ -165,23 +239,31 @@ async def _stream_generator(
             )
         ],
     )
-    yield f"data: {first_chunk.json()}\n\n"
+    yield f"data: {_model_to_json(first_chunk)}\n\n"
 
     # 逐 token chunk
-    async for token in engine.generate_stream(prompt, max_new_tokens=request.max_tokens):
-        chunk = ChatCompletionChunk(
-            id=completion_id,
-            created=created,
-            model=_model_id,
-            choices=[
-                ChatCompletionChunkChoice(
-                    index=0,
-                    delta=DeltaMessage(content=token),
-                    finish_reason=None,
-                )
-            ],
-        )
-        yield f"data: {chunk.json()}\n\n"
+    async for event in engine.generate_stream_events(
+        prompt,
+        max_new_tokens=request.max_tokens,
+        temperature=request.temperature,
+        top_p=request.top_p,
+    ):
+        if hasattr(event, "text"):
+            chunk = ChatCompletionChunk(
+                id=completion_id,
+                created=created,
+                model=_model_id,
+                choices=[
+                    ChatCompletionChunkChoice(
+                        index=0,
+                        delta=DeltaMessage(content=event.text),
+                        finish_reason=None,
+                    )
+                ],
+            )
+            yield f"data: {_model_to_json(chunk)}\n\n"
+        else:
+            finish_reason = _normalize_finish_reason(event.finish_reason)
 
     # 结束 chunk
     stop_chunk = ChatCompletionChunk(
@@ -192,9 +274,9 @@ async def _stream_generator(
             ChatCompletionChunkChoice(
                 index=0,
                 delta=DeltaMessage(),
-                finish_reason="stop",
+                finish_reason=finish_reason,
             )
         ],
     )
-    yield f"data: {stop_chunk.json()}\n\n"
+    yield f"data: {_model_to_json(stop_chunk)}\n\n"
     yield "data: [DONE]\n\n"

@@ -38,8 +38,11 @@ class RequestState:
     prompt_token_ids: list[int] = field(default_factory=list)
     generated_token_ids: list[int] = field(default_factory=list)
     generated_text_parts: list[str] = field(default_factory=list)
+    decoded_text: str = ""
     prefilled: bool = False
     finished: bool = False
+    # Phase 9：Chunked Prefill 进度。记录已完成 prefill 的 token 数，0 表示未开始。
+    prefilled_tokens: int = 0
     finish_reason: str | None = None
     # Phase 7：preemption 支持
     # swap_out 时将 GPU KV 拷贝到 CPU，存储于此；swap_in 时清除
@@ -57,4 +60,6 @@ class RequestState:
 
     @property
     def output_text(self) -> str:
+        if self.decoded_text:
+            return self.decoded_text
         return "".join(self.generated_text_parts)

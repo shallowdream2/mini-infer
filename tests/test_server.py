@@ -35,7 +35,7 @@ async def client():
         model_name="dry",
         dry_run=True,
         num_gpu_blocks=32,
-        block_size=16,
+        block_size=256,
         max_batch_size=4,
     )
     app.state.engine_config = config  # type: ignore[attr-defined]
@@ -78,6 +78,7 @@ async def test_chat_completion_non_stream(client: httpx.AsyncClient):
     assert choice["message"]["role"] == "assistant"
     assert isinstance(choice["message"]["content"], str)
     assert len(choice["message"]["content"]) > 0
+    assert choice["finish_reason"] == "length"
 
 
 @pytest.mark.asyncio
@@ -107,9 +108,9 @@ async def test_chat_completion_stream(client: httpx.AsyncClient):
     assert first["object"] == "chat.completion.chunk"
     assert first["choices"][0]["delta"].get("role") == "assistant"
 
-    # 最后一个 JSON chunk 的 finish_reason == "stop"
+    # 最后一个 JSON chunk 的 finish_reason == "length"
     last_chunk = chunks[-1]
-    assert last_chunk["choices"][0]["finish_reason"] == "stop"
+    assert last_chunk["choices"][0]["finish_reason"] == "length"
 
     # 中间 chunk 有 content
     content_chunks = [c for c in chunks[1:-1] if c["choices"][0]["delta"].get("content")]
@@ -130,3 +131,61 @@ async def test_stream_has_valid_ids(client: httpx.AsyncClient):
     chunks = [json.loads(d) for d in data_lines if d != "[DONE]"]
     ids = {c["id"] for c in chunks}
     assert len(ids) == 1  # 所有 chunk 共享同一 id
+
+
+@pytest.mark.asyncio
+async def test_invalid_max_tokens_returns_422(client: httpx.AsyncClient):
+    payload = {
+        "model": "mini-infer",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 0,
+        "stream": False,
+    }
+    resp = await client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_unknown_model_returns_404(client: httpx.AsyncClient):
+    payload = {
+        "model": "not-a-real-model",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 2,
+        "stream": False,
+    }
+    resp = await client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_unsupported_stop_returns_400(client: httpx.AsyncClient):
+    payload = {
+        "model": "mini-infer",
+        "messages": [{"role": "user", "content": "hello"}],
+        "max_tokens": 2,
+        "stream": False,
+        "stop": ["\n\n"],
+    }
+    resp = await client.post("/v1/chat/completions", json=payload)
+    assert resp.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_server_can_start_without_injected_config():
+    """不经过 serve.py 注入 config 时，server.py 默认回退到 dry_run 配置。"""
+    had_config = hasattr(app.state, "engine_config")
+    old_config = getattr(app.state, "engine_config", None)
+    if had_config:
+        delattr(app.state, "engine_config")
+    try:
+        async with LifespanManager(app) as manager:
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=manager.app), base_url="http://test"
+            ) as c:
+                resp = await c.get("/v1/models")
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["data"][0]["id"] == "mini-infer"
+    finally:
+        if had_config:
+            app.state.engine_config = old_config  # type: ignore[attr-defined]

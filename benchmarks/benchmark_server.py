@@ -1,5 +1,5 @@
 """
-benchmarks/benchmark_server.py — Phase 8 OpenAI-compatible HTTP API benchmark。
+benchmarks/benchmark_server.py — Phase 8 Chat Completions 子集兼容 HTTP API benchmark。
 
 测试对象：mini-infer AsyncEngine + FastAPI HTTP layer（对标直接 LLMEngine 调用）
 
@@ -315,7 +315,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="cuda:0")
     p.add_argument("--dtype", type=str, default="float16")
     p.add_argument("--max-batch-size", type=int, default=8)
-    p.add_argument("--num-gpu-blocks", type=int, default=512)
+    p.add_argument("--num-gpu-blocks", type=int, default=200)
     p.add_argument("--block-size", type=int, default=256)
     p.add_argument("--max-tokens", type=int, default=64, help="每请求最大输出 token 数")
     p.add_argument("--trials", type=int, default=5, help="单请求延迟测量次数")
