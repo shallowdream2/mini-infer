@@ -16,7 +16,6 @@
       "Read(//proc/67074/**)",
       "Bash(MODEL_PATH=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct)",
       "Bash(/home/shh/anaconda3/envs/ai-infra/bin/python -c \":*)",
-      "Bash(/home/shh/anaconda3/envs/ai-infra/bin/python -c \"import transformers; print\\(transformers.__version__\\)\")",
       "Bash(export http_proxy=http://127.0.0.1:7890)",
       "Bash(/home/shh/anaconda3/envs/ai-infra/bin/pip install:*)",
       "Bash(MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct cd /home/shh/projects/mini-infer __NEW_LINE_2453feb21f4b2dd0__ echo \"=== batch=1 ===\")",

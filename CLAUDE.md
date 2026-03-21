@@ -29,7 +29,7 @@
 | Phase 6 | True PagedAttention（flash_attn block_tables，batch=8 达到 100% HF）| ✅ |
 | Phase 6.5 | Triton kernel（decode attention kernel，对比 flash_attn，大厂核心路线主线）| ✅ |
 | Phase 7 | Preemption + Priority Scheduling（swap to CPU，优先级调度）| ✅ |
-| Phase 8 | OpenAI-compatible HTTP API（FastAPI + streaming）| 🔄 进行中（implement ✓，review 待）|
+| Phase 8 | OpenAI-compatible HTTP API（FastAPI + streaming）| 🔄 进行中（review ✓，implement 待修复）|
 
 详细阶段计划参考 `本地资料/Claude计划/00-长期路线图.md`。
 
@@ -114,11 +114,13 @@ skills 位于 `.claude/skills/`。
 
 > 进度表说明：Phase 进行中时在此维护逐步骤进度表（Step 0-7）；Phase 完成（archive ✓）后删除进度表，历史记录见 `本地资料/里程碑总结/`。
 >
+> **权威性说明**：如果上方“当前状态”摘要表与本节逐步骤进度表暂时不一致，以本节进度表为准；archive 完成后再同步摘要表。
+>
 > **Step 0 标记规则**：用户执行前置条件验证命令后，若反馈"OK"或"通过"，Claude 应立即将 Step 0 标为 ✓，**不需要用户手动修改进度表**。
 
 | 步骤 | skill | 状态 |
 |------|-------|------|
-| 0 | 前置条件验证（fastapi/uvicorn/openai 可导入 + 现有测试通过）| ✓ |
+| 0 | 前置条件验证（Phase 8 server 依赖可导入 + 核心导入通过 + dry_run 测试通过）| ✓ |
 | 1 | infer-plan | ✓ |
 | 2 | infer-implement | ⬜ |
 | 3 | infer-review | ✓ |
@@ -129,9 +131,9 @@ skills 位于 `.claude/skills/`。
 
 Phase 8 前置条件验证命令：
 ```bash
-conda run -n ai-infra python -c "import fastapi, uvicorn, openai; print('ok')"
+conda run -n ai-infra python -c "import fastapi, uvicorn, httpx, pytest_asyncio, asgi_lifespan; print('ok')"
 conda run -n ai-infra python -c "from mini_infer import LLMEngine, EngineConfig; print('ok')"
-conda run -n ai-infra python -m pytest tests/test_smoke.py tests/test_engine.py tests/test_preemption.py -q
+conda run -n ai-infra python -m pytest tests/test_smoke.py tests/test_engine.py tests/test_preemption.py tests/test_server.py -q
 ```
 
 ## 知识与内容产出
@@ -159,9 +161,10 @@ conda run -n ai-infra python -m pytest tests/test_smoke.py tests/test_engine.py 
 
 优先使用这些命令：
 
-- 环境激活：`conda activate ai-infra`
-- 环境检查：`pwd`、`python3 --version`
+- AI/代理 shell：`conda run -n ai-infra python ...`
+- 交互 shell（已完成 `conda init` 时）：`conda activate ai-infra`
+- 环境检查：`pwd`、`conda run -n ai-infra python --version`
 - GPU 检查：`nvidia-smi`
-- 最小测试：`python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py`
+- 最小测试：`conda run -n ai-infra python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py`
 
 如果缺少模型权重，必须明确说明，不得伪造运行结果。（GPU 始终可用。）

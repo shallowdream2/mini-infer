@@ -1,6 +1,6 @@
 """
 Phase 4 双卡 benchmark。对比三种推理配置在 2 × RTX 4090 上的性能：
-  - single：单卡 LLMEngine（Phase 3 基线，cuda:0）
+  - single：单卡 LLMEngine（当前主线 paged decode 路径，cuda:0）
   - replica：双卡 ReplicaEngine（cuda:0 + cuda:1，数据并行）
   - pp：双卡 PPEngine（device_map="balanced"，HF Pipeline Parallel）
     注：PP = Pipeline Parallel（不同层在不同 GPU），不是 Tensor Parallel（同层 all-reduce）
@@ -92,14 +92,14 @@ def benchmark_single(
     max_new_tokens: int = 128,
     device: str = "cuda:0",
     dtype: str = "float16",
-    num_gpu_blocks: int = 512,
+    num_gpu_blocks: int = 200,
 ) -> MultiGPUBenchmarkResult:
     config = EngineConfig(
         model_name=model_name,
         device=device,
         dtype=dtype,
         max_batch_size=batch_size,
-        block_size=16,
+        block_size=256,
         num_gpu_blocks=num_gpu_blocks,
         num_hidden_layers=QWEN_LAYERS,
         num_kv_heads=QWEN_KV_HEADS,
@@ -148,7 +148,7 @@ def benchmark_replica(
     batch_size: int = 8,
     max_new_tokens: int = 128,
     dtype: str = "float16",
-    num_gpu_blocks: int = 512,
+    num_gpu_blocks: int = 200,
 ) -> MultiGPUBenchmarkResult:
     def _make_cfg(device: str) -> EngineConfig:
         return EngineConfig(
@@ -156,7 +156,7 @@ def benchmark_replica(
             device=device,
             dtype=dtype,
             max_batch_size=max(1, batch_size // 2 + batch_size % 2),  # 每卡最多 ceil(batch/2) 条
-            block_size=16,
+            block_size=256,
             num_gpu_blocks=num_gpu_blocks,
             num_hidden_layers=QWEN_LAYERS,
             num_kv_heads=QWEN_KV_HEADS,
@@ -284,7 +284,12 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--max-new-tokens", type=int, default=128)
     parser.add_argument("--dtype", type=str, default="float16")
-    parser.add_argument("--num-gpu-blocks", type=int, default=512)
+    parser.add_argument(
+        "--num-gpu-blocks",
+        type=int,
+        default=200,
+        help="LLMEngine KV block 数。默认 200，配合 block_size=256 以适配当前 paged decode 路径。",
+    )
     args = parser.parse_args()
 
     if args.mode == "single":

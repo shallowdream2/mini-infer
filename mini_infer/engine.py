@@ -37,6 +37,11 @@ class LLMEngine:
 
     def __init__(self, config: EngineConfig) -> None:
         self.config = config
+        if not config.dry_run and config.block_size % 256 != 0:
+            raise ValueError(
+                "真实 LLMEngine decode 路径使用 flash_attn_with_kvcache，"
+                f"block_size 必须是 256 的倍数，当前为 {config.block_size}。"
+            )
         self.kv_cache = KVCacheManager(config=config)
         self.scheduler = Scheduler(max_batch_size=config.max_batch_size)
         self.model_runner = ModelRunner(config=config, kv_cache=self.kv_cache)

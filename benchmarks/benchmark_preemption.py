@@ -75,7 +75,7 @@ def make_engine(num_gpu_blocks: int = NUM_GPU_BLOCKS) -> LLMEngine:
     config = EngineConfig(
         model_name=MODEL_PATH,
         dry_run=False,
-        block_size=BLOCK_SIZE,
+        block_size=GPU_BLOCK_SIZE,
         num_gpu_blocks=num_gpu_blocks,
         max_batch_size=MAX_BATCH_SIZE,
     )

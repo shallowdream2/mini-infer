@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mini-Infer Archiving"
+  short_description: "Audit and close out mini-infer phase docs"
+  default_prompt: "Use $mini-infer-archive to audit and close out the current mini-infer phase."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mini-Infer Planning"
+  short_description: "Plan mini-infer phases and scoped changes"
+  default_prompt: "Use $mini-infer-plan to plan the next mini-infer phase or code change."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "infer-blog"
+  short_description: "Claude-equivalent blog writing for mini-infer"
+  default_prompt: "Use $infer-blog to draft a mini-infer technical blog post."

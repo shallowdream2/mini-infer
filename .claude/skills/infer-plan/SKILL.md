@@ -60,7 +60,7 @@ argument-hint: [任务或阶段]
 至少 2 条可量化标准 + 1 条正确性验证：
 
 - 量化：`batch=8 throughput ≥ 95% HF baseline`（数字来自 benchmark_mini.py）
-- 正确性：`pytest tests/` 全部通过
+- 正确性：当前改动对应的 dry_run / 单元测试通过；如果改动跨多个模块或公共接口，再升级为组合测试
 - profiling 验证：`profile_decode.py` 中目标操作的 CUDA 时间降至预期值
 
 ### 7. 风险与回退

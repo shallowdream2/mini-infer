@@ -26,10 +26,10 @@ argument-hint: [实现任务]
 
 ## 验证要求
 
-每个实现步骤完成后必须给出验证：
+每个实现步骤完成后必须给出与当前改动匹配的验证：
 
-- **dry_run 路径**（无 GPU）：`python -m pytest tests/` 通过
-- **GPU 路径**（有 GPU）：至少跑一次 `engine.generate()` 并确认输出正常
+- **dry_run 路径**（无 GPU）：优先运行与当前改动直接相关的最小测试；如果改动跨多个模块、公共接口或阶段主链路，再升级为组合测试或 `python -m pytest tests/`
+- **GPU 路径**（有 GPU）：对 GPU / 推理逻辑修改，至少跑一次与改动直接相关的真实路径（如 `engine.generate()`、对应 benchmark 或 profile 命令）并说明结果
 - 如果环境不满足验证条件，**明确说明**原因和缺失的条件，不得伪造结果
 
 ## 完成后汇报

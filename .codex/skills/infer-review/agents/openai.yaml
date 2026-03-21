@@ -1,0 +1,4 @@
+interface:
+  display_name: "infer-review"
+  short_description: "Claude-equivalent review for mini-infer"
+  default_prompt: "Use $infer-review to review the recent mini-infer changes."

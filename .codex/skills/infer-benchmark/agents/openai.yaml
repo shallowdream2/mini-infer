@@ -1,0 +1,4 @@
+interface:
+  display_name: "infer-benchmark"
+  short_description: "Claude-equivalent benchmarking for mini-infer"
+  default_prompt: "Use $infer-benchmark to design or run the next mini-infer benchmark."

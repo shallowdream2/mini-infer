@@ -8,12 +8,17 @@
       "Bash(git status*)",
       "Bash(git diff*)",
       "Bash(rg *)",
+      "Bash(conda run:*)",
       "Bash(python -m pip install -e .*)",
       "Bash(python3 -m pip install -e .*)",
       "Bash(python -m pytest *)",
       "Bash(python3 -m pytest *)",
       "Bash(python benchmarks/benchmark_*)",
       "Bash(python3 benchmarks/benchmark_*)",
+      "Bash(python benchmarks/profile_decode.py*)",
+      "Bash(python3 benchmarks/profile_decode.py*)",
+      "Bash(python serve.py*)",
+      "Bash(python3 serve.py*)",
       "Bash(nvidia-smi)"
     ],
     "deny": [

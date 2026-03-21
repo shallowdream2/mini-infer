@@ -15,6 +15,7 @@ argument-hint: [benchmark 任务]
 - 先说明对象：HF baseline 或 mini-infer 当前实现
 - 说明 workload：模型、batch size、prompt 长度、output 长度、并发数
 - 至少关注 `throughput`、`TTFT`、`TPOT`、`peak memory`
+- 若某个指标在当前脚本中不可得、仅近似可得，或与其他 benchmark 的测量口径不同，必须显式标注 `N/A`、`近似` 或差异说明
 - 输出环境、命令、数据口径、结果、结论和局限性
 - 没有真实数据时，不输出性能结论
 

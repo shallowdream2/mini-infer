@@ -40,13 +40,14 @@ Phase 6 用 flash_attn_with_kvcache 的 block_table 接口替换 gather→Dynami
 
 | 模式 | Throughput | GPU0 峰值显存 | GPU1 峰值显存 |
 |------|-----------|------------|------------|
-| single（Phase 3 基线） | 361.4 tok/s | 16.42 GB | — |
+| single（历史 Phase 3 基线） | 361.4 tok/s | 16.42 GB | — |
 | replica（双卡 Replica） | 376.1 tok/s | 16.31 GB | 16.31 GB |
 | pp（HF Pipeline Parallel） | 361.5 tok/s | 7.00 GB | 8.97 GB |
 
 Replica batch=8 仅 +4.1%：batch=8 拆成 4+4 后，每卡 batch=4 效率（194 tok/s × 2 = 388）而单卡 batch=8 已达 361（388 的 93%），scaling 空间只有 7%。
 PP 吞吐持平，价值在于每卡显存减半（支持装不进单卡的大模型）。
 注：此处 PP = Pipeline Parallel（HF device_map="balanced"，不同层在不同 GPU），不是 Tensor Parallel（同层 all-reduce）。
+说明：上表保留 Phase 4 的历史测量结果；当前 `benchmarks/benchmark_multi_gpu.py` 为了对齐主线 paged decode 路径，single/replica 默认使用 `block_size=256`、`num_gpu_blocks=200`。
 
 ## 架构设计
 
@@ -98,21 +99,24 @@ HTTP 请求 C ─┘        ↓
 - Ubuntu 24.04 + CUDA（benchmark 需要 GPU）
 - Conda 环境 `ai-infra`（Python 3.10+，transformers 4.40+，PyTorch 2.x）
 
+说明：
+- AI/代理的非交互 shell 默认优先使用 `conda run -n ai-infra ...`
+- 交互 shell 如果已经完成 `conda init`，也可以继续使用 `conda activate ai-infra`
+
 ### 单卡 benchmark
 
 ```bash
-conda activate ai-infra
 export MODEL=/path/to/Qwen2.5-7B-Instruct   # 本地根目录路径（避免 HF snapshot 问题）
 export HF_HUB_OFFLINE=1
 
 # HuggingFace baseline
-python benchmarks/benchmark_hf.py --model $MODEL --batch-size 8 --max-new-tokens 128
+conda run -n ai-infra python benchmarks/benchmark_hf.py --model $MODEL --batch-size 8 --max-new-tokens 128
 
 # mini-infer Phase 3（向量化 gather + DynamicCache）
-python benchmarks/benchmark_mini.py --model $MODEL --batch-size 8 --max-new-tokens 128
+conda run -n ai-infra python benchmarks/benchmark_mini.py --model $MODEL --batch-size 8 --max-new-tokens 128
 
 # mini-infer Phase 6（True PagedAttention，flash_attn block_table，双 GPU 对比）
-python benchmarks/benchmark_flash.py --model $MODEL --batch-size 8 --max-new-tokens 128 \
+conda run -n ai-infra python benchmarks/benchmark_flash.py --model $MODEL --batch-size 8 --max-new-tokens 128 \
     --device cuda:0 --num-gpu-blocks 200 --compare --hf-device cuda:1
 ```
 
@@ -120,30 +124,32 @@ python benchmarks/benchmark_flash.py --model $MODEL --batch-size 8 --max-new-tok
 
 ```bash
 # Triton decode attention kernel vs flash_attn_with_kvcache latency 对比
-python benchmarks/benchmark_triton.py                    # 跑所有配置（batch=1/8，seq_len=128/512/1024/2048）
-python benchmarks/benchmark_triton.py --batch_size 1 --seq_len 512
+conda run -n ai-infra python benchmarks/benchmark_triton.py                    # 跑所有配置（batch=1/8，seq_len=128/512/1024/2048）
+conda run -n ai-infra python benchmarks/benchmark_triton.py --batch_size 1 --seq_len 512
 
 # Triton kernel 数值正确性测试
-python -m pytest tests/test_triton_attn.py -v
+conda run -n ai-infra python -m pytest tests/test_triton_attn.py -v
 ```
 
 ### 双卡 benchmark
 
 ```bash
 # Replica 模式（双卡数据并行）
-python benchmarks/benchmark_multi_gpu.py --model $MODEL --mode replica
+conda run -n ai-infra python benchmarks/benchmark_multi_gpu.py --model $MODEL --mode replica
 
 # Pipeline Parallel 模式（HF device_map="balanced"）
 # 注：这是 Pipeline Parallel（PP），不是 Tensor Parallel（TP）
 # PP：不同层在不同 GPU；TP：同一层按 head 切分 + all-reduce
-python benchmarks/benchmark_multi_gpu.py --model $MODEL --mode pp
+conda run -n ai-infra python benchmarks/benchmark_multi_gpu.py --model $MODEL --mode pp
 ```
+
+说明：当前 `benchmark_multi_gpu.py` 中 single/replica 默认走主线 `LLMEngine` 配置，即 `block_size=256`、`num_gpu_blocks=200`。
 
 ### decode_batch profiling（Phase 6）
 
 ```bash
 # 依赖上方已设置的 MODEL 和 HF_HUB_OFFLINE=1
-python benchmarks/profile_decode.py --model $MODEL --batch-size 8 --decode-steps 30
+conda run -n ai-infra python benchmarks/profile_decode.py --model $MODEL --batch-size 8 --decode-steps 30
 ```
 
 Phase 6 输出只有 `model_forward` 标签，`gather_batch_kv` 和 `write_decode_kv` 已消除。
@@ -186,16 +192,16 @@ curl http://localhost:8000/v1/chat/completions \
 
 ```bash
 # 基础测试
-python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py tests/test_replica_engine.py tests/test_engine.py
+conda run -n ai-infra python -m pytest tests/test_smoke.py tests/test_scheduler.py tests/test_kv_cache.py tests/test_replica_engine.py tests/test_engine.py
 
 # Phase 7 preemption 测试（dry_run，无需 GPU）
-python -m pytest tests/test_preemption.py -v
+conda run -n ai-infra python -m pytest tests/test_preemption.py -v
 
 # Phase 8 HTTP server 测试（dry_run，无需 GPU）
-python -m pytest tests/test_server.py -v
+conda run -n ai-infra python -m pytest tests/test_server.py -v
 
 # Phase 6 GPU 测试（需要 2× RTX 4090）
-python -m pytest tests/test_paged_attention.py -v
+conda run -n ai-infra python -m pytest tests/test_paged_attention.py -v
 ```
 
 ## 项目结构
@@ -239,9 +245,11 @@ tests/
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
-.claude/                 Claude Code 协作配置
-CLAUDE.md                项目级协作规则
-本地资料/                实验记录、博客草稿、知识整理（不上传 Git）
+.claude/                 Claude Code 协作配置（原始来源）
+.codex/                  Codex repo-local 技能源文件与安装说明
+CLAUDE.md                Claude 项目级协作规则
+CODEX.md                 Codex 项目级协作规则
+本地资料/                实验记录、博客草稿、知识整理（当前位于仓库内，以个人长期记录为主）
 ```
 
 ## 开发阶段
@@ -265,3 +273,4 @@ CLAUDE.md                项目级协作规则
 - 真实模型推理、benchmark、多卡实验需要 CUDA GPU、模型权重和对应依赖
 - 模型加载建议使用 `HF_HUB_OFFLINE=1` + 本地绝对路径（避免 HF snapshot 缺失触发重下载）
 - Phase 8 HTTP server 测试（`test_server.py`）使用 dry_run 模式，无需 GPU 或模型权重
+- Codex 迁移资产位于 `CODEX.md` 和 `.codex/`；真正安装到 `~/.codex/skills/` 仍然是本机手动步骤

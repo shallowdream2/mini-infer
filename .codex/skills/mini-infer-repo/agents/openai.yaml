@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mini-Infer Repository"
+  short_description: "Load mini-infer context and route the task"
+  default_prompt: "Use $mini-infer-repo to load the mini-infer repository context before working."

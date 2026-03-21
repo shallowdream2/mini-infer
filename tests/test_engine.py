@@ -98,6 +98,13 @@ def test_empty_prompts_returns_empty_list() -> None:
     assert outputs == []
 
 
+def test_real_engine_requires_256_aligned_block_size() -> None:
+    """真实 LLMEngine 应在加载模型前拒绝非 256 对齐的 block_size。"""
+    config = EngineConfig(model_name="stub", dry_run=False, block_size=16)
+    with pytest.raises(ValueError, match="block_size"):
+        LLMEngine(config)
+
+
 def test_multiple_generate_calls_independent() -> None:
     """连续两次 generate 调用之间状态互不干扰，块计数每次都能归零。"""
     engine = _make_engine(num_gpu_blocks=32, block_size=4)

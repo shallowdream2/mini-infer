@@ -119,7 +119,7 @@ class PPEngine:
 
     def generate(self, prompts: list[str], max_new_tokens: int = 128) -> list[str]:
         """
-        批量推理。使用 HF model.generate()，右填充对齐，greedy decode。
+        批量推理。使用 HF model.generate()，左填充对齐，greedy decode。
         返回仅包含新生成 token 的文本（不含输入 prompt）。
         """
         if self.config.dry_run:

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mini-Infer Benchmarking"
+  short_description: "Benchmark mini-infer and compare against HF"
+  default_prompt: "Use $mini-infer-benchmark to design or run the next mini-infer benchmark."

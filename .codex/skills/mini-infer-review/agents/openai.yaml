@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mini-Infer Review"
+  short_description: "Review mini-infer changes for bugs and risks"
+  default_prompt: "Use $mini-infer-review to review the recent mini-infer changes."

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Mini-Infer Implementation"
+  short_description: "Implement planned mini-infer changes safely"
+  default_prompt: "Use $mini-infer-implement to implement the planned mini-infer change."
