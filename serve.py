@@ -1,5 +1,5 @@
 """
-Phase 8 启动脚本。
+Phase 8/9 启动脚本。
 
 用法：
   python serve.py --model /path/to/Qwen2.5-7B-Instruct
@@ -13,6 +13,7 @@ Phase 8 启动脚本。
   --dry-run  使用 stub tokenizer + 随机 forward，无需真实模型
   --device   推理设备（默认 cuda:0）
   --dtype    权重精度（默认 float16）
+  --chunk-prefill-size  Phase 9：每步 prefill 的 token 上限（0=禁用）
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--num-gpu-blocks", type=int, default=200)
     parser.add_argument("--block-size", type=int, default=256)
+    parser.add_argument("--chunk-prefill-size", type=int, default=0)
     return parser.parse_args()
 
 
@@ -54,6 +56,7 @@ def main() -> None:
         max_batch_size=args.max_batch_size,
         num_gpu_blocks=args.num_gpu_blocks,
         block_size=args.block_size,
+        chunk_prefill_size=args.chunk_prefill_size,
     )
 
     # 将 config 注入 app.state，lifespan 中读取

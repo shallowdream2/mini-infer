@@ -13,6 +13,7 @@ Phase 8 HTTP server 测试。
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 import pytest_asyncio
@@ -20,7 +21,8 @@ import httpx
 from asgi_lifespan import LifespanManager
 
 from mini_infer.config import EngineConfig
-from mini_infer.server import app
+from mini_infer.server import app, _default_engine_config
+import serve
 
 
 # ---------------------------------------------------------------------------
@@ -189,3 +191,20 @@ async def test_server_can_start_without_injected_config():
     finally:
         if had_config:
             app.state.engine_config = old_config  # type: ignore[attr-defined]
+
+
+def test_default_engine_config_reads_chunk_prefill_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MINI_INFER_MODEL", "dry")
+    monkeypatch.setenv("MINI_INFER_CHUNK_PREFILL_SIZE", "256")
+    config = _default_engine_config()
+    assert config.chunk_prefill_size == 256
+
+
+def test_serve_parse_args_exposes_chunk_prefill_size(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["serve.py", "--dry-run", "--chunk-prefill-size", "256"],
+    )
+    args = serve.parse_args()
+    assert args.chunk_prefill_size == 256

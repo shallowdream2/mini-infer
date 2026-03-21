@@ -14,7 +14,7 @@ Phase 8 新增：单步接口，供 AsyncEngine / HTTP 服务使用：
 Phase 9 新增：Chunked Prefill（chunk_prefill_size > 0 时启用）：
   - 长 prompt 请求分多步 prefill，每步只处理 chunk_prefill_size 个 token
   - PREFILLING 状态介于 WAITING 和 RUNNING 之间，一次最多 1 个请求处于该状态
-  - 中间 DynamicCache 保存在 _prefilling_caches（CPU 内存），最后一个 chunk 后写入 block tensor
+  - 中间 DynamicCache 保存在 _prefilling_caches（当前实现保留在模型设备上），最后一个 chunk 后写入 block tensor
   - generate() 和 step() 两条路径均支持，chunk_prefill_size=0 时行为与 Phase 8 完全一致
 
 注意：generate() 和 add_request/step() 使用同一个 scheduler/kv_cache，

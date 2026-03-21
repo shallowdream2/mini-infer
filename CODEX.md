@@ -47,6 +47,7 @@ mini-infer 是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学
 - `Preemption + Priority Scheduling`
 - 双卡扩展（Replica + HF Pipeline Parallel 测量）
 - `OpenAI Chat Completions 子集兼容 HTTP API`
+- `Chunked Prefill`
 
 项目代码主入口：
 
@@ -63,6 +64,8 @@ mini-infer 是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学
 - `mini_infer/replica_engine.py`
 - `mini_infer/pp_engine.py`
 - `mini_infer/tp_engine.py`
+- `benchmarks/benchmark_chunked_prefill.py`
+- `tests/test_chunked_prefill.py`
 
 测试位于 `tests/`，benchmark 位于 `benchmarks/`。
 

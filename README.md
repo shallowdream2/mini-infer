@@ -62,7 +62,7 @@ engine.py           LLMEngine：continuous batching 主循环（Phase 8 HTTP 接
   └── model_runner.py   ModelRunner：prefill + batch decode 执行
 
 async_engine.py     AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
-server.py / serve.py  FastAPI HTTP server + CLI 启动（Phase 8）
+server.py / serve.py  FastAPI HTTP server + CLI 启动（Phase 8/9）
 replica_engine.py   ReplicaEngine：双卡数据并行
 tp_engine.py        TPEngine：HF Pipeline Parallel（测量用）
 ```
@@ -143,7 +143,7 @@ conda run -n ai-infra python benchmarks/benchmark_preemption.py
 conda run -n ai-infra python benchmarks/benchmark_preemption.py --dry-only
 ```
 
-### Phase 8 HTTP server
+### Phase 8/9 HTTP server
 
 ```bash
 # dry_run 模式（无需模型权重，快速验证 API 结构）
@@ -152,6 +152,9 @@ conda run -n ai-infra python serve.py --dry-run --port 8000
 # 真实模型
 export MODEL=/path/to/Qwen2.5-7B-Instruct
 conda run -n ai-infra python serve.py --model $MODEL --port 8000
+
+# 真实模型 + Phase 9 chunked prefill
+conda run -n ai-infra python serve.py --model $MODEL --chunk-prefill-size 256 --port 8000
 
 # 测试 API（另一个终端）
 curl http://localhost:8000/v1/models
@@ -174,6 +177,9 @@ uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
 
 # 真实模型也可通过环境变量启动
 MINI_INFER_MODEL=$MODEL uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
+
+# 真实模型 + Phase 9 chunked prefill（直接 uvicorn）
+MINI_INFER_MODEL=$MODEL MINI_INFER_CHUNK_PREFILL_SIZE=256 uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
 
 # HTTP benchmark（Phase 8）
 conda run -n ai-infra python benchmarks/benchmark_server.py --model $MODEL
@@ -214,13 +220,13 @@ mini_infer/              核心推理代码
   engine.py              LLMEngine：continuous batching 主循环（Phase 8 HTTP 接口，Phase 9 chunked prefill）
   async_engine.py        AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
   openai_schema.py       OpenAI Chat Completions API Pydantic 模型（Phase 8）
-  server.py              FastAPI HTTP server（Phase 8）
+  server.py              FastAPI HTTP server（Phase 8/9）
   replica_engine.py      ReplicaEngine（双卡数据并行）
   pp_engine.py           PPEngine（HF Pipeline Parallel，测量用）
   tp_engine.py           向后兼容别名（TPEngine = PPEngine）
   triton_attn.py         Triton decode attention kernel（Phase 6.5，实验性）
 
-serve.py                 HTTP server CLI 启动脚本（Phase 8）
+serve.py                 HTTP server CLI 启动脚本（Phase 8/9）
 
 benchmarks/
   benchmark_hf.py        HuggingFace Transformers baseline
