@@ -46,7 +46,7 @@
 | Phase 6 | ✅ |
 | Phase 6.5 | ✅ |
 | Phase 7 | ✅ |
-| Phase 8 | 🔄 进行中（review ✓，implement 待修复）|
+| Phase 8 | ✅ |
 
 ## 使用约定
 

@@ -35,7 +35,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", type=str, default="float16")
     parser.add_argument("--max-batch-size", type=int, default=8)
     parser.add_argument("--num-gpu-blocks", type=int, default=200)
-    parser.add_argument("--block-size", type=int, default=16)
+    parser.add_argument("--block-size", type=int, default=256)
     return parser.parse_args()
 
 

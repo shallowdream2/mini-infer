@@ -102,6 +102,7 @@ HTTP 请求 C ─┘        ↓
 说明：
 - AI/代理的非交互 shell 默认优先使用 `conda run -n ai-infra ...`
 - 交互 shell 如果已经完成 `conda init`，也可以继续使用 `conda activate ai-infra`
+- **真实模型（非 dry_run）的 `block_size` 必须是 256 的倍数**（flash_attn_with_kvcache 对齐要求），推荐使用默认值 `block_size=256`
 
 ### 单卡 benchmark
 

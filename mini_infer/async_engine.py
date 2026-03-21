@@ -101,7 +101,12 @@ class AsyncEngine:
         try:
             self._engine.add_request(prompt, max_new_tokens, priority, request_id=rid)
             while True:
-                token = await asyncio.wait_for(queue.get(), timeout=60.0)
+                try:
+                    token = await asyncio.wait_for(queue.get(), timeout=60.0)
+                except asyncio.TimeoutError:
+                    raise RuntimeError(
+                        f"生成超时（等待 token 超过 60s），request_id={rid!r}"
+                    )
                 if token is _DONE:
                     return
                 yield token  # type: ignore[misc]
@@ -163,9 +168,10 @@ class AsyncEngine:
                 except Exception:
                     import traceback
                     traceback.print_exc()
-                    # 错误时通知所有等待中的消费者退出
+                    # 错误时通知所有等待中的消费者退出，并清理追踪表
                     for rid in list(self._token_queues):
                         self._put(rid, _DONE)
+                        self._engine.cleanup_request(rid)
                     break
             else:
                 time.sleep(0.001)  # 无请求时短暂休眠，避免空转

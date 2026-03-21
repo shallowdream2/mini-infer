@@ -100,7 +100,7 @@ async def test_chat_completion_stream(client: httpx.AsyncClient):
 
     # 解析所有 JSON chunk（排除 [DONE]）
     chunks = [json.loads(d) for d in data_lines[:-1]]
-    assert len(chunks) >= 2  # 至少 role chunk + 1 token chunk + stop chunk
+    assert len(chunks) >= 3  # 至少 role chunk + 1 token chunk + stop chunk
 
     # 第一个 chunk 包含 role
     first = chunks[0]

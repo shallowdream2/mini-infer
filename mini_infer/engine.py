@@ -330,12 +330,30 @@ class LLMEngine:
                 self.model_runner.decode_batch(running)
 
             # ── 4. 收集新 token（清理前，确保 finished 请求的最后 token 也被捕获）
+            #
+            # 注意：real GPU 路径的 prefill/decode_batch 始终以 "" 存入 generated_text_parts
+            # （逐 token decode 对多字节字符会返回空串），因此不能依赖 generated_text_parts。
+            # 改用增量 tokenizer.decode：decode(all_ids[:curr]) - decode(all_ids[:pre])
+            # 的文本差值，确保 real GPU 路径也能正确生成可读文本。
+            # dry_run 路径同样走此逻辑（_StubTokenizer.decode 返回 " [1] [2]..." 格式正确）。
             for state in self.scheduler.get_running_states():
                 rid = state.request.request_id
                 pre = pre_lens.get(rid, 0)
-                parts = list(state.generated_text_parts[pre:])
-                if parts:
-                    new_tokens[rid] = parts
+                curr = len(state.generated_token_ids)
+                if curr > pre:
+                    tok_ids = state.generated_token_ids
+                    old_text = (
+                        self.model_runner.tokenizer.decode(
+                            tok_ids[:pre], skip_special_tokens=True
+                        )
+                        if pre > 0 else ""
+                    )
+                    new_text = self.model_runner.tokenizer.decode(
+                        tok_ids[:curr], skip_special_tokens=True
+                    )
+                    delta = new_text[len(old_text):]
+                    if delta:
+                        new_tokens[rid] = [delta]
 
             # ── 5. 清理完成的请求 ────────────────────────────────────────
             for state in list(self.scheduler.get_running_states()):
