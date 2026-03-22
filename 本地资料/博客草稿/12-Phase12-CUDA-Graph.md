@@ -1,6 +1,8 @@
 # CUDA Graph 接入 Paged Attention：静态图与动态调度的折中
 
 > 系列：mini-infer 推理系统学习项目 Phase 12
+>
+> 2026-03-22 当前仓库复验：在较短 workload（`decode_steps=20`、`warmup=8`）下，1.5B 仍然复现了同方向收益：bs=1/4/8 分别从 `9.06/9.50/12.00 ms` 降到 `5.51/7.74/9.63 ms`。正文表格继续保留阶段正式 benchmark 的完整结果。
 
 ---
 

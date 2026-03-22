@@ -15,6 +15,9 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **Preemption + Priority Scheduling**：GPU KV swap to CPU，优先级调度，低优先级请求主动让出 GPU 块
 - **OpenAI Chat Completions 子集兼容 HTTP API**：FastAPI + SSE streaming，AsyncEngine 实现跨 HTTP 请求的 continuous batching
 - **Chunked Prefill**：长 prompt 拆分 chunk 投送，decode 请求不被长 prefill 饿死（ITL spike −57%~−67%）
+- **Prefix Caching**：block-level prefix hash + LRU eviction，共享前缀命中时 TTFT −22%
+- **Speculative Decoding**：0.5B draft + 7B target，modified rejection sampling，acceptance_rate 55.85%
+- **CUDA Graph**：decode_batch 静态捕获 + replay，1.5B 模型 bs=1 延迟 −28.9%
 
 项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。
 
@@ -55,14 +58,15 @@ PP 吞吐持平，价值在于每卡显存减半（支持装不进单卡的大�
 ## 架构概览
 
 ```
-engine.py           LLMEngine：continuous batching 主循环（Phase 8 HTTP 接口，Phase 9 chunked prefill）
+engine.py           LLMEngine：continuous batching 主循环（Phase 8 HTTP 接口，Phase 9 chunked prefill，Phase 10 prefix cache，Phase 12 CUDA Graph）
   ├── scheduler.py      Scheduler：waiting/running/swapped/prefilling 队列（Phase 7 preemption，Phase 9）
-  ├── kv_cache.py       KVCacheManager：Paged KV Cache（BlockTable + FreeBlockPool + swap_out/in）
+  ├── kv_cache.py       KVCacheManager：Paged KV Cache（BlockTable + FreeBlockPool + swap_out/in + Prefix Cache）
   ├── attention.py      PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
-  └── model_runner.py   ModelRunner：prefill + batch decode 执行
+  └── model_runner.py   ModelRunner：prefill + batch decode 执行（Phase 12 graph capture/replay）
 
 async_engine.py     AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
 server.py / serve.py  FastAPI HTTP server + CLI 启动（Phase 8/9）
+spec_engine.py      SpecEngine：draft + target 双模型 speculative decoding（Phase 11）
 replica_engine.py   ReplicaEngine：双卡数据并行
 tp_engine.py        TPEngine：HF Pipeline Parallel（测量用）
 ```
@@ -208,7 +212,34 @@ conda run -n ai-infra python benchmarks/benchmark_server.py --model $MODEL
 conda run -n ai-infra python benchmarks/benchmark_chunked_prefill.py --model $MODEL --chunk-size 256
 ```
 
-### 单元测试（无 GPU）
+### Phase 10-12 benchmark
+
+```bash
+# Prefix Caching（Phase 10）
+# dry_run：只验证 hit/miss 路径与 cache 行为
+conda run -n ai-infra python benchmarks/benchmark_prefix_cache.py --dry_run
+
+# 真实 GPU：建议先用 0.5B 做开发/验证
+conda run -n ai-infra python benchmarks/benchmark_prefix_cache.py \
+    --model ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775 \
+    --batch_size 8 --max_new_tokens 64
+
+# Speculative Decoding（Phase 11）
+# dry_run：验证 rollback / rejection sampling / 主循环
+conda run -n ai-infra python benchmarks/benchmark_spec.py --dry_run
+
+# 真实 GPU：draft=0.5B(cu0), target=7B(cu1)，同时跑 target-only baseline
+conda run -n ai-infra python benchmarks/benchmark_spec.py \
+    --draft auto --target auto --K 4 --max_new_tokens 64 --target_only
+
+# CUDA Graph（Phase 12）
+# 1.5B 是当前主要开发/验证模型；7B 可作为最终确认
+conda run -n ai-infra python benchmarks/benchmark_cuda_graph.py \
+    --model ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306 \
+    --num-kv-heads 2 --head-dim 128 --num-layers 28
+```
+
+### 测试命令（大部分无需 GPU）
 
 ```bash
 # 基础测试
@@ -223,7 +254,16 @@ conda run -n ai-infra python -m pytest tests/test_server.py -v
 # Phase 9 Chunked Prefill 测试（dry_run，无需 GPU）
 conda run -n ai-infra python -m pytest tests/test_chunked_prefill.py -v
 
-# Phase 6 GPU 测试（需要 2× RTX 4090）
+# Phase 10 Prefix Cache 测试（dry_run，无需 GPU）
+conda run -n ai-infra python -m pytest tests/test_prefix_cache.py -v
+
+# Phase 11 Speculative Decoding 测试（dry_run，无需 GPU）
+conda run -n ai-infra python -m pytest tests/test_spec_engine.py -v
+
+# Phase 12 CUDA Graph 测试（dry_run，无需 GPU）
+conda run -n ai-infra python -m pytest tests/test_cuda_graph.py -v
+
+# Phase 6 GPU 测试（需要真实 GPU）
 conda run -n ai-infra python -m pytest tests/test_paged_attention.py -v
 ```
 

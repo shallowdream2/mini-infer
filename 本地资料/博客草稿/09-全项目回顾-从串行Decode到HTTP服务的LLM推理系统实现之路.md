@@ -1,6 +1,7 @@
 # 从串行 Decode 到 HTTP 服务：手写 LLM 推理系统的全程复盘
 
 > mini-infer 项目完整回顾，2026-03-18 至 2026-03-21，历经 8 个主阶段与 1 个 Phase 6.5 专项阶段。
+> 更新说明（2026-03-22）：本文覆盖到 Phase 8 收尾时点；Phase 9-12 已在后续阶段中完成，对应结果见 `10-Phase10-Prefix-Caching.md`、`11-Phase11-Speculative-Decoding.md`、`12-Phase12-CUDA-Graph.md` 及相关里程碑/实验记录。
 
 ---
 
@@ -612,11 +613,11 @@ mini-infer 在 4 天内从串行 decode 走到了 100% HF 吞吐 + OpenAI Chat C
 
 ## 还没做完的事情
 
-项目主线已经收束，但有几类空白我不想假装不存在：
+以本文成稿时点（Phase 8 收尾）为准，项目主线已经收束，但有几类空白我不想假装不存在：
 
 - **P99 / 端到端分位数延迟**：目前有 TTFT / TPOT / throughput，但还没有独立 uvicorn 进程 + 真实 streaming client 下的统一分位数口径
-- **Chunked Prefill**：当前还没有 token budget 机制，长 prefill 仍可能阻塞 decode
-- **Prefix Caching**：还没有 block 级前缀复用与命中统计
+- **Chunked Prefill**：当时还没有 token budget 机制，长 prefill 仍可能阻塞 decode
+- **Prefix Caching**：当时还没有 block 级前缀复用与命中统计
 - **真正的 Tensor Parallel**：当前双卡只有 Replica 和 Pipeline Parallel，没有 Megatron/vLLM 风格的 all-reduce TP
 - **生产级监控与故障恢复**：HTTP 服务已经能跑，但还没有监控、熔断、重试、健康恢复这一层
 

@@ -2,6 +2,7 @@
 
 > 本文是 mini-infer 系列的第十篇，基于 Phase 10 的真实实现和 RTX 4090 实测数据。
 > 实验环境：Ubuntu 24.04 + RTX 4090，Qwen2.5-7B-Instruct，PyTorch 2.1.2+cu121，flash_attn 2.5.9.post1。
+> 2026-03-22 当前仓库复验：`num_gpu_blocks=256`、`block_size=256`、`max_new_tokens=64` 下，单请求 miss/hit = `1476.7 ms -> 1133.0 ms`，`1.30x`；batch=4 miss/hit = `1234.6 ms -> 1240.1 ms`，约 `1.00x`。
 
 ---
 
@@ -247,9 +248,9 @@ def prefill_with_prefix(self, state, cached_len, cached_blocks):
 
 | 路径 | TTFT | cache_size |
 |------|------|-----------|
-| miss（建立 cache） | 1468.0 ms | 1 block |
-| hit（复用 prefix） | 1139.3 ms | 1 block |
-| **speedup** | **1.29× (−22%)** | — |
+| miss（建立 cache） | 1476.7 ms | 1 block |
+| hit（复用 prefix） | 1133.0 ms | 1 block |
+| **speedup** | **1.30× (−23%)** | — |
 
 shared prefix = 257 tokens（恰好 1 个完整 cacheable block）。
 
@@ -257,9 +258,9 @@ shared prefix = 257 tokens（恰好 1 个完整 cacheable block）。
 
 | 路径 | 耗时 | 近似吞吐 |
 |------|------|---------|
-| miss batch | 1235.8 ms | ~207 tok/s |
-| hit batch | 1242.9 ms | ~206 tok/s |
-| speedup | 0.99× | — |
+| miss batch | 1234.6 ms | ~207 tok/s |
+| hit batch | 1240.1 ms | ~206 tok/s |
+| speedup | 1.00× | — |
 
 batch 吞吐几乎无提升。原因很直接：`max_new_tokens=64` 意味着 64 步 decode，而 prefix 只有 1 block（256 token）。节省的 256 token prefill 时间相比 64 步 decode 的总时间占比很低。
 
@@ -267,7 +268,7 @@ batch 吞吐几乎无提升。原因很直接：`max_new_tokens=64` 意味着 64
 
 | 场景 | prefix | output | 预期收益 |
 |------|--------|--------|---------|
-| 当前测试 | 257 token（1 block）| 64 token | 低（1.29×）|
+| 当前测试 | 257 token（1 block）| 64 token | 低（1.30×）|
 | RAG 问答 | 1024 token（4 blocks）| 32 token | 高（理论 ~5×）|
 | Few-shot 评估 | 2048 token（8 blocks）| 16 token | 很高（理论 ~10×）|
 
@@ -336,7 +337,7 @@ Phase 10 在现有的 Paged KV Cache 基础上，以约 150 行核心代码实�
 - **准入修正**：命中 prefix 后 blocks_needed 仅算 suffix，防止过度拒绝
 - **swap_out 清零**：preemption 后 prefix state 清空，re-admit 时重新命中
 
-实测在 1-block（257 token）prefix 下单请求 TTFT **−22%**。batch 吞吐收益取决于 prefix 长度与 output 长度之比；RAG 类 workload（长 prefix + 短 output）将有更显著的提升。
+实测在 1-block（257 token）prefix 下单请求 TTFT **−23%**。batch 吞吐收益取决于 prefix 长度与 output 长度之比；RAG 类 workload（长 prefix + 短 output）将有更显著的提升。
 
 系列下一篇：**Speculative Decoding**——用小模型（Qwen2.5-0.5B）批量 draft，大模型（Qwen2.5-7B）并行验证，目标在高接受率 workload 下将 decode 吞吐提升 2× 以上。
 
@@ -357,7 +358,7 @@ Phase 10 在现有的 Paged KV Cache 基础上，以约 150 行核心代码实�
   — block 粒度 vs. token 粒度的取舍；Python hash() vs. SHA-256 的选择；capping 的必要性；准入 check 的修正逻辑
 
 - [x] 有代码、实验或运行结果支撑
-  — 关键函数代码片段均来自真实实现；实验数据来自 `本地资料/实验记录/2026-03-22-phase10-benchmark.md`（miss=1468ms，hit=1139ms，speedup=1.29×）
+  — 关键函数代码片段均来自真实实现；正文数字已按当前仓库复验同步（miss=1476.7ms，hit=1133.0ms，speedup=1.30×）
 
 - [x] 有失败点、坑点或反思
   — 4 个真实坑点：hash 随机性、capping 测试失败、GPU prefix_cache_size=0、OOM；batch 吞吐无明显提升的诚实分析

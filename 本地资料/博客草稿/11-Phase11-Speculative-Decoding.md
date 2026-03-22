@@ -1,6 +1,8 @@
 # 从零实现投机解码：rejection sampling 正确性与 v1 双 forward 的代价
 
 > 系列：mini-infer 推理系统学习项目 Phase 11
+>
+> 2026-03-22 当前仓库复验：`Qwen2.5-0.5B draft + 7B target`、`K=4`、`max_new_tokens=64` 下，`acceptance_rate = 60.66%`，spec vs target-only `speedup = 0.79x`。这说明当前 v1 实现功能正确，但吞吐仍低于 baseline。
 
 ---
 
@@ -158,24 +160,24 @@ def _align_draft_prob(p: torch.Tensor) -> torch.Tensor:
 
 | 指标 | SpecEngine (K=4) | Target-only |
 |------|-----------------|-------------|
-| total_time | 5.69s | 4.51s |
-| throughput | ~29.0 tok/s | ~44.4 tok/s |
-| **speedup** | **0.65×** | baseline |
-| **acceptance_rate** | **55.85%** | N/A |
+| total_time | 5.77s | 4.51s |
+| throughput | ~35.0 tok/s | ~44.3 tok/s |
+| **speedup** | **0.79×** | baseline |
+| **acceptance_rate** | **60.66%** | N/A |
 | memory (draft) | 1.9 GB (cuda:0) | — |
 | memory (target) | 18.2 GB (cuda:1) | 18.2 GB (cuda:1) |
 
 *throughput 为 word count 近似，非精确 token count。*
 
-acceptance_rate = 55.85%（229/410）：K=4 greedy 下 0.5B 和 7B 在超过一半的位置"意见一致"，rejection sampling 工作正常。
+acceptance_rate = 60.66%：K=4 greedy 下 0.5B 和 7B 在超过一半的位置"意见一致"，rejection sampling 工作正常。
 
-**但 v1 spec 比 target-only 慢了 35%。**
+**但 v1 spec 比 target-only 仍慢约 21%。**
 
 ---
 
 ## 为什么更慢：v1 双 forward 的算力分析
 
-每轮 spec 迭代，当 acceptance_rate=55.85% 时平均接受约 2.3 个 token，但需要：
+每轮 spec 迭代，当 acceptance_rate≈60.66% 时平均接受约 2.4 个 draft token，但需要：
 - K=4 次 draft forward（0.5B，每次 ~0.14 次 7B 等效）
 - 1 次 target verify（7B）
 - 1 次 target advance（7B）
@@ -183,10 +185,10 @@ acceptance_rate = 55.85%（229/410）：K=4 greedy 下 0.5B 和 7B 在超过一�
 等效 target forward/token：
 
 ```
-(2 × 1 + 4 × 0.5/7) / 2.3 ≈ (2 + 0.29) / 2.3 ≈ 1.0
+(2 × 1 + 4 × 0.5/7) / 2.43 ≈ (2 + 0.29) / 2.43 ≈ 0.94
 ```
 
-理论上与 target-only（1 forward/token）计算量相当，但实际 0.65× 的差距来自系统层：
+理论上与 target-only（1 forward/token）计算量接近，但实际 0.79× 的差距来自系统层：
 
 - 每轮 2 次 target forward 的 CUDA kernel launch + sync overhead
 - `get_prefix_kv` 每轮从 block tensor 重建完整 KV（额外内存读写）
@@ -209,7 +211,7 @@ use_cache=True
 
 这样每轮只跑一次 7B forward。被拒绝的 token 对应的 KV 写入后需要通过 rollback 清除，多一步但总代价更低。
 
-预期 speedup（acceptance_rate=55.85%，K=4）：
+预期 speedup（acceptance_rate≈60%，K=4）：
 
 ```
 (K × AR + 1) / 1   ÷   (2 × 7B_equiv) / (K × AR + 1)
@@ -235,8 +237,8 @@ use_cache=True
 
 ## 总结
 
-Phase 11 实现了 speculative decoding 的完整功能链路：draft 生成 → target 验证 → rejection sampling → KV 同步，acceptance_rate = 55.85%（K=4, greedy），输出分布等价于 target-only。
+Phase 11 实现了 speculative decoding 的完整功能链路：draft 生成 → target 验证 → rejection sampling → KV 同步，当前仓库复验下 acceptance_rate = 60.66%（K=4, greedy），输出分布等价于 target-only。
 
-v1 的主要局限是吞吐 0.65× target-only，根本原因是双 forward 设计在系统层的 overhead 超过了算法层的收益。这不是 rejection sampling 的问题，而是 KV cache 管理方式的代价——v2 通过合并 forward 可以解决，但 v1 证明了算法正确性是第一步。
+v1 的主要局限是吞吐仍只有 0.79× target-only，根本原因是双 forward 设计在系统层的 overhead 超过了算法层的收益。这不是 rejection sampling 的问题，而是 KV cache 管理方式的代价——v2 通过合并 forward 可以解决，但 v1 证明了算法正确性是第一步。
 
 推理系统的工程规律：先跑通，再量化，再优化。每一步都需要真实数据支撑。

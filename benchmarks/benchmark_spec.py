@@ -33,8 +33,11 @@ Phase 11 Speculative Decoding benchmark。
 from __future__ import annotations
 
 import argparse
+import gc
 import os
 import time
+
+import torch
 
 from mini_infer.config import EngineConfig
 from mini_infer.engine import LLMEngine
@@ -226,9 +229,13 @@ def main() -> None:
 
     # --- Target-only baseline（可选）---
     if args.target_only and not dry_run:
-        print("\n[3] 加载 target-only engine（baseline）...")
-        # 注意：target 已经在 spec_engine 内部；重用会有 KV cache 冲突
-        # 这里单独建一个新 LLMEngine（独立 KV cache）
+        # spec_engine 已经占用了 draft(cuda:0) + target(cuda:1)。
+        # 若不先释放，再单独加载一份 target-only baseline，会在 24GB 卡上直接 OOM。
+        del spec_engine
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        print("\n[3] 清理 SpecEngine 后加载 target-only engine（baseline）...")
         t0 = time.perf_counter()
         target_engine = build_target_only_engine(target_path, dry_run=False)
         print(f"    target-only engine loaded in {time.perf_counter()-t0:.1f}s")

@@ -6,8 +6,6 @@ import argparse
 import os
 import sys
 
-from mini_infer.clients.chat_client import main as chat_main
-
 DEFAULT_MODEL_PATH = os.path.expanduser(
     "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct"
 )
@@ -29,6 +27,12 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         default="",
         help="override the local model path used by --real",
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda:0",
+        help="device used by the temporary real-model server",
+    )
     return parser.parse_known_args(argv)
 
 
@@ -48,8 +52,18 @@ def resolve_real_model_path(args: argparse.Namespace) -> str:
 
 def main() -> int:
     args, rest = parse_args(sys.argv[1:])
+    from mini_infer.clients.chat_client import main as chat_main
+
     if args.real or args.model_path:
-        argv = ["--quick-model-path", resolve_real_model_path(args), "--max-tokens", "64", *rest]
+        argv = [
+            "--quick-model-path",
+            resolve_real_model_path(args),
+            "--device",
+            args.device,
+            "--max-tokens",
+            "64",
+            *rest,
+        ]
     elif rest:
         argv = rest
     else:

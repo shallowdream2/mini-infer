@@ -26,6 +26,8 @@ Phase 10 Prefix Cache benchmark。
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import time
 from typing import Any
 
@@ -37,13 +39,28 @@ from mini_infer.engine import LLMEngine
 # 辅助函数
 # ---------------------------------------------------------------------------
 
+def infer_model_arch(model_path: str) -> dict[str, int]:
+    config_path = os.path.join(model_path, "config.json")
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(f"找不到模型配置文件：{config_path}")
+    with open(config_path, "r", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    return {
+        "num_hidden_layers": int(cfg["num_hidden_layers"]),
+        "num_kv_heads": int(cfg.get("num_key_value_heads", cfg["num_attention_heads"])),
+        "head_dim": int(cfg["hidden_size"]) // int(cfg["num_attention_heads"]),
+    }
+
+
 def build_engine(model: str, dry_run: bool, num_gpu_blocks: int, block_size: int) -> LLMEngine:
+    arch = {} if dry_run else infer_model_arch(model)
     config = EngineConfig(
         model_name=model,
         dry_run=dry_run,
         num_gpu_blocks=num_gpu_blocks,
         block_size=block_size,
         max_batch_size=16,
+        **arch,
     )
     return LLMEngine(config)
 
@@ -151,6 +168,14 @@ def main() -> None:
     print(f"  model={args.model}, dry_run={dry_run}")
     print(f"  num_gpu_blocks={args.num_gpu_blocks}, block_size={args.block_size}")
     print(f"  max_new_tokens={args.max_new_tokens}, batch_size={args.batch_size}")
+    if not dry_run:
+        arch = infer_model_arch(args.model)
+        print(
+            "  arch="
+            f"{arch['num_hidden_layers']} layers, "
+            f"{arch['num_kv_heads']} KV heads, "
+            f"head_dim={arch['head_dim']}"
+        )
     print("=" * 70)
 
     engine = build_engine(args.model, dry_run, args.num_gpu_blocks, args.block_size)

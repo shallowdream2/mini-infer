@@ -48,6 +48,9 @@ mini-infer 是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学
 - 双卡扩展（Replica + HF Pipeline Parallel 测量）
 - `OpenAI Chat Completions 子集兼容 HTTP API`
 - `Chunked Prefill`
+- `Prefix Caching`
+- `Speculative Decoding`
+- `CUDA Graph`
 
 项目代码主入口：
 
@@ -64,8 +67,15 @@ mini-infer 是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学
 - `mini_infer/replica_engine.py`
 - `mini_infer/pp_engine.py`
 - `mini_infer/tp_engine.py`
+- `mini_infer/spec_engine.py`
 - `benchmarks/benchmark_chunked_prefill.py`
+- `benchmarks/benchmark_prefix_cache.py`
+- `benchmarks/benchmark_spec.py`
+- `benchmarks/benchmark_cuda_graph.py`
 - `tests/test_chunked_prefill.py`
+- `tests/test_prefix_cache.py`
+- `tests/test_spec_engine.py`
+- `tests/test_cuda_graph.py`
 
 测试位于 `tests/`，benchmark 位于 `benchmarks/`。
 
@@ -77,7 +87,7 @@ mini-infer 是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学
 - 默认假设 GPU 可用
 - 如果缺少模型权重，必须明确说明缺的是哪个模型，不得伪造运行结果
 
-已验证的关键版本快照（2026-03-21）：
+已验证的关键版本快照（2026-03-22）：
 
 - `torch 2.1.2+cu121`
 - `transformers 4.43.4`

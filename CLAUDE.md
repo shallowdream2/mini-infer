@@ -18,6 +18,8 @@
 - **OpenAI Chat Completions 子集兼容 HTTP API**（Phase 8，FastAPI + SSE streaming，AsyncEngine continuous batching）
 - **Chunked Prefill**（Phase 9，长 prefill 拆分 chunk 投送，decode 请求不被长 prefill 饿死，ITL spike −57%~−67%）
 - **Prefix Caching**（Phase 10，block-level SHA-256 链式 hash + LRU eviction + ref_count，共享前缀 TTFT −22%）
+- **Speculative Decoding**（Phase 11，Qwen2.5-0.5B draft + 7B target，modified rejection sampling，acceptance_rate 55.85%）
+- **CUDA Graph**（Phase 12，decode_batch 静态捕获 + graph pool，1.5B bs=1 延迟 −28.9%）
 
 ## 当前状态
 
@@ -104,7 +106,9 @@
 - `mini_infer/replica_engine.py` — ReplicaEngine（双卡数据并行）
 - `mini_infer/pp_engine.py` — PPEngine（HF Pipeline Parallel，测量用）
 - `mini_infer/tp_engine.py` — 向后兼容别名（TPEngine = PPEngine，Phase 13 实现真 TP 后将重写）
+- `mini_infer/spec_engine.py` — SpecEngine（Phase 11，draft+target 双模型 speculative decoding）
 - `serve.py` — HTTP server CLI 启动脚本（argparse + uvicorn，Phase 8）
+- `chat.py` / `quick_chat.py` / `mini_infer/clients/chat_client.py` — 本地聊天入口与临时服务 quick mode
 
 测试位于 `tests/`。
 
@@ -117,6 +121,9 @@ benchmark 位于 `benchmarks/`：
 - `benchmark_preemption.py` — Phase 7 preemption swap latency + 吞吐回归
 - `benchmark_server.py` — Phase 8 HTTP API benchmark（TTFT / TPOT / 并发吞吐）
 - `benchmark_chunked_prefill.py` — Phase 9 Chunked Prefill benchmark（ITL spike / TTFT 对比）
+- `benchmark_prefix_cache.py` — Phase 10 Prefix Caching benchmark（miss/hit TTFT，对比共享前缀收益）
+- `benchmark_spec.py` — Phase 11 Speculative Decoding benchmark（acceptance rate / spec vs target-only）
+- `benchmark_cuda_graph.py` — Phase 12 CUDA Graph benchmark（eager vs graph decode step latency）
 - `profile_decode.py` — decode_batch 内部 profiling（Phase 6）
 
 skills 位于 `.claude/skills/`。
@@ -148,6 +155,18 @@ skills 位于 `.claude/skills/`。
 10. Phase 之间的空档期（上一 Phase archive 完成、下一 Phase 尚未 plan）：对话开始时说明"当前在 Phase N 和 Phase N+1 之间，下一步是 Phase N+1 的 infer-plan"，不要误判为 Phase N 仍在进行。
 
 
+## Phase 12.5 进度
+
+| 步骤 | 状态 |
+|------|------|
+| infer-plan | ✓ |
+| infer-implement | ✓ |
+| infer-review | ✓ |
+| infer-benchmark | ✓ |
+| infer-summarize | ✓ |
+| infer-blog | ✓ |
+| infer-archive | ⬜ |
+
 **Phase 9-15 战略原则**：
 - 每个 Phase 结束时项目是完整的、可独立展示的，不依赖后续 Phase
 - 每个 Phase 有明确的跳过/降级条件，卡点超过合理时间可跳过并文档记录原因
@@ -158,9 +177,6 @@ skills 位于 `.claude/skills/`。
 
 | 阶段 | 最小验收标准 |
 |------|-------------|
-| Phase 10 | 实现前缀命中识别与 block 复用，命中 workload 下显存或 TTFT 有量化收益，未命中路径无明显回退 |
-| Phase 11 | draft + target 双模型 speculative decoding 跑通，给出 acceptance rate、吞吐提升和回退成本 |
-| Phase 12 | decode_batch 形状收敛后可稳定 capture / replay，比较启用前后的 Python dispatch 开销与吞吐变化 |
 | Phase 12.5 | 长序列场景下给出 split-K / flash decoding 对比，证明长 context decode 的扩展性改善 |
 | Phase 13 | 至少实现一层或一条主链路上的真 TP（含 NCCL all-reduce），并与 PP / Replica 明确区分 benchmark 口径 |
 | Phase 14 | 跑通 MLA 核心数据流与 cache 组织，解释与标准 MHA/GQA 的差别，给出最小正确性与性能验证 |
