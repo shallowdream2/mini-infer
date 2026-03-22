@@ -18,6 +18,8 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **Prefix Caching**：block-level prefix hash + LRU eviction，共享前缀命中时 TTFT −22%
 - **Speculative Decoding**：0.5B draft + 7B target，modified rejection sampling，acceptance_rate 55.85%
 - **CUDA Graph**：decode_batch 静态捕获 + replay，1.5B 模型 bs=1 延迟 −28.9%
+- **Flash Decoding / Split-K**：Triton split-K attention kernel，1.5B seq=4096 延迟 3.31× vs 标准 Triton kernel，SM 利用率 9% → 103%
+- **Tensor Parallelism**：Megatron-LM 风格，column/row parallel 权重切分 + NCCL all-reduce forward hook，TP=2 greedy 输出与单卡完全一致
 
 项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。
 
@@ -237,6 +239,32 @@ conda run -n ai-infra python benchmarks/benchmark_spec.py \
 conda run -n ai-infra python benchmarks/benchmark_cuda_graph.py \
     --model ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306 \
     --num-kv-heads 2 --head-dim 128 --num-layers 28
+
+# Flash Decoding（Phase 12.5，无需模型权重）
+# 1.5B 配置（12Q/2KV heads）
+conda run -n ai-infra python benchmarks/benchmark_flash_decode.py
+
+# 7B 配置（28Q/4KV heads）
+conda run -n ai-infra python benchmarks/benchmark_flash_decode.py \
+    --num-q-heads 28 --num-kv-heads 4 --skip-reference
+
+# 正确性测试
+conda run -n ai-infra python -m pytest tests/test_flash_decode.py -v
+```
+
+# Tensor Parallel（Phase 13）
+```bash
+# 单卡 baseline
+conda run -n ai-infra python benchmarks/benchmark_tp.py --mode single
+
+# Pipeline Parallel（HF device_map=balanced）
+conda run -n ai-infra python benchmarks/benchmark_tp.py --mode pp
+
+# Tensor Parallel TP=2（torchrun，真实 NCCL 通信）
+conda run -n ai-infra torchrun --nproc_per_node 2 benchmarks/benchmark_tp.py --mode torchrun_tp
+
+# TP 正确性测试（dry_run，无需 GPU）
+conda run -n ai-infra python -m pytest tests/test_tp_engine.py -v
 ```
 
 ### 测试命令（大部分无需 GPU）
@@ -283,8 +311,10 @@ mini_infer/              核心推理代码
   server.py              FastAPI HTTP server（Phase 8/9）
   replica_engine.py      ReplicaEngine（双卡数据并行）
   pp_engine.py           PPEngine（HF Pipeline Parallel，测量用）
-  tp_engine.py           向后兼容别名（TPEngine = PPEngine）
+  tp_engine.py           TPEngine：真 Tensor Parallel 引擎（Phase 13，mp.spawn，重写自旧 PP 别名）
+  tp_model_runner.py     TensorParallelModelRunner：权重切分 + all-reduce hook（Phase 13）
   triton_attn.py         Triton decode attention kernel（Phase 6.5，实验性）
+  triton_flash_decode.py Flash Decoding split-K kernel（Phase 12.5，实验性，dense KV）
   spec_engine.py         SpecEngine：Speculative Decoding 引擎（Phase 11，draft+target 双模型）
 
 serve.py                 HTTP server CLI 启动脚本（Phase 8/9）
@@ -304,6 +334,8 @@ benchmarks/
   benchmark_prefix_cache.py    Phase 10 Prefix Cache benchmark（miss/hit TTFT 对比，支持 --dry_run）
   benchmark_spec.py      Phase 11 Speculative Decoding benchmark（acceptance_rate / speedup 对比）
   benchmark_cuda_graph.py  Phase 12 CUDA Graph benchmark（eager vs graph，逐 batch_size 延迟对比）
+  benchmark_flash_decode.py Phase 12.5 Flash Decoding benchmark（seq_len sweep，split-K vs triton_65 vs flash_attn）
+  benchmark_tp.py        Phase 13 Tensor Parallel benchmark（single/pp/torchrun_tp 吞吐 + VRAM 对比）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
 
 tests/
@@ -318,6 +350,8 @@ tests/
   test_prefix_cache.py     Phase 10 Prefix Cache 测试（dry_run，miss/hit/evict/preemption）
   test_spec_engine.py      Phase 11 Speculative Decoding 测试（rollback_to / rejection sampling / dry_run，13 tests）
   test_cuda_graph.py       Phase 12 CUDA Graph 测试（dry_run：graph pool 为空时降级、_find_padded_bs 边界）
+  test_flash_decode.py     Phase 12.5 Flash Decoding 正确性测试（21 tests：GQA、empty split、非整除 seq_len）
+  test_tp_engine.py        Phase 13 Tensor Parallel 测试（dry_run，13 tests：col/row shard、数学等价、attn 属性、mock all-reduce）
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
@@ -345,8 +379,8 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 10 | Prefix Caching（block-level hash + LRU，TTFT −22% @ 1-block prefix）| ✅ 完成 |
 | Phase 11 | Speculative Decoding（Qwen2.5-0.5B draft + 7B target，rejection sampling，acceptance_rate=55.85%）| ✅ 完成 |
 | Phase 12 | CUDA Graph（decode_batch 静态捕获，消除 Python dispatch 开销；1.5B bs=1 +28.9%）| ✅ 完成 |
-| Phase 12.5 | Flash Decoding（Split-K，长序列 attention 并行化）| ⬜ 计划中 |
-| Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce）| ⬜ 计划中 |
+| Phase 12.5 | Flash Decoding（Split-K，Triton 实现；1.5B seq=4096 3.31× vs triton_65）| ✅ 完成 |
+| Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce；1.5B TP=2 正确性验证通过，tp=2 76.5 tok/s vs single 98.0）| ✅ 完成 |
 | Phase 14 | MLA（Multi-head Latent Attention，DeepSeek 架构）| ⬜ 计划中 |
 | Phase 15 | PD 解耦（Disaggregated Prefill/Decode）| ⬜ 计划中 |
 

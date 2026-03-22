@@ -20,6 +20,7 @@
 - **Prefix Caching**（Phase 10，block-level SHA-256 链式 hash + LRU eviction + ref_count，共享前缀 TTFT −22%）
 - **Speculative Decoding**（Phase 11，Qwen2.5-0.5B draft + 7B target，modified rejection sampling，acceptance_rate 55.85%）
 - **CUDA Graph**（Phase 12，decode_batch 静态捕获 + graph pool，1.5B bs=1 延迟 −28.9%）
+- **Flash Decoding / Split-K Attention**（Phase 12.5，Triton split-K kernel，1.5B seq=4096 延迟 3.31× vs triton_65，SM 利用率 9% → 103%）
 
 ## 当前状态
 
@@ -38,9 +39,9 @@
 | Phase 10 | Prefix Caching（block-level hash + LRU，TTFT −22% @ 1-block prefix）| ✅ |
 | Phase 11 | Speculative Decoding（draft+target 双模型，rejection sampling）| ✅ |
 | Phase 12 | CUDA Graph（decode_batch 静态捕获，消除 Python dispatch 开销，1.5B +28.9%）| ✅ |
-| Phase 12.5 | Flash Decoding（Split-K attention，长序列并行，Triton 实现）| ⬜ |
-| Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce，column/row parallel）| ⬜ |
-| Phase 14 | MLA（Multi-head Latent Attention，DeepSeek-V2/V3 架构）| ⬜ |
+| Phase 12.5 | Flash Decoding（Split-K attention，长序列并行，Triton 实现，1.5B seq=4096 3.31× vs triton_65）| ✅ |
+| Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce，column/row parallel）| ✅ |
+| Phase 14 | MLA（Multi-head Latent Attention，DeepSeek-V2/V3 架构）| 🔄 |
 | Phase 15 | PD 解耦（Disaggregated Prefill/Decode，KV 网络传输）| ⬜ |
 
 **权威来源说明**：当前状态与未来计划以本文件（`CLAUDE.md`）为权威来源；详细技术规划参考 `本地资料/Claude计划/00-长期路线图.md`；`README.md` 仅作快速索引；带日期的里程碑总结、开发日志和实验记录默认视为历史快照。
@@ -105,8 +106,10 @@
 - `mini_infer/server.py` — FastAPI HTTP server（Phase 8）
 - `mini_infer/replica_engine.py` — ReplicaEngine（双卡数据并行）
 - `mini_infer/pp_engine.py` — PPEngine（HF Pipeline Parallel，测量用）
-- `mini_infer/tp_engine.py` — 向后兼容别名（TPEngine = PPEngine，Phase 13 实现真 TP 后将重写）
+- `mini_infer/tp_engine.py` — TPEngine 真 TP 引擎（Phase 13，mp.spawn + 文件锁 rendezvous）
+- `mini_infer/tp_model_runner.py` — TensorParallelModelRunner（Phase 13，Megatron-LM 风格权重切分 + all-reduce hook）
 - `mini_infer/spec_engine.py` — SpecEngine（Phase 11，draft+target 双模型 speculative decoding）
+- `mini_infer/triton_flash_decode.py` — Flash Decoding split-K kernel（Phase 12.5，实验性，密 KV，不接入主路径）
 - `serve.py` — HTTP server CLI 启动脚本（argparse + uvicorn，Phase 8）
 - `chat.py` / `quick_chat.py` / `mini_infer/clients/chat_client.py` — 本地聊天入口与临时服务 quick mode
 
@@ -124,6 +127,7 @@ benchmark 位于 `benchmarks/`：
 - `benchmark_prefix_cache.py` — Phase 10 Prefix Caching benchmark（miss/hit TTFT，对比共享前缀收益）
 - `benchmark_spec.py` — Phase 11 Speculative Decoding benchmark（acceptance rate / spec vs target-only）
 - `benchmark_cuda_graph.py` — Phase 12 CUDA Graph benchmark（eager vs graph decode step latency）
+- `benchmark_flash_decode.py` — Phase 12.5 Flash Decoding benchmark（seq_len sweep，split-K vs triton_65 vs flash_attn）
 - `profile_decode.py` — decode_batch 内部 profiling（Phase 6）
 
 skills 位于 `.claude/skills/`。
@@ -154,19 +158,6 @@ skills 位于 `.claude/skills/`。
 9. 无模型权重时，明确说明，不伪造运行结果。（GPU 始终可用，不需要确认。）
 10. Phase 之间的空档期（上一 Phase archive 完成、下一 Phase 尚未 plan）：对话开始时说明"当前在 Phase N 和 Phase N+1 之间，下一步是 Phase N+1 的 infer-plan"，不要误判为 Phase N 仍在进行。
 
-
-## Phase 12.5 进度
-
-| 步骤 | 状态 |
-|------|------|
-| infer-plan | ✓ |
-| infer-implement | ✓ |
-| infer-review | ✓ |
-| infer-benchmark | ✓ |
-| infer-summarize | ✓ |
-| infer-blog | ✓ |
-| infer-archive | ⬜ |
-
 **Phase 9-15 战略原则**：
 - 每个 Phase 结束时项目是完整的、可独立展示的，不依赖后续 Phase
 - 每个 Phase 有明确的跳过/降级条件，卡点超过合理时间可跳过并文档记录原因
@@ -177,7 +168,6 @@ skills 位于 `.claude/skills/`。
 
 | 阶段 | 最小验收标准 |
 |------|-------------|
-| Phase 12.5 | 长序列场景下给出 split-K / flash decoding 对比，证明长 context decode 的扩展性改善 |
 | Phase 13 | 至少实现一层或一条主链路上的真 TP（含 NCCL all-reduce），并与 PP / Replica 明确区分 benchmark 口径 |
 | Phase 14 | 跑通 MLA 核心数据流与 cache 组织，解释与标准 MHA/GQA 的差别，给出最小正确性与性能验证 |
 | Phase 15 | 拆分 Prefill/Decode 角色或进程，给出解耦后的吞吐、延迟、资源占用变化，说明适用 workload |
