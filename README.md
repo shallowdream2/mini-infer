@@ -172,8 +172,21 @@ curl http://localhost:8000/v1/chat/completions \
 env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u http_proxy -u https_proxy \
   conda run -n ai-infra python -c "from openai import OpenAI; client = OpenAI(base_url='http://127.0.0.1:8000/v1', api_key='none'); resp = client.chat.completions.create(model='mini-infer', messages=[{'role':'user','content':'hello'}], max_tokens=8); print(resp.choices[0].message.content)"
 
-# 交互式聊天客户端（默认直连本地服务；对 localhost 默认忽略代理变量）
-conda run -n ai-infra python chat.py --base-url http://127.0.0.1:8000/v1
+# 最简单的功能验证：单命令自动起临时 dry-run 服务并进入聊天
+conda run --no-capture-output -n ai-infra python quick_chat.py
+
+# 最简单的真实模型聊天：默认尝试本机 Qwen2.5-7B-Instruct 本地目录
+conda run --no-capture-output -n ai-infra python quick_chat.py --real
+
+# 如果默认目录不同，可显式指定
+conda run --no-capture-output -n ai-infra python quick_chat.py --real --model-path /path/to/Qwen2.5-7B-Instruct
+
+# 等价写法
+conda run --no-capture-output -n ai-infra python chat.py --quick-dry-run
+
+# 如果你已经手动起好了服务，再连现有服务聊天
+# 注意：chat.py 是交互程序；conda run 需要加 --no-capture-output 才能正常读 stdin
+conda run --no-capture-output -n ai-infra python chat.py
 # 支持 /clear、/history、/help、exit
 
 # 直接 uvicorn 启动（未注入 config 时默认回退到 dry_run）
@@ -231,7 +244,9 @@ mini_infer/              核心推理代码
   triton_attn.py         Triton decode attention kernel（Phase 6.5，实验性）
 
 serve.py                 HTTP server CLI 启动脚本（Phase 8/9）
-chat.py                  交互式聊天客户端（连接本地 Chat Completions API）
+chat.py                  高级聊天入口（薄包装，实际实现位于 mini_infer/clients/chat_client.py）
+quick_chat.py            一键快速聊天入口（薄包装，默认自动起临时 dry-run 服务）
+mini_infer/clients/chat_client.py  聊天客户端实现（HTTP 调用、SSE、quick mode）
 
 benchmarks/
   benchmark_hf.py        HuggingFace Transformers baseline

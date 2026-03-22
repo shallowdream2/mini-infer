@@ -666,6 +666,43 @@ class KVCacheManager:
         return len(self._prefix_cache)
 
     # ------------------------------------------------------------------
+    # Phase 11：Speculative Decoding — KV 回滚
+    # ------------------------------------------------------------------
+
+    def rollback_to(self, request_id: str, seq_len: int) -> None:
+        """
+        Phase 11：Speculative Decoding 回滚接口。
+
+        将请求的 KV cache 截断到 seq_len 长度，释放多余的物理块。
+        用于 rejection sampling 后丢弃未被接受的 draft token 对应的 KV。
+
+        调用前提：seq_len <= 当前 _seq_lens[request_id]，且 request_id 已存在。
+        对 prefix cache 共享块（ref_count > 1）的释放仅递减引用计数，不归还 _free_blocks。
+        """
+        if request_id not in self._block_tables:
+            return
+        current_seq_len = self._seq_lens.get(request_id, 0)
+        if seq_len >= current_seq_len:
+            return  # 无需截断
+
+        # 目标需要的块数（至少保留 1 块）
+        target_num_blocks = max(1, math.ceil(seq_len / self.block_size))
+        current_blocks = self._block_tables[request_id]
+
+        if len(current_blocks) > target_num_blocks:
+            excess = current_blocks[target_num_blocks:]
+            self._block_tables[request_id] = current_blocks[:target_num_blocks]
+            for block in excess:
+                count = self._ref_count.get(block, 1) - 1
+                if count <= 0:
+                    self._free_blocks.append(block)
+                    self._ref_count.pop(block, None)
+                else:
+                    self._ref_count[block] = count
+
+        self._seq_lens[request_id] = seq_len
+
+    # ------------------------------------------------------------------
     # 废弃接口（保留以减少测试迁移成本，不再有实际功能）
     # ------------------------------------------------------------------
 

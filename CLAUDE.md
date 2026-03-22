@@ -134,6 +134,18 @@ skills 位于 `.claude/skills/`。
 10. Phase 之间的空档期（上一 Phase archive 完成、下一 Phase 尚未 plan）：对话开始时说明"当前在 Phase N 和 Phase N+1 之间，下一步是 Phase N+1 的 infer-plan"，不要误判为 Phase N 仍在进行。
 
 
+## Phase 11 进度
+
+| 步骤 | 状态 |
+|------|------|
+| infer-plan | ✓ |
+| infer-implement | ⬜ |
+| infer-review | ⬜ |
+| infer-benchmark | ⬜ |
+| infer-summarize | ⬜ |
+| infer-blog | ⬜ |
+| infer-archive | ⬜ |
+
 **Phase 9-15 战略原则**：
 - 每个 Phase 结束时项目是完整的、可独立展示的，不依赖后续 Phase
 - 每个 Phase 有明确的跳过/降级条件，卡点超过合理时间可跳过并文档记录原因

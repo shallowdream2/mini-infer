@@ -356,3 +356,141 @@ class ModelRunner:
     def free_request(self, state: RequestState) -> None:
         """Phase 2 中 KV 由 KVCacheManager 管理，此处为接口兼容保留，无需操作。"""
         pass
+
+    # ------------------------------------------------------------------
+    # Phase 11：Speculative Decoding 辅助接口
+    # ------------------------------------------------------------------
+
+    def spec_decode_one(self, state: RequestState) -> torch.Tensor:
+        """
+        Phase 11：Draft 模型一步 decode，返回 logit tensor [vocab_size]（不采样，不更新 state）。
+
+        调用方负责：
+          - 调用前先调用 kv_cache.ensure_next_slot([request_id])
+          - 调用后从返回的 logit 采样 token，并调用 kv_cache.advance_seq_lens 和更新 state
+
+        dry_run：返回全 0 的固定大小 logit。
+        GPU：走 paged attention 路径（同 decode_batch），返回 logits[vocab_size]。
+        """
+        if self.config.dry_run:
+            # dry_run stub：vocabulary 大小固定为 256 以匹配 StubTokenizer（ord）的范围
+            return torch.zeros(256)
+
+        request_id = state.request.request_id
+        last_token = (
+            state.generated_token_ids[-1]
+            if state.generated_token_ids
+            else state.prompt_token_ids[-1]
+        )
+        input_ids = torch.tensor(
+            [[last_token]], dtype=torch.long, device=self.config.device
+        )
+        block_table, cache_seqlens = self.kv_cache.build_block_tables([request_id])
+        position_ids = cache_seqlens.long().unsqueeze(1)
+        max_kv_len = int(cache_seqlens.max().item()) + 1
+        self._paged_ctx.set(block_table, cache_seqlens, max_kv_len)
+        try:
+            with torch.no_grad():
+                out = self.model(
+                    input_ids=input_ids,
+                    position_ids=position_ids,
+                    use_cache=False,
+                )
+            logits = out.logits[0, 0, :].clone()  # [vocab_size]
+        finally:
+            self._paged_ctx.clear()
+        return logits
+
+    def spec_verify_target(
+        self, state: RequestState, draft_tokens: list[int]
+    ) -> torch.Tensor:
+        """
+        Phase 11：目标模型一次 forward 验证 K 个 draft token。
+
+        从 block tensor 重建当前完整 KV（类似 prefix cache 路径），
+        以 draft_tokens（K 个 token）为输入做 HF forward，
+        返回 logits Tensor[K, vocab_size]（第 i 个 logit 对应 draft_tokens[i] 之后的分布）。
+
+        注意：此方法不修改 block tensor 也不更新 state，只返回 logits 用于 rejection sampling。
+        调用方在 rejection sampling 后决定接受哪些 token，再调用 spec_advance_target_kv 提交。
+
+        dry_run：返回全 0 的 Tensor[K, 256]。
+        """
+        K = len(draft_tokens)
+        if self.config.dry_run:
+            return torch.zeros(K, 256)
+
+        request_id = state.request.request_id
+        seq_len = self.kv_cache._seq_lens[request_id]
+        block_table = self.kv_cache._block_tables[request_id]
+        current_kv = self.kv_cache.get_prefix_kv(block_table, seq_len)
+
+        input_ids = torch.tensor(
+            [draft_tokens], dtype=torch.long, device=self.config.device
+        )
+        with torch.no_grad():
+            out = self.model(
+                input_ids=input_ids,
+                past_key_values=current_kv,
+                use_cache=False,  # 不需要 KV 输出，only logits
+            )
+        return out.logits[0].clone()  # [K, vocab_size]
+
+    def spec_advance_target_kv(
+        self, state: RequestState, token_ids: list[int]
+    ) -> torch.Tensor:
+        """
+        Phase 11：将 token_ids（已接受的 token 列表）提交到目标模型的 block tensor。
+
+        类似 mini-prefill：从 block tensor 重建当前 KV，以 token_ids 为输入做 HF forward
+        并将新 KV 写入 block tensor，同时更新 seq_len。
+
+        返回最后一个位置的 logit [vocab_size]（供下一轮 spec 迭代的 last_logit 缓存）。
+
+        调用前提：kv_cache 已有足够的空闲块容纳 len(token_ids) 个新 token。
+        dry_run：直接推进 seq_len，返回全 0 logit。
+        """
+        if self.config.dry_run:
+            request_id = state.request.request_id
+            self.kv_cache._seq_lens[request_id] += len(token_ids)
+            # 确保块分配（dry_run 下不操作 GPU tensor，只管元数据）
+            for _ in token_ids:
+                rid = request_id
+                token_pos = self.kv_cache._seq_lens[rid] - 1  # 刚自增后的位置
+                # 在 dry_run 下 ensure_next_slot 是安全的（只分配元数据 block）
+                block_idx = (self.kv_cache._seq_lens[rid] - 1) // self.kv_cache.block_size
+                while block_idx >= len(self.kv_cache._block_tables[rid]):
+                    self.kv_cache._block_tables[rid].append(
+                        self.kv_cache._allocate_block()
+                    )
+            return torch.zeros(256)
+
+        request_id = state.request.request_id
+        seq_len = self.kv_cache._seq_lens[request_id]
+        block_table = self.kv_cache._block_tables[request_id]
+        current_kv = self.kv_cache.get_prefix_kv(block_table, seq_len)
+
+        # 确保目标块已分配
+        for _ in token_ids:
+            self.kv_cache.ensure_next_slot([request_id])
+            # ensure_next_slot 需要 seq_len 处已有块；先占位再写入
+            self.kv_cache._seq_lens[request_id] += 1
+
+        # 重置 seq_len，让 write_prefill_kv_suffix 正确写入
+        self.kv_cache._seq_lens[request_id] = seq_len
+
+        input_ids = torch.tensor(
+            [token_ids], dtype=torch.long, device=self.config.device
+        )
+        with torch.no_grad():
+            out = self.model(
+                input_ids=input_ids,
+                past_key_values=current_kv,
+                use_cache=True,
+            )
+
+        # 写入 token_ids 对应的新 KV 块（offset = seq_len，即只写 suffix）
+        self.kv_cache.write_prefill_kv_suffix(request_id, out.past_key_values, seq_len)
+        self.kv_cache._seq_lens[request_id] = seq_len + len(token_ids)
+
+        return out.logits[0, -1, :].clone()  # [vocab_size]
