@@ -181,6 +181,9 @@ conda run --no-capture-output -n ai-infra python quick_chat.py --real
 # 如果默认目录不同，可显式指定
 conda run --no-capture-output -n ai-infra python quick_chat.py --real --model-path /path/to/Qwen2.5-7B-Instruct
 
+# 如果 cuda:0 忙，可以显式切到另一张卡
+conda run --no-capture-output -n ai-infra python quick_chat.py --real --device cuda:1
+
 # 等价写法
 conda run --no-capture-output -n ai-infra python chat.py --quick-dry-run
 
@@ -242,6 +245,7 @@ mini_infer/              核心推理代码
   pp_engine.py           PPEngine（HF Pipeline Parallel，测量用）
   tp_engine.py           向后兼容别名（TPEngine = PPEngine）
   triton_attn.py         Triton decode attention kernel（Phase 6.5，实验性）
+  spec_engine.py         SpecEngine：Speculative Decoding 引擎（Phase 11，draft+target 双模型）
 
 serve.py                 HTTP server CLI 启动脚本（Phase 8/9）
 chat.py                  高级聊天入口（薄包装，实际实现位于 mini_infer/clients/chat_client.py）
@@ -258,6 +262,7 @@ benchmarks/
   benchmark_server.py    Phase 8 HTTP API benchmark（TTFT/TPOT/并发吞吐）
   benchmark_chunked_prefill.py  Phase 9 Chunked Prefill benchmark（ITL spike / TTFT 对比）
   benchmark_prefix_cache.py    Phase 10 Prefix Cache benchmark（miss/hit TTFT 对比，支持 --dry_run）
+  benchmark_spec.py      Phase 11 Speculative Decoding benchmark（acceptance_rate / speedup 对比）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
 
 tests/
@@ -270,6 +275,7 @@ tests/
   test_server.py           Phase 8 HTTP server 测试（ASGI TestClient，dry_run）
   test_chunked_prefill.py  Phase 9 Chunked Prefill 测试（dry_run，状态机 + 端到端 + KV 无泄漏）
   test_prefix_cache.py     Phase 10 Prefix Cache 测试（dry_run，miss/hit/evict/preemption）
+  test_spec_engine.py      Phase 11 Speculative Decoding 测试（rollback_to / rejection sampling / dry_run，13 tests）
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
@@ -295,7 +301,7 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 8 | OpenAI Chat Completions 子集兼容 HTTP API（FastAPI + SSE streaming，AsyncEngine）| ✅ 完成 |
 | Phase 9 | Chunked Prefill（长 prefill 不阻塞 decode，ITL spike −57% @ chunk=256）| ✅ 完成 |
 | Phase 10 | Prefix Caching（block-level hash + LRU，TTFT −22% @ 1-block prefix）| ✅ 完成 |
-| Phase 11 | Speculative Decoding（draft+target 双模型推理加速）| ⬜ 计划中 |
+| Phase 11 | Speculative Decoding（Qwen2.5-0.5B draft + 7B target，rejection sampling，acceptance_rate=55.85%）| ✅ 完成 |
 | Phase 12 | CUDA Graph（decode_batch 静态捕获，消除 Python dispatch 开销）| ⬜ 计划中 |
 | Phase 12.5 | Flash Decoding（Split-K，长序列 attention 并行化）| ⬜ 计划中 |
 | Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce）| ⬜ 计划中 |

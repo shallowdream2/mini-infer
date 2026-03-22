@@ -1,5 +1,15 @@
 """
-Phase 3/5/6/9/10 模型执行器。
+Phase 3/5/6/9/10/12 模型执行器。
+
+Phase 12 新增（CUDA Graph）：
+  - warmup_cuda_graphs(batch_sizes)：引擎启动时调用，为每个 batch_size 预热 + 捕获 CUDA 图
+  - decode_batch() 新增 graph replay 路径：
+      - 找到最小 padded_bs >= actual_bs
+      - copy_() 更新静态 buffer（input_ids / position_ids / block_table / cache_seqlens）
+      - graph.replay() 回放捕获好的 CUDA kernel 序列，跳过 Python dispatch overhead
+      - ensure_next_slot / advance_seq_lens / 采样 仍在 graph 外部执行（Python 操作）
+  - max_kv_len 在 graph 模式下固定为 config.max_model_len，消除 .item() 同步，同时保证
+    RoPE cos/sin 形状恒定（cos_cached[:max_model_len] 是常量形状，CUDA Graph 兼容）
 
 Phase 10 新增：
   - prefill_with_prefix(state, cached_len, cached_blocks)：
@@ -34,6 +44,8 @@ Phase 2 已有的设计：
 
 dry_run=True 时保留桩实现，不加载真实模型，供无 GPU 的单元测试使用。
 """
+
+import math
 
 import torch
 from transformers import DynamicCache
@@ -124,6 +136,11 @@ class ModelRunner:
             # Phase 6：永久 patch attention 层，decode 时走 paged attention 路径
             from .attention import patch_model_for_paged_decode
             self._paged_ctx = patch_model_for_paged_decode(self.model, self.kv_cache)
+
+        # Phase 12：CUDA Graph pool（batch_size → CUDAGraph）和静态 buffer
+        # 在 dry_run 模式下保持为空，不影响现有路径
+        self._cuda_graphs: dict[int, torch.cuda.CUDAGraph] = {}
+        self._graph_static: dict[int, dict] = {}  # bs → {input_ids, position_ids, block_table, cache_seqlens, logits}
 
     def prefill(self, states: list[RequestState]) -> None:
         """
@@ -299,9 +316,10 @@ class ModelRunner:
             return
 
         request_ids = [s.request.request_id for s in active]
+        bs = len(active)
 
-        # Phase 6 True PagedAttention 路径：
-        # 1. 确保每个请求的下一个写入位置已有物理块（原 write_decode_kv 的块分配职责）
+        # Phase 6 True PagedAttention 路径（Phase 12 在此基础上可选 CUDA Graph 回放）：
+        # 1. 确保每个请求的下一个写入位置已有物理块（必须在 graph 外执行，修改 Python 状态）
         self.kv_cache.ensure_next_slot(request_ids)
 
         # 2. 构造 flash_attn 所需张量
@@ -314,36 +332,26 @@ class ModelRunner:
         )
 
         # 4. position_ids：新 token 的真实位置 = 当前 cache 长度
-        #    形状 [batch, 1]，供各层 attention patched_forward 做 RoPE
         position_ids = cache_seqlens.long().unsqueeze(1)
 
-        # 5. 注入 paged context，触发所有 attention 层走 paged 路径
-        #    max_kv_len 在此处做唯一一次 .item() 同步，避免 28 层各同步一次（性能关键）
-        max_kv_len = int(cache_seqlens.max().item()) + 1
-        self._paged_ctx.set(block_table, cache_seqlens, max_kv_len)
+        # 5. Phase 12：尝试 CUDA Graph 路径；否则走 eager 路径
+        padded_bs = self._find_padded_bs(bs)
+        if padded_bs is not None:
+            # Graph replay（max_kv_len 固定为 max_model_len，不需要 .item() 同步）
+            logits_batch = self._graph_decode_forward(
+                bs, padded_bs, input_ids, position_ids, block_table, cache_seqlens
+            )
+        else:
+            # Eager 路径：max_kv_len 在此处做唯一一次 .item() 同步
+            max_kv_len = int(cache_seqlens.max().item()) + 1
+            logits_batch = self._eager_decode_forward(
+                input_ids, position_ids, block_table, cache_seqlens, max_kv_len
+            )
 
-        # 6. 一次 batch forward（无 past_key_values，无 attention_mask；
-        #    flash_attn_with_kvcache 通过 block_table+cache_seqlens 管理 KV）
-        try:
-            with torch.profiler.record_function("model_forward"):
-                with torch.no_grad():
-                    out = self.model(
-                        input_ids=input_ids,
-                        position_ids=position_ids,
-                        use_cache=False,
-                    )
+        # 6. flash_attn 已 in-place 写入新 KV，只需递增 seq_len（必须在 graph 外执行）
+        self.kv_cache.advance_seq_lens(request_ids)
 
-            logits_batch = out.logits[:, 0, :].clone()  # [batch, vocab_size]
-            del out
-
-            # 7. flash_attn 已 in-place 写入新 KV，只需递增 seq_len
-            self.kv_cache.advance_seq_lens(request_ids)
-        finally:
-            # 无论 forward 是否抛出异常，都必须清除 paged context
-            # 否则下一次 prefill 会误走 decode 路径
-            self._paged_ctx.clear()
-
-        # 8. 采样下一个 token，更新请求状态
+        # 7. 采样下一个 token，更新请求状态
         for b, state in enumerate(active):
             next_token_id = _sample_token(logits_batch[b], state.request.sampling_params)
             state.append_generated(next_token_id, "")
@@ -356,6 +364,167 @@ class ModelRunner:
     def free_request(self, state: RequestState) -> None:
         """Phase 2 中 KV 由 KVCacheManager 管理，此处为接口兼容保留，无需操作。"""
         pass
+
+    # ------------------------------------------------------------------
+    # Phase 12：CUDA Graph 捕获与回放
+    # ------------------------------------------------------------------
+
+    def warmup_cuda_graphs(
+        self, batch_sizes: list[int] | None = None, warmup_iters: int = 3
+    ) -> None:
+        """
+        Phase 12：为指定 batch size 列表捕获 CUDA Graph，供 decode_batch 使用。
+
+        调用时机：LLMEngine 初始化完成、模型加载后，首次请求到来前。
+        dry_run=True 时直接返回，不做任何操作。
+
+        捕获策略：
+          - max_kv_len 固定为 config.max_model_len，使 RoPE cos/sin 形状恒定
+          - block_table 静态宽度 = ceil(max_model_len / block_size)（每请求最大块数）
+          - 捕获前做 warmup_iters 次 eager forward，让 CUDA 分配好所有 workspace
+        """
+        if self.config.dry_run:
+            return
+        if batch_sizes is None:
+            batch_sizes = [bs for bs in [1, 2, 4, 8] if bs <= self.config.max_batch_size]
+
+        max_blocks_per_seq = math.ceil(self.config.max_model_len / self.config.block_size)
+        device = self.config.device
+        fixed_max_kv_len = self.config.max_model_len
+
+        for bs in sorted(batch_sizes):
+            # 静态输入 buffer
+            s_input_ids = torch.zeros(bs, 1, dtype=torch.long, device=device)
+            s_position_ids = torch.zeros(bs, 1, dtype=torch.long, device=device)
+            s_block_table = torch.zeros(bs, max_blocks_per_seq, dtype=torch.int32, device=device)
+            s_cache_seqlens = torch.zeros(bs, dtype=torch.int32, device=device)
+
+            # Warmup：让 CUDA 分配好 workspace tensor，避免 graph 捕获时触发动态分配
+            for _ in range(warmup_iters):
+                self._paged_ctx.set(s_block_table, s_cache_seqlens, fixed_max_kv_len)
+                with torch.no_grad():
+                    _ = self.model(
+                        input_ids=s_input_ids,
+                        position_ids=s_position_ids,
+                        use_cache=False,
+                    )
+                self._paged_ctx.clear()
+            torch.cuda.synchronize()
+
+            # 捕获 CUDA Graph
+            g = torch.cuda.CUDAGraph()
+            self._paged_ctx.set(s_block_table, s_cache_seqlens, fixed_max_kv_len)
+            with torch.cuda.graph(g):
+                with torch.no_grad():
+                    graph_out = self.model(
+                        input_ids=s_input_ids,
+                        position_ids=s_position_ids,
+                        use_cache=False,
+                    )
+                # logits[:, 0, :] 的 slice 也在 graph 内完成，保证形状固定
+                s_logits = graph_out.logits[:, 0, :]  # [bs, vocab_size]
+            self._paged_ctx.clear()
+
+            # bt_staging：预分配 block_table staging buffer，避免 _graph_decode_forward
+            # 每次调用都分配临时 GPU tensor（固定形状 [bs, max_blocks_per_seq]）
+            s_bt_staging = torch.zeros(bs, max_blocks_per_seq, dtype=torch.int32, device=device)
+
+            self._cuda_graphs[bs] = g
+            self._graph_static[bs] = {
+                "input_ids": s_input_ids,
+                "position_ids": s_position_ids,
+                "block_table": s_block_table,
+                "cache_seqlens": s_cache_seqlens,
+                "logits": s_logits,
+                "bt_staging": s_bt_staging,
+            }
+
+    def _find_padded_bs(self, actual_bs: int) -> int | None:
+        """找到 >= actual_bs 的最小已捕获 batch size；不存在则返回 None（走 eager 路径）。"""
+        for padded in sorted(self._cuda_graphs.keys()):
+            if padded >= actual_bs:
+                return padded
+        return None
+
+    def _graph_decode_forward(
+        self,
+        actual_bs: int,
+        padded_bs: int,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Phase 12：CUDA Graph 回放路径。
+
+        将实际 batch（actual_bs）的数据 copy_() 进静态 buffer，pad 到 padded_bs，
+        replay graph，返回 actual_bs 行的 logits（已 clone，脱离静态 buffer）。
+
+        注意：paged_ctx 在此处设置并清除，max_kv_len 固定为 config.max_model_len。
+        """
+        static = self._graph_static[padded_bs]
+        max_blocks = static["block_table"].shape[1]
+
+        # 1. 用预分配的 staging buffer 拼接 padded block_table（避免每步分配临时 tensor）
+        bt_cols = block_table.shape[1]
+        staging = static["bt_staging"]
+        staging.zero_()
+        staging[:actual_bs, : min(bt_cols, max_blocks)].copy_(
+            block_table[:, : min(bt_cols, max_blocks)]
+        )
+
+        # 2. copy_() 更新静态 buffer（in-place，不改变 shape）
+        static["input_ids"][:actual_bs].copy_(input_ids)
+        if actual_bs < padded_bs:
+            static["input_ids"][actual_bs:].zero_()
+        static["position_ids"][:actual_bs].copy_(position_ids)
+        if actual_bs < padded_bs:
+            static["position_ids"][actual_bs:].zero_()
+        static["cache_seqlens"][:actual_bs].copy_(cache_seqlens)
+        if actual_bs < padded_bs:
+            static["cache_seqlens"][actual_bs:].zero_()
+        static["block_table"].copy_(staging)
+
+        # 3. 设置 paged context（max_kv_len 固定，与 graph 捕获时一致）
+        self._paged_ctx.set(
+            static["block_table"],
+            static["cache_seqlens"],
+            self.config.max_model_len,
+        )
+
+        # 4. Replay + try/finally 保证异常时 paged_ctx 被清除
+        #    （不清除会导致下一次 prefill 误走 decode 路径）
+        try:
+            self._cuda_graphs[padded_bs].replay()
+        finally:
+            self._paged_ctx.clear()
+
+        return static["logits"][:actual_bs].clone()
+
+    def _eager_decode_forward(
+        self,
+        input_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        block_table: torch.Tensor,
+        cache_seqlens: torch.Tensor,
+        max_kv_len: int,
+    ) -> torch.Tensor:
+        """Phase 12：抽取 eager forward 为独立方法，供 graph 回路降级使用。"""
+        self._paged_ctx.set(block_table, cache_seqlens, max_kv_len)
+        try:
+            with torch.profiler.record_function("model_forward"):
+                with torch.no_grad():
+                    out = self.model(
+                        input_ids=input_ids,
+                        position_ids=position_ids,
+                        use_cache=False,
+                    )
+            logits = out.logits[:, 0, :].clone()  # [batch, vocab_size]
+            del out
+            return logits
+        finally:
+            self._paged_ctx.clear()
 
     # ------------------------------------------------------------------
     # Phase 11：Speculative Decoding 辅助接口

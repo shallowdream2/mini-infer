@@ -9,10 +9,12 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from typing import Any
 
 
@@ -42,7 +44,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="",
         help="auto-start a temporary local real-model server with the given model path",
     )
+    parser.add_argument("--device", type=str, default="cuda:0", help="device for temporary real-model server")
     return parser.parse_args(argv)
+
+
+@dataclass(slots=True)
+class _ServerHandle:
+    proc: subprocess.Popen[bytes]
+    log_path: str
 
 
 def _build_opener(base_url: str, use_env_proxy: bool) -> urllib.request.OpenerDirector:
@@ -182,18 +191,32 @@ def _base_url_host_port(base_url: str) -> tuple[str, int]:
     return host, 80
 
 
-def _cleanup_process(proc: subprocess.Popen[bytes] | None) -> None:
-    if proc is None or proc.poll() is not None:
+def _cleanup_process(handle: _ServerHandle | None) -> None:
+    if handle is None:
         return
-    proc.terminate()
+    proc = handle.proc
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=3.0)
     try:
-        proc.wait(timeout=3.0)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=3.0)
+        os.unlink(handle.log_path)
+    except FileNotFoundError:
+        return
+
+def _read_log_tail(log_path: str, limit: int = 3000) -> str:
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return ""
+    return text[-limit:].strip()
 
 
-def _start_temporary_server(args: argparse.Namespace) -> subprocess.Popen[bytes]:
+def _start_temporary_server(args: argparse.Namespace) -> _ServerHandle:
     host, port = _base_url_host_port(args.base_url)
     if host not in {"127.0.0.1", "localhost"}:
         raise RuntimeError("quick mode 仅支持本地服务地址（127.0.0.1 / localhost）。")
@@ -204,21 +227,37 @@ def _start_temporary_server(args: argparse.Namespace) -> subprocess.Popen[bytes]
         cmd.append("--dry-run")
         mode = "dry-run"
     else:
-        cmd.extend(["--model", args.quick_model_path])
+        cmd.extend(["--model", args.quick_model_path, "--device", args.device])
         mode = "real-model"
 
+    log_file = tempfile.NamedTemporaryFile(
+        prefix="mini_infer_quick_chat_",
+        suffix=".log",
+        delete=False,
+    )
+    log_path = log_file.name
+    env = os.environ.copy()
+    env.setdefault("HF_HUB_OFFLINE", "1")
     proc = subprocess.Popen(  # noqa: S603 - local trusted script in current repo.
         cmd,
         cwd=repo_root,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        env=env,
     )
-    atexit.register(_cleanup_process, proc)
-    print(f"[info] starting temporary {mode} server on http://{host}:{port}/v1 ...")
-    return proc
+    log_file.close()
+    handle = _ServerHandle(proc=proc, log_path=log_path)
+    atexit.register(_cleanup_process, handle)
+    if args.quick_dry_run:
+        print(f"[info] starting temporary {mode} server on http://{host}:{port}/v1 ...")
+        print("[info] dry-run uses fake token output like [1] [2]; use --real for real model output.")
+    else:
+        print(f"[info] starting temporary {mode} server on http://{host}:{port}/v1 ...")
+        print(f"[info] model={args.quick_model_path}  device={args.device}")
+    return handle
 
 
-def _ensure_server(args: argparse.Namespace, opener: urllib.request.OpenerDirector) -> subprocess.Popen[bytes] | None:
+def _ensure_server(args: argparse.Namespace, opener: urllib.request.OpenerDirector) -> _ServerHandle | None:
     try:
         _check_server(opener, args.base_url, min(args.timeout, 5.0))
         return None
@@ -226,21 +265,32 @@ def _ensure_server(args: argparse.Namespace, opener: urllib.request.OpenerDirect
         if not (args.quick_dry_run or args.quick_model_path):
             raise
 
-    proc = _start_temporary_server(args)
+    handle = _start_temporary_server(args)
     startup_error: Exception | None = None
-    for _ in range(50):
+    max_wait = 60.0 if not args.quick_dry_run else 10.0
+    interval = 0.2
+    deadline = time.monotonic() + max_wait
+    while time.monotonic() < deadline:
         try:
             _check_server(opener, args.base_url, 1.0)
             print("[info] temporary server is ready.")
-            return proc
+            return handle
         except Exception as exc:  # noqa: BLE001 - keep polling until timeout.
             startup_error = exc
-            if proc.poll() is not None:
+            if handle.proc.poll() is not None:
                 break
-            time.sleep(0.1)
+            time.sleep(interval)
 
-    _cleanup_process(proc)
+    log_tail = _read_log_tail(handle.log_path)
+    _cleanup_process(handle)
     assert startup_error is not None
+    if log_tail:
+        raise RuntimeError(
+            "temporary server failed to start.\n"
+            f"{startup_error}\n\n"
+            "--- server log tail ---\n"
+            f"{log_tail}"
+        ) from startup_error
     raise RuntimeError(f"temporary server failed to start: {startup_error}") from startup_error
 
 
@@ -252,7 +302,7 @@ def main(argv: list[str] | None = None) -> int:
     opener = _build_opener(args.base_url, args.use_env_proxy)
     chat_url = args.base_url.rstrip("/") + "/chat/completions"
     messages: list[dict[str, str]] = []
-    server_proc: subprocess.Popen[bytes] | None = None
+    server_proc: _ServerHandle | None = None
     if args.system:
         messages.append({"role": "system", "content": args.system})
 

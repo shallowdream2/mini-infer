@@ -34,7 +34,7 @@
 | Phase 8 | OpenAI Chat Completions 子集兼容 HTTP API（FastAPI + streaming）| ✅ |
 | Phase 9 | Chunked Prefill（长 prefill 不阻塞 decode，调度器改造）| ✅ |
 | Phase 10 | Prefix Caching（block-level hash + LRU，TTFT −22% @ 1-block prefix）| ✅ |
-| Phase 11 | Speculative Decoding（draft+target 双模型，rejection sampling）| ⬜ |
+| Phase 11 | Speculative Decoding（draft+target 双模型，rejection sampling）| ✅ |
 | Phase 12 | CUDA Graph（decode_batch 静态捕获，消除 Python dispatch 开销）| ⬜ |
 | Phase 12.5 | Flash Decoding（Split-K attention，长序列并行，Triton 实现）| ⬜ |
 | Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce，column/row parallel）| ⬜ |
@@ -51,7 +51,7 @@
 - 主开发环境是 Ubuntu 24.04 + bash + Python 3.10+
 - 真实运行和 benchmark 环境是 Ubuntu 24.04 + 2 × RTX 4090
 
-**当前已安装关键版本（2026-03-21）：**
+**当前已安装关键版本（2026-03-22）：**
 
 | 包 | 版本 | 备注 |
 |----|------|------|
@@ -63,6 +63,20 @@
 **关键约束：**
 - PyTorch SDPA flash_sdp 已启用 → HF 模型推理时已在用 FlashAttention kernel
 - flash_attn 2.5.9.post1 的 `flash_attn_with_kvcache` 已有 `block_table` 参数，Phase 6 已使用
+
+**本地已下载模型（2026-03-22）：**
+
+| 模型 | 路径 | VRAM | 架构参数 | 用途 |
+|------|------|------|---------|------|
+| Qwen2.5-0.5B-Instruct | `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775` | ~1.9 GB | 24层, 14Q/2KV heads, head_dim=64, vocab=151936 | spec draft 模型；快速 dev/test |
+| Qwen2.5-1.5B-Instruct | `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306` | ~3 GB | 28层, 12Q/2KV heads, head_dim=128, vocab=151936 | Phase 12+ 主要开发用模型 |
+| Qwen2.5-7B-Instruct | `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct`（**根目录**，非 snapshot） | ~18.2 GB | 28层, 28Q/4KV heads, head_dim=128, vocab=152064 | 最终 benchmark 验证；snapshot 子目录不可用 |
+
+**模型使用注意事项：**
+- 所有本地模型必须配合 `HF_HUB_OFFLINE=1` 使用，防止 transformers 联网检查触发重下载
+- 7B 使用根目录路径（snapshot 子目录 shard 2-4 软链接缺失）
+- 0.5B 和 1.5B 使用 snapshots/ 子目录路径（完整）
+- EngineConfig 参数需按模型明确指定 `num_hidden_layers / num_kv_heads / head_dim`（不可依赖默认值，默认值为 7B 参数）
 
 ## 工作方式
 
@@ -134,13 +148,13 @@ skills 位于 `.claude/skills/`。
 10. Phase 之间的空档期（上一 Phase archive 完成、下一 Phase 尚未 plan）：对话开始时说明"当前在 Phase N 和 Phase N+1 之间，下一步是 Phase N+1 的 infer-plan"，不要误判为 Phase N 仍在进行。
 
 
-## Phase 11 进度
+## Phase 12 进度
 
 | 步骤 | 状态 |
 |------|------|
 | infer-plan | ✓ |
-| infer-implement | ⬜ |
-| infer-review | ⬜ |
+| infer-implement | ✓ |
+| infer-review | ✓ |
 | infer-benchmark | ⬜ |
 | infer-summarize | ⬜ |
 | infer-blog | ⬜ |

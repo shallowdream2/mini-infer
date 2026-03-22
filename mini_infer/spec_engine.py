@@ -84,6 +84,16 @@ def _rejection_sample(
         position n+K → target_verify_logits[K-1]     → bonus token（全接受时使用）
     """
     device = target_prev_logit.device
+    target_vocab = target_prev_logit.shape[0]
+    # draft_probs 可能来自不同设备（如 draft 在 cuda:0，target 在 cuda:1），统一移到 target 设备
+    # 同时对齐 vocab size（draft/target 版本不同时 vocab 大小可能不同）
+    def _align_draft_prob(p: torch.Tensor) -> torch.Tensor:
+        p = p.to(device)
+        if p.shape[0] < target_vocab:
+            return torch.cat([p, torch.zeros(target_vocab - p.shape[0], device=device, dtype=p.dtype)])
+        return p[:target_vocab]
+
+    draft_probs = [_align_draft_prob(p) for p in draft_probs]
     # target 在各位置的分布（K+1 项）
     # target_logits_check[i] = target 的分布，用于决定是否接受 draft_tokens[i]
     target_probs_check: list[torch.Tensor] = [_softmax(target_prev_logit)]
@@ -224,10 +234,21 @@ class SpecEngine:
             d_state.generated_token_ids = [first_token]
             d_state.generated_text_parts = [t_state.generated_text_parts[0]]
 
-        # target 的 prev_logit 初始为 None（触发一次额外的 spec_advance 获取 logit）
-        # 为简化实现，在 spec 循环中用 prefill 输出的 target logit 替代
-        # 此处记录 prefill 后的 target "last logit"（从 prefill 输出中获取）
-        target_prev_logit = self._get_prefill_last_logit(self.target, t_state)
+        # 将 first_token 提交到 target KV block tensor，同时获取该位置的 logit。
+        # 不能用 spec_verify_target（use_cache=False），那样不会写 KV，导致后续
+        # spec_verify_target 的 KV 上下文少 1 个 token，attention 偏移 1 位。
+        first_token_list = t_state.generated_token_ids[:1]
+        if first_token_list:
+            target_prev_logit = self.target.model_runner.spec_advance_target_kv(
+                t_state, first_token_list
+            )
+        else:
+            vocab_size = (
+                self.target.model_runner.model.config.vocab_size
+                if not self.target.config.dry_run
+                else 256
+            )
+            target_prev_logit = torch.zeros(vocab_size)
 
         # --- 3. Speculative Decoding 主循环 ---
         while (
@@ -297,24 +318,6 @@ class SpecEngine:
         self.target.kv_cache.free_request(t_state)
 
         return output_text
-
-    def _get_prefill_last_logit(
-        self, engine: LLMEngine, state: RequestState
-    ) -> torch.Tensor:
-        """
-        获取 prefill 后 target 模型在第一个生成位置的 logit。
-
-        在 dry_run 下返回全零 tensor（stubs 无实际 logit）。
-        在 GPU 下重新跑一次 spec_verify_target 以获取 logit（代价：1 token 额外 forward）。
-        """
-        if engine.config.dry_run:
-            return torch.zeros(256)
-        # 用 prefill 的最后一个输出 token 运行一次 spec_verify_target（K=1）
-        first_token = state.generated_token_ids[:1]
-        if not first_token:
-            return torch.zeros(engine.model_runner.model.config.vocab_size)
-        logits = engine.model_runner.spec_verify_target(state, first_token)
-        return logits[-1]  # [vocab_size]
 
     def _draft_k_steps(
         self, state: RequestState, K: int

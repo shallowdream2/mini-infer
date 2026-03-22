@@ -56,6 +56,9 @@ class LLMEngine:
         self._step_states: dict[str, RequestState] = {}
         # Phase 9：chunked prefill 时保存中间 DynamicCache（request_id → DynamicCache | None）
         self._prefilling_caches: dict[str, object] = {}
+        # Phase 12：CUDA Graph warmup（config.use_cuda_graph=True 时触发）
+        if config.use_cuda_graph and not config.dry_run:
+            self.model_runner.warmup_cuda_graphs()
 
     def generate(
         self,

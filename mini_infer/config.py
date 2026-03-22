@@ -27,6 +27,9 @@ class EngineConfig:
     dry_run: bool = False  # 为 True 时使用桩实现，不加载真实模型，供无 GPU 或单元测试使用
     # Phase 9：Chunked Prefill。0 = 禁用（向后兼容）；正整数 = 每步 prefill 的 token 数上限
     chunk_prefill_size: int = 0
+    # Phase 12：CUDA Graph。True 时在引擎初始化后 warmup 并捕获 decode_batch 图。
+    # 仅在 dry_run=False 时生效；与 chunked prefill 兼容（prefill 步走 eager 模式）。
+    use_cuda_graph: bool = False
 
     def __post_init__(self) -> None:
         if self.max_batch_size <= 0:

@@ -49,11 +49,11 @@ def resolve_real_model_path(args: argparse.Namespace) -> str:
 def main() -> int:
     args, rest = parse_args(sys.argv[1:])
     if args.real or args.model_path:
-        argv = ["--quick-model-path", resolve_real_model_path(args), *rest]
+        argv = ["--quick-model-path", resolve_real_model_path(args), "--max-tokens", "64", *rest]
     elif rest:
         argv = rest
     else:
-        argv = ["--quick-dry-run"]
+        argv = ["--quick-dry-run", "--max-tokens", "64"]
     return chat_main(argv)
 
 

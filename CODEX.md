@@ -74,7 +74,7 @@ mini-infer 是一个面向 `Qwen2.5` 类 `decoder-only` 模型的推理系统学
 - 默认工作环境：Ubuntu 24.04 + bash + Python 3.10+
 - 默认复用现有 Conda 环境：`ai-infra`
 - 真实 benchmark / 多卡实验环境：Ubuntu 24.04 + 2 x RTX 4090
-- 默认假设 GPU 可用；不要反复询问 GPU 是否存在
+- 默认假设 GPU 可用
 - 如果缺少模型权重，必须明确说明缺的是哪个模型，不得伪造运行结果
 
 已验证的关键版本快照（2026-03-21）：
