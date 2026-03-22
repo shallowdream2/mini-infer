@@ -50,7 +50,7 @@
 | Phase 9 | ✅ |
 | Phase 10 | ✅ |
 | Phase 11 | ✅ |
-| Phase 12 | ⬜ |
+| Phase 12 | ✅ |
 | Phase 12.5 | ⬜ |
 | Phase 13 | ⬜ |
 | Phase 14 | ⬜ |
