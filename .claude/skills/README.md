@@ -48,7 +48,7 @@
 | Phase 7 | ✅ |
 | Phase 8 | ✅ |
 | Phase 9 | ✅ |
-| Phase 10 | ⬜ |
+| Phase 10 | ✅ |
 | Phase 11 | ⬜ |
 | Phase 12 | ⬜ |
 | Phase 12.5 | ⬜ |

@@ -17,6 +17,7 @@
 - 真实 benchmark（对照 HF Transformers baseline，batch=8 达到 100% HF）
 - **OpenAI Chat Completions 子集兼容 HTTP API**（Phase 8，FastAPI + SSE streaming，AsyncEngine continuous batching）
 - **Chunked Prefill**（Phase 9，长 prefill 拆分 chunk 投送，decode 请求不被长 prefill 饿死，ITL spike −57%~−67%）
+- **Prefix Caching**（Phase 10，block-level SHA-256 链式 hash + LRU eviction + ref_count，共享前缀 TTFT −22%）
 
 ## 当前状态
 
@@ -32,7 +33,7 @@
 | Phase 7 | Preemption + Priority Scheduling（swap to CPU，优先级调度）| ✅ |
 | Phase 8 | OpenAI Chat Completions 子集兼容 HTTP API（FastAPI + streaming）| ✅ |
 | Phase 9 | Chunked Prefill（长 prefill 不阻塞 decode，调度器改造）| ✅ |
-| Phase 10 | Prefix Caching（RadixAttention，KV 前缀共享，LRU 淘汰）| ⬜ |
+| Phase 10 | Prefix Caching（block-level hash + LRU，TTFT −22% @ 1-block prefix）| ✅ |
 | Phase 11 | Speculative Decoding（draft+target 双模型，rejection sampling）| ⬜ |
 | Phase 12 | CUDA Graph（decode_batch 静态捕获，消除 Python dispatch 开销）| ⬜ |
 | Phase 12.5 | Flash Decoding（Split-K attention，长序列并行，Triton 实现）| ⬜ |
@@ -132,7 +133,6 @@ skills 位于 `.claude/skills/`。
 9. 无模型权重时，明确说明，不伪造运行结果。（GPU 始终可用，不需要确认。）
 10. Phase 之间的空档期（上一 Phase archive 完成、下一 Phase 尚未 plan）：对话开始时说明"当前在 Phase N 和 Phase N+1 之间，下一步是 Phase N+1 的 infer-plan"，不要误判为 Phase N 仍在进行。
 
-**下一阶段**：Phase 10（Prefix Caching）。Phase 9 archive 已完成，可随时开始 Phase 10 的 infer-plan。
 
 **Phase 9-15 战略原则**：
 - 每个 Phase 结束时项目是完整的、可独立展示的，不依赖后续 Phase

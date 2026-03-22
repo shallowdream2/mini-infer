@@ -110,6 +110,7 @@ async def measure_single_request(
     client: httpx.AsyncClient,
     prompt: str,
     max_tokens: int = 64,
+    dry_run: bool = False,
 ) -> SingleRequestResult:
     """
     发送 SSE 流式请求，精确计时首个 content delta 到达时间。
@@ -134,12 +135,27 @@ async def measure_single_request(
     data_lines = [l[6:] for l in lines if l.startswith("data: ") and l[6:] != "[DONE]"]
     chunks = [json.loads(d) for d in data_lines]
 
-    # 统计 content token 数（content delta 非空的 chunk）
+    # 统计 content 文本块
     content_chunks = [
         c for c in chunks
         if c["choices"][0]["delta"].get("content")
     ]
-    output_tokens = len(content_chunks)  # 每个 chunk 对应一个 token（近似）
+    content_text = "".join(c["choices"][0]["delta"]["content"] for c in content_chunks)
+
+    # 事件数不等于 token 数：首次 step 可能把 prefill 采样 token 和首个 decode token 合并成一个 delta。
+    # 对同一 prompt 再做一次非流式请求，复用 usage.completion_tokens 作为精确 token 数。
+    if dry_run:
+        # dry_run stub 文本形如 " [1] [2] [3]"，按标记数统计更接近真实 token 数。
+        output_tokens = content_text.count("[")
+    else:
+        usage_payload = {
+            "model": "mini-infer",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "stream": False,
+        }
+        usage_resp = await client.post("/v1/chat/completions", json=usage_payload)
+        output_tokens = usage_resp.json()["usage"]["completion_tokens"]
 
     total_ms = (t_response - t_start) * 1000
 
@@ -163,6 +179,7 @@ async def measure_concurrency(
     client: httpx.AsyncClient,
     concurrency: int,
     max_tokens: int = 64,
+    dry_run: bool = False,
 ) -> ConcurrencyResult:
     """并发发送 concurrency 个请求，测量总 throughput。"""
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(concurrency)]
@@ -176,6 +193,8 @@ async def measure_concurrency(
         }
         resp = await client.post("/v1/chat/completions", json=payload)
         body = resp.json()
+        if dry_run:
+            return body["choices"][0]["message"]["content"].count("[")
         return body["usage"]["completion_tokens"]
 
     t0 = time.perf_counter()
@@ -277,7 +296,9 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         print(f"\n单请求延迟测量（{n_trials} 次）...")
         for i in range(n_trials):
             prompt = PROMPTS[i % len(PROMPTS)]
-            r = await measure_single_request(client, prompt, max_tokens=args.max_tokens)
+            r = await measure_single_request(
+                client, prompt, max_tokens=args.max_tokens, dry_run=dry_run
+            )
             single_results.append(r)
         print_single_results(single_results)
 
@@ -286,7 +307,9 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         concurrency_levels = args.concurrency
         concurrency_results = []
         for c in concurrency_levels:
-            r = await measure_concurrency(client, c, max_tokens=args.max_tokens)
+            r = await measure_concurrency(
+                client, c, max_tokens=args.max_tokens, dry_run=dry_run
+            )
             concurrency_results.append(r)
             print(f"  并发={c}: {r.throughput_tok_s:.1f} tok/s "
                   f"({r.total_tokens} tokens / {r.total_time_s:.2f}s)")
@@ -300,7 +323,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
     print("\n── 局限性说明")
     print("  1. TTFT 为近似值：httpx.ASGITransport 缓冲完整响应，无法测真实流式首 token 延迟")
     print("     真实 TTFT 需要: uvicorn 独立进程 + curl/httpx streaming client")
-    print("  2. 并发 throughput 口径：非流式请求 completion_tokens（tokenizer 计算），精确值")
+    print("  2. 并发 throughput 口径：真实模型时使用 completion_tokens；dry_run 时按 stub token 标记数统计")
     print("  3. 峰值显存：与 Phase 6/7 相同（HTTP 层不引入额外 GPU 内存）")
     print("  4. 本 benchmark 未对比 HF baseline（HTTP 层不改变推理内核）；")
     print("     推理性能参考 Phase 6 benchmark_mini.py：batch=8 约 406 tok/s")

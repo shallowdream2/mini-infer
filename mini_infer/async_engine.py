@@ -168,7 +168,7 @@ class AsyncEngine:
         temperature: float = 0.0,
         top_p: float = 1.0,
     ) -> AsyncGenerator[str, None]:
-        """逐 token 异步 yield，直到生成完毕。"""
+        """逐增量文本异步 yield，直到生成完毕。"""
         async for event in self.generate_stream_events(
             prompt,
             max_new_tokens=max_new_tokens,
@@ -257,19 +257,20 @@ class AsyncEngine:
                 try:
                     with self._engine_lock:
                         new_tokens = self._engine.step()
+                        tracked_rids = list(self._token_queues)
                         finished = {
                             rid: self._engine.get_finish_reason(rid)
-                            for rid in new_tokens
+                            for rid in tracked_rids
                             if self._engine.is_finished(rid)
                         }
                     for rid, tokens in new_tokens.items():
                         for text in tokens:
                             self._put(rid, _TokenEvent(text))
-                        # 如果请求在本步完成，投递 DONE 哨兵，并清理追踪表
-                        if rid in finished:
-                            self._put(rid, _DoneEvent(finished[rid]))
-                            with self._engine_lock:
-                                self._engine.cleanup_request(rid)
+                    # 即使本步没有可见文本增量，也必须为已完成请求投递 DONE 哨兵。
+                    for rid, finish_reason in finished.items():
+                        self._put(rid, _DoneEvent(finish_reason))
+                        with self._engine_lock:
+                            self._engine.cleanup_request(rid)
                 except Exception as exc:
                     self._loop_error = exc
                     self._running = False

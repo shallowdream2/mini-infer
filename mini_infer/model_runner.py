@@ -1,5 +1,12 @@
 """
-Phase 3/5/6/9 模型执行器。
+Phase 3/5/6/9/10 模型执行器。
+
+Phase 10 新增：
+  - prefill_with_prefix(state, cached_len, cached_blocks)：
+      从 block tensor 重建前缀 KV（get_prefix_kv），
+      仅对后缀 token 做 HF forward（past_key_values = prefix DynamicCache），
+      再用 write_prefill_kv_suffix 把后缀 KV 写入新块，采样第一个 token。
+
 
 Phase 9 新增（相比 Phase 6）：
   - prefill_chunk(state, token_start, token_end, past_cache, is_last_chunk)：
@@ -151,6 +158,62 @@ class ModelRunner:
                 state.mark_finished("eos")
             elif len(state.generated_token_ids) >= state.request.sampling_params.max_new_tokens:
                 state.mark_finished("length")
+
+    def prefill_with_prefix(
+        self,
+        state: RequestState,
+        cached_len: int,
+        cached_blocks: list[int],
+    ) -> None:
+        """
+        Phase 10：后缀 prefill（有前缀命中时调用）。
+
+        - 从 block tensor 重建前缀 KV（DynamicCache），只在 GPU 路径执行
+        - 仅对 prompt_token_ids[cached_len:] 做 HF forward
+        - 把后缀 KV 写入新分配的块（write_prefill_kv_suffix）
+        - 采样并记录第一个生成 token，设 prefilled=True
+
+        dry_run 路径与普通 prefill 桩实现相同。
+        """
+        if self.config.dry_run:
+            state.append_generated(1, " [1]")
+            state.prefilled = True
+            if len(state.generated_token_ids) >= state.request.sampling_params.max_new_tokens:
+                state.mark_finished("length")
+            return
+
+        prompt_len = len(state.prompt_token_ids)
+        suffix_ids = state.prompt_token_ids[cached_len:]
+
+        # 从 block tensor 重建前缀 KV（DynamicCache 格式）
+        prefix_kv = self.kv_cache.get_prefix_kv(cached_blocks, cached_len)
+
+        # 只对后缀 token 做 HF forward（past_key_values = prefix_kv）
+        # DynamicCache.get_seq_length() 返回 cached_len，HF 会自动把 position_ids
+        # 设为 [cached_len, cached_len+1, ..., prompt_len-1]，RoPE 位置编码正确
+        suffix_input_ids = torch.tensor(
+            [suffix_ids], dtype=torch.long, device=self.config.device
+        )
+        with torch.no_grad():
+            out = self.model(
+                input_ids=suffix_input_ids,
+                past_key_values=prefix_kv,
+                use_cache=True,
+            )
+
+        # 只写后缀 KV 到新块，跳过已缓存的前缀（避免覆盖共享 block）
+        self.kv_cache.write_prefill_kv_suffix(
+            state.request.request_id, out.past_key_values, cached_len
+        )
+
+        next_token_id = _sample_token(out.logits[0, -1], state.request.sampling_params)
+        state.append_generated(next_token_id, "")
+        state.prefilled = True
+
+        if next_token_id == self.eos_token_id:
+            state.mark_finished("eos")
+        elif len(state.generated_token_ids) >= state.request.sampling_params.max_new_tokens:
+            state.mark_finished("length")
 
     def prefill_chunk(
         self,

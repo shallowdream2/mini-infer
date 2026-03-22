@@ -306,11 +306,14 @@ class TestEnginePreemption:
             engine.generate(["a", "b"], max_new_tokens=2, priorities=[1])
 
     def test_generate_without_priorities_backward_compatible(self) -> None:
-        """不传 priorities 时行为与 Phase 2 完全一致（所有请求优先级=0）。"""
+        """不传 priorities 时行为与 Phase 2 完全一致（所有请求优先级=0）。
+
+        Phase 10：prefix cache 可能持有部分 blocks，因此检查 free + cache_size == total。
+        """
         engine = _make_engine(num_gpu_blocks=32)
         outputs = engine.generate(["hello", "world"], max_new_tokens=3)
         assert len(outputs) == 2
-        assert engine.kv_cache.num_free_blocks() == 32
+        assert engine.kv_cache.num_free_blocks() + engine.kv_cache.prefix_cache_size() == 32
 
     def test_high_priority_request_preempts_low(self) -> None:
         """高优先级（priority=0）请求在 KV 不足时，成功换出低优先级（priority=5）请求。"""

@@ -244,7 +244,7 @@ async def _stream_generator(
     )
     yield f"data: {_model_to_json(first_chunk)}\n\n"
 
-    # 逐 token chunk
+    # 逐增量文本 chunk（一次 step 可能合并多个 token 到同一个 delta）
     async for event in engine.generate_stream_events(
         prompt,
         max_new_tokens=request.max_tokens,

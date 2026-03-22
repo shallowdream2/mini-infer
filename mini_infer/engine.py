@@ -1,5 +1,5 @@
 """
-Phase 7/8/9 推理引擎。
+Phase 7/8/9/10 推理引擎。
 
 Phase 7：continuous batching + preemption + priority scheduling（generate() 接口）。
 
@@ -167,6 +167,7 @@ class LLMEngine:
 
                 else:
                     # ── 原始路径（Phase 8 行为，chunk_prefill_size == 0）────────
+                    # Phase 10：此路径支持 prefix cache（chunked prefill 路径不走 prefix cache）
                     # 1. 准入：接入尽可能多的等待请求，块不足时尝试抢占
                     newly_admitted: list[RequestState] = []
                     while (
@@ -178,19 +179,26 @@ class LLMEngine:
 
                         prompt_len = len(next_state.prompt_token_ids)
                         max_out = next_state.request.sampling_params.max_new_tokens
-                        blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
+                        # Phase 10：预先查询 prefix cache，仅对 suffix + decode 部分计算所需新块数。
+                        # cached_len > 0 时，这些块已在 cache 中，不需要新分配，避免准入时过度保守。
+                        cached_len_peek, _ = self.kv_cache.find_prefix_cache(
+                            next_state.prompt_token_ids
+                        )
+                        suffix_len = prompt_len - cached_len_peek  # no hit → suffix_len = prompt_len
+                        blocks_needed = math.ceil((suffix_len + max_out) / self.config.block_size)
 
                         if blocks_needed > self.config.num_gpu_blocks:
                             raise RuntimeError(
                                 f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块"
-                                f"（prompt={prompt_len} + max_new_tokens={max_out}），"
+                                f"（suffix={suffix_len} + max_new_tokens={max_out}，"
+                                f"prefix_cached={cached_len_peek} tokens），"
                                 f"超过系统总块数 {self.config.num_gpu_blocks}。"
                                 f"请增大 num_gpu_blocks 或减小 max_new_tokens。"
                             )
 
                         if self.kv_cache.num_free_blocks() >= blocks_needed:
                             state = self.scheduler.pop_next_waiting()
-                            self.kv_cache.init_request(state)
+                            self._admit_with_prefix(state)  # Phase 10：prefix cache 感知准入
                             self.scheduler.add_to_running(state)
                             newly_admitted.append(state)
                         else:
@@ -211,15 +219,15 @@ class LLMEngine:
                             if self.scheduler.num_running() == 0 and not newly_admitted:
                                 raise RuntimeError(
                                     f"请求 {next_state.request.request_id!r} 需要 {blocks_needed} 个 KV 块"
-                                    f"（prompt={prompt_len} + max_new_tokens={max_out}），"
+                                    f"（suffix={suffix_len} + max_new_tokens={max_out}），"
                                     f"但当前仅有 {self.kv_cache.num_free_blocks()} 个空闲块，"
                                     f"且没有优先级更低的 running 请求可换出。"
                                 )
                             break
 
-                    # 2. Prefill
+                    # 2. Prefill（Phase 10：prefix hit 请求走 prefill_with_prefix，并在完成后注册缓存）
                     if newly_admitted:
-                        self.model_runner.prefill(newly_admitted)
+                        self._prefill_and_register(newly_admitted)
 
                 # ── 3. Batch decode：两条路径共用 ────────────────────────────
                 running = self.scheduler.get_running_states()
@@ -283,6 +291,41 @@ class LLMEngine:
 
     def _tokenize(self, text: str) -> list[int]:
         return self.model_runner.tokenizer.encode(text, add_special_tokens=True)
+
+    # ------------------------------------------------------------------
+    # Phase 10：Prefix Cache 辅助方法（仅用于 chunk_prefill_size == 0 路径）
+    # ------------------------------------------------------------------
+
+    def _admit_with_prefix(self, state: RequestState) -> None:
+        """准入时查找 prefix cache：命中则 init_request_with_prefix，否则 init_request。"""
+        cached_len, cached_blocks = self.kv_cache.find_prefix_cache(state.prompt_token_ids)
+        if cached_len > 0:
+            self.kv_cache.init_request_with_prefix(state, cached_len, cached_blocks)
+            state.prefix_cached_len = cached_len
+            state.prefix_cached_blocks = cached_blocks
+        else:
+            self.kv_cache.init_request(state)
+
+    def _prefill_and_register(self, newly_admitted: list[RequestState]) -> None:
+        """对新准入请求执行 prefill，然后将结果注册到 prefix cache。
+
+        prefix cache miss 的请求批量调用 prefill()；
+        prefix cache hit 的请求逐个调用 prefill_with_prefix()。
+        所有请求 prefill 完成后统一调用 register_prefix_blocks_for_request() 注册缓存。
+        """
+        miss_states = [s for s in newly_admitted if s.prefix_cached_len == 0]
+        hit_states = [s for s in newly_admitted if s.prefix_cached_len > 0]
+        if miss_states:
+            self.model_runner.prefill(miss_states)
+        for state in hit_states:
+            self.model_runner.prefill_with_prefix(
+                state, state.prefix_cached_len, state.prefix_cached_blocks
+            )
+        # 注册所有新 prefill 的 block（含 miss 和 hit 的 suffix blocks）
+        for state in newly_admitted:
+            self.kv_cache.register_prefix_blocks_for_request(
+                state.request.request_id, state.prompt_token_ids
+            )
 
     # ------------------------------------------------------------------
     # Phase 8：单步接口（供 AsyncEngine / HTTP 服务使用）
@@ -454,6 +497,7 @@ class LLMEngine:
 
             else:
                 # ── 原始路径（Phase 8 行为，chunk_prefill_size == 0）──────────
+                # Phase 10：此路径支持 prefix cache（chunked prefill 路径不走 prefix cache）
                 # 1. 准入（与 generate() 相同逻辑）
                 newly_admitted: list[RequestState] = []
                 while (
@@ -465,7 +509,12 @@ class LLMEngine:
 
                     prompt_len = len(next_state.prompt_token_ids)
                     max_out = next_state.request.sampling_params.max_new_tokens
-                    blocks_needed = math.ceil((prompt_len + max_out) / self.config.block_size)
+                    # Phase 10：预先查询 prefix cache，仅对 suffix + decode 部分计算所需新块数
+                    cached_len_peek, _ = self.kv_cache.find_prefix_cache(
+                        next_state.prompt_token_ids
+                    )
+                    suffix_len = prompt_len - cached_len_peek
+                    blocks_needed = math.ceil((suffix_len + max_out) / self.config.block_size)
 
                     if blocks_needed > self.config.num_gpu_blocks:
                         raise RuntimeError(
@@ -475,7 +524,7 @@ class LLMEngine:
 
                     if self.kv_cache.num_free_blocks() >= blocks_needed:
                         state = self.scheduler.pop_next_waiting()
-                        self.kv_cache.init_request(state)
+                        self._admit_with_prefix(state)  # Phase 10：prefix cache 感知准入
                         self.scheduler.add_to_running(state)
                         newly_admitted.append(state)
                     else:
@@ -500,9 +549,9 @@ class LLMEngine:
                             )
                         break
 
-                # 2. Prefill
+                # 2. Prefill（Phase 10：prefix hit 请求走 prefill_with_prefix，完成后注册缓存）
                 if newly_admitted:
-                    self.model_runner.prefill(newly_admitted)
+                    self._prefill_and_register(newly_admitted)
                     just_prefilled = newly_admitted
 
             # ── 3. Decode（收集前记录 pre_lens，捕获 prefill + decode 两阶段的新 token）

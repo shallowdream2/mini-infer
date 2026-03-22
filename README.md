@@ -172,6 +172,10 @@ curl http://localhost:8000/v1/chat/completions \
 env -u ALL_PROXY -u HTTP_PROXY -u HTTPS_PROXY -u all_proxy -u http_proxy -u https_proxy \
   conda run -n ai-infra python -c "from openai import OpenAI; client = OpenAI(base_url='http://127.0.0.1:8000/v1', api_key='none'); resp = client.chat.completions.create(model='mini-infer', messages=[{'role':'user','content':'hello'}], max_tokens=8); print(resp.choices[0].message.content)"
 
+# 交互式聊天客户端（默认直连本地服务；对 localhost 默认忽略代理变量）
+conda run -n ai-infra python chat.py --base-url http://127.0.0.1:8000/v1
+# 支持 /clear、/history、/help、exit
+
 # 直接 uvicorn 启动（未注入 config 时默认回退到 dry_run）
 uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
 
@@ -227,6 +231,7 @@ mini_infer/              核心推理代码
   triton_attn.py         Triton decode attention kernel（Phase 6.5，实验性）
 
 serve.py                 HTTP server CLI 启动脚本（Phase 8/9）
+chat.py                  交互式聊天客户端（连接本地 Chat Completions API）
 
 benchmarks/
   benchmark_hf.py        HuggingFace Transformers baseline
@@ -237,6 +242,7 @@ benchmarks/
   benchmark_preemption.py Phase 7 preemption swap latency + 吞吐回归测试
   benchmark_server.py    Phase 8 HTTP API benchmark（TTFT/TPOT/并发吞吐）
   benchmark_chunked_prefill.py  Phase 9 Chunked Prefill benchmark（ITL spike / TTFT 对比）
+  benchmark_prefix_cache.py    Phase 10 Prefix Cache benchmark（miss/hit TTFT 对比，支持 --dry_run）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
 
 tests/
@@ -248,6 +254,7 @@ tests/
   test_preemption.py       Phase 7 preemption + priority scheduling 测试（dry_run）
   test_server.py           Phase 8 HTTP server 测试（ASGI TestClient，dry_run）
   test_chunked_prefill.py  Phase 9 Chunked Prefill 测试（dry_run，状态机 + 端到端 + KV 无泄漏）
+  test_prefix_cache.py     Phase 10 Prefix Cache 测试（dry_run，miss/hit/evict/preemption）
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
@@ -272,7 +279,7 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 7 | Preemption + Priority Scheduling（GPU↔CPU KV swap，优先级调度）| ✅ 完成 |
 | Phase 8 | OpenAI Chat Completions 子集兼容 HTTP API（FastAPI + SSE streaming，AsyncEngine）| ✅ 完成 |
 | Phase 9 | Chunked Prefill（长 prefill 不阻塞 decode，ITL spike −57% @ chunk=256）| ✅ 完成 |
-| Phase 10 | Prefix Caching（RadixAttention，KV 前缀共享）| ⬜ 计划中 |
+| Phase 10 | Prefix Caching（block-level hash + LRU，TTFT −22% @ 1-block prefix）| ✅ 完成 |
 | Phase 11 | Speculative Decoding（draft+target 双模型推理加速）| ⬜ 计划中 |
 | Phase 12 | CUDA Graph（decode_batch 静态捕获，消除 Python dispatch 开销）| ⬜ 计划中 |
 | Phase 12.5 | Flash Decoding（Split-K，长序列 attention 并行化）| ⬜ 计划中 |

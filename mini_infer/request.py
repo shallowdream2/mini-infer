@@ -49,6 +49,11 @@ class RequestState:
     cpu_kv: list | None = None
     # swap_out 时记录的 seq_len（含 prompt + 已生成 token 数），供 swap_in 重建块分配
     swapped_seq_len: int = 0
+    # Phase 10：Prefix Cache
+    # 准入时命中的前缀缓存长度（按 block_size 对齐）；0 表示无命中
+    prefix_cached_len: int = 0
+    # 准入时命中的前缀物理 block 列表（对应 prefix_cached_len // block_size 个块）
+    prefix_cached_blocks: list[int] = field(default_factory=list)
 
     def append_generated(self, token_id: int, token_text: str) -> None:
         self.generated_token_ids.append(token_id)

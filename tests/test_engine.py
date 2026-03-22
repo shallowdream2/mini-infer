@@ -47,11 +47,18 @@ def test_output_count_matches_prompts() -> None:
 
 
 def test_kv_blocks_returned_after_generate() -> None:
-    """generate 完成后，所有 KV 块必须全部归还到空闲池，不留下泄漏。"""
+    """generate 完成后，所有 KV 块必须全部归还到空闲池或 prefix cache，不留下泄漏。
+
+    Phase 10：prefix cache 合法地持有已完成请求的 prompt blocks（ref_count >= 1）。
+    正确性检查：free + prefix_cache_size == initial_free。
+    """
     engine = _make_engine(num_gpu_blocks=16, block_size=4)
     initial_free = engine.kv_cache.num_free_blocks()
     engine.generate(["hello", "world"], max_new_tokens=4)
-    assert engine.kv_cache.num_free_blocks() == initial_free
+    assert (
+        engine.kv_cache.num_free_blocks() + engine.kv_cache.prefix_cache_size()
+        == initial_free
+    )
 
 
 def test_kv_exhaustion_raises_runtime_error() -> None:
@@ -82,13 +89,16 @@ def test_output_order_preserved_with_different_prompt_lengths() -> None:
 def test_max_new_tokens_one_completes_at_prefill() -> None:
     """max_new_tokens=1 时，请求在 prefill 阶段采样第一个 token 后即完成，不进 decode。
 
-    完成后 KV 块全部归还（验证 prefill-only 路径的块生命周期正确）。
+    完成后 KV 块全部归还或持有于 prefix cache（Phase 10），验证 prefill-only 路径的块生命周期正确。
     """
     engine = _make_engine(num_gpu_blocks=32, block_size=4)
     initial_free = engine.kv_cache.num_free_blocks()
     outputs = engine.generate(["hello", "world"], max_new_tokens=1)
     assert len(outputs) == 2
-    assert engine.kv_cache.num_free_blocks() == initial_free
+    assert (
+        engine.kv_cache.num_free_blocks() + engine.kv_cache.prefix_cache_size()
+        == initial_free
+    )
 
 
 def test_empty_prompts_returns_empty_list() -> None:
@@ -106,14 +116,23 @@ def test_real_engine_requires_256_aligned_block_size() -> None:
 
 
 def test_multiple_generate_calls_independent() -> None:
-    """连续两次 generate 调用之间状态互不干扰，块计数每次都能归零。"""
+    """连续两次 generate 调用之间状态互不干扰，块计数每次都能归零（或进入 prefix cache）。
+
+    Phase 10：prefix cache 会跨调用保留 prompt blocks，但不应影响后续请求的准入。
+    """
     engine = _make_engine(num_gpu_blocks=32, block_size=4)
     initial_free = engine.kv_cache.num_free_blocks()
 
     outputs1 = engine.generate(["hello"], max_new_tokens=2)
-    assert engine.kv_cache.num_free_blocks() == initial_free
+    assert (
+        engine.kv_cache.num_free_blocks() + engine.kv_cache.prefix_cache_size()
+        == initial_free
+    )
 
     outputs2 = engine.generate(["world"], max_new_tokens=2)
-    assert engine.kv_cache.num_free_blocks() == initial_free
+    assert (
+        engine.kv_cache.num_free_blocks() + engine.kv_cache.prefix_cache_size()
+        == initial_free
+    )
     assert len(outputs1) == 1
     assert len(outputs2) == 1

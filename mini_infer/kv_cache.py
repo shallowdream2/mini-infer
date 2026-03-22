@@ -1,5 +1,19 @@
 """
-Phase 3 / Phase 6 Paged KV Cache 管理器。
+Phase 3 / Phase 6 / Phase 10 Paged KV Cache 管理器。
+
+Phase 10 新增接口（Prefix Caching）：
+  - find_prefix_cache(token_ids)：查找前缀命中，返回 (cached_len, phys_block_ids)
+  - init_request_with_prefix(state, cached_len, cached_blocks)：复用前缀物理块初始化请求
+  - write_prefill_kv_suffix(request_id, past_key_values, cached_len)：只写后缀部分 KV
+  - get_prefix_kv(phys_block_ids, cached_len)：从 block tensor 重建 DynamicCache
+  - register_prefix_blocks(token_ids, block_table)：注册新计算的 blocks 到前缀缓存
+  - register_prefix_blocks_for_request(request_id, token_ids)：按 request_id 注册
+  - evict_lru_prefix_block()：LRU 淘汰（ref_count==1 才可淘汰）
+  物理块引用计数（_ref_count）统一管理 prefix cache 共享块的生命周期：
+    · _allocate_block() 分配时 ref_count = 1（请求持有）
+    · register_prefix_blocks() 注册时 ref_count += 1（cache 额外持有）
+    · free_request() 减 1；降到 0 才归还 _free_blocks（cached block 不提前释放）
+    · evict_lru_prefix_block() 减 1；降到 0 时归还 _free_blocks
 
 Phase 6 新增接口（True PagedAttention）：
   - ensure_next_slot()：decode 前预分配下一 token 的物理块
@@ -14,13 +28,15 @@ Phase 3 优化：gather_batch_kv() 从嵌套 Python 循环改为向量化 advanc
 相比 Phase 1 的 HF past_key_values dict，优势在于：
   - 显存有上限（num_gpu_blocks 固定）
   - 支持 batch decode（不同长度请求共享同一个 block pool）
-  - free_request 立即归还物理块，无显存碎片
+  - free_request 引用计数归零后归还物理块，无显存碎片
 
 dry_run=True 时不分配 GPU tensor，仅做块管理逻辑的元数据追踪，供无 GPU 环境的测试使用。
 """
 
+import hashlib
 import math
-from collections import deque
+import struct
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 
 import torch
@@ -86,6 +102,14 @@ class KVCacheManager:
         # 每个请求已存入的 KV token 数量
         self._seq_lens: dict[str, int] = {}
 
+        # Phase 10：前缀缓存
+        # block_chained_hash → phys_block_id（命中时直接复用物理块）
+        self._prefix_cache: dict[int, int] = {}
+        # LRU 顺序（OrderedDict，最近使用在末尾，淘汰时从头取）
+        self._lru: OrderedDict[int, None] = OrderedDict()
+        # 物理块引用计数（request 持有 + cache 持有之和）
+        self._ref_count: dict[int, int] = {}
+
     # ------------------------------------------------------------------
     # 块池管理
     # ------------------------------------------------------------------
@@ -95,8 +119,15 @@ class KVCacheManager:
 
     def _allocate_block(self) -> int:
         if not self._free_blocks:
-            raise RuntimeError("KV cache 已满：没有可用的空闲块，请减少并发请求数或增大 num_gpu_blocks")
-        return self._free_blocks.popleft()
+            # 尝试淘汰 LRU 前缀缓存块（ref_count==1 才可淘汰）
+            if not self.evict_lru_prefix_block():
+                raise RuntimeError(
+                    "KV cache 已满：没有可用的空闲块，且没有可淘汰的前缀缓存块。"
+                    "请减少并发请求数或增大 num_gpu_blocks。"
+                )
+        block = self._free_blocks.popleft()
+        self._ref_count[block] = 1  # 分配时引用计数初始化为 1（请求持有）
+        return block
 
     # ------------------------------------------------------------------
     # 请求生命周期
@@ -112,10 +143,21 @@ class KVCacheManager:
         self._seq_lens[request_id] = prompt_len
 
     def free_request(self, state: RequestState) -> None:
-        """归还请求的所有物理块到空闲池。"""
+        """
+        归还请求的所有物理块。
+
+        Phase 10：引用计数控制释放。缓存中的共享块 ref_count > 1，
+        free_request 只递减计数，降到 0 时才归还 _free_blocks。
+        """
         request_id = state.request.request_id
         blocks = self._block_tables.pop(request_id, [])
-        self._free_blocks.extend(blocks)
+        for block in blocks:
+            count = self._ref_count.get(block, 1) - 1
+            if count <= 0:
+                self._free_blocks.append(block)
+                self._ref_count.pop(block, None)
+            else:
+                self._ref_count[block] = count
         self._seq_lens.pop(request_id, None)
 
     # ------------------------------------------------------------------
@@ -322,6 +364,10 @@ class KVCacheManager:
 
         # 释放 GPU 块（dry_run 下只做元数据清理）
         self.free_request(state)
+        # Phase 10：清除 prefix 状态，确保 swap_in 后 prefix_cached_blocks 不再引用
+        # 已归还的物理块（避免后续误用）。swap_in 会重新分配所有块，不走 prefix 路径。
+        state.prefix_cached_len = 0
+        state.prefix_cached_blocks = []
 
     def swap_in(self, state: "RequestState") -> None:
         """
@@ -424,6 +470,200 @@ class KVCacheManager:
         """
         for rid in request_ids:
             self._seq_lens[rid] += 1
+
+    # ------------------------------------------------------------------
+    # Phase 10：Prefix Caching
+    # ------------------------------------------------------------------
+
+    def _compute_block_hashes(self, token_ids: list[int]) -> list[int]:
+        """
+        计算 token_ids 各完整 block 的链式 hash。
+
+        每个 block 的 hash 包含前缀历史（chain），避免相同 token 在不同位置错误命中。
+        只计算完整 block（末尾不足 block_size 的部分不参与 hash）。
+
+        限制最大可缓存 block 数：
+          - prompt_len % block_size == 0：只缓存前 N-1 块，保留最后一块作为 suffix
+          - 否则：缓存所有完整 block（partial tail 自然成为 suffix）
+        这样保证 find_prefix_cache 返回的 cached_len < prompt_len，
+        避免 suffix 为空时向模型传入空 input_ids 的问题。
+        """
+        num_full_blocks = len(token_ids) // self.block_size
+        # 若 prompt 恰好 block 对齐，留最后一块不缓存（保证至少 1 block suffix）
+        max_cacheable = (num_full_blocks - 1) if (
+            len(token_ids) > 0 and len(token_ids) % self.block_size == 0
+        ) else num_full_blocks
+
+        hashes: list[int] = []
+        prev_hash = 0
+        for i in range(max_cacheable):
+            start = i * self.block_size
+            end = start + self.block_size
+            # 使用 SHA-256 确保确定性（避免 PYTHONHASHSEED 随机化）和低碰撞概率。
+            # struct.pack: 8 字节无符号 prev_hash + block_size 个有符号 token id
+            buf = struct.pack(
+                f">Q{end - start}i",
+                prev_hash & 0xFFFFFFFFFFFFFFFF,
+                *token_ids[start:end],
+            )
+            block_hash = int.from_bytes(hashlib.sha256(buf).digest()[:8], "big")
+            hashes.append(block_hash)
+            prev_hash = block_hash
+        return hashes
+
+    def find_prefix_cache(self, token_ids: list[int]) -> tuple[int, list[int]]:
+        """
+        查找 token_ids 的最长前缀命中，返回 (cached_len, phys_block_ids)。
+
+        cached_len 按 block_size 对齐，且 < len(token_ids)（保证非空 suffix）。
+        命中时更新 LRU 顺序。
+        """
+        hashes = self._compute_block_hashes(token_ids)
+        cached_blocks: list[int] = []
+        for block_hash in hashes:
+            if block_hash not in self._prefix_cache:
+                break
+            phys_block = self._prefix_cache[block_hash]
+            cached_blocks.append(phys_block)
+            self._lru.move_to_end(block_hash)  # 标记为最近使用
+        cached_len = len(cached_blocks) * self.block_size
+        return cached_len, cached_blocks
+
+    def init_request_with_prefix(
+        self,
+        state: "RequestState",
+        cached_len: int,
+        cached_blocks: list[int],
+    ) -> None:
+        """
+        为有前缀命中的请求初始化 KV cache：
+          - 复用 cached_blocks（引用计数 +1）
+          - 为后缀 token 分配新物理块
+          - seq_len 设为 prompt_len（前缀 KV 已在缓存中）
+
+        调用前提：cached_len 是 block_size 的整数倍且 < prompt_len（保证非空 suffix）。
+        """
+        request_id = state.request.request_id
+        prompt_len = len(state.prompt_token_ids)
+        suffix_len = prompt_len - cached_len
+
+        # 增加缓存块的引用计数（新请求复用）
+        for block in cached_blocks:
+            self._ref_count[block] = self._ref_count.get(block, 1) + 1
+
+        # 为后缀分配新块
+        num_new_blocks = max(1, math.ceil(suffix_len / self.block_size)) if suffix_len > 0 else 0
+        new_blocks = [self._allocate_block() for _ in range(num_new_blocks)]
+
+        self._block_tables[request_id] = list(cached_blocks) + new_blocks
+        self._seq_lens[request_id] = prompt_len
+
+    def register_prefix_blocks(self, token_ids: list[int], block_table: list[int]) -> None:
+        """
+        prefill 完成后，将 prompt 的完整 block 注册到前缀缓存。
+
+        已缓存的 block 只更新 LRU；新 block 加入缓存并增加引用计数。
+        只注册 _compute_block_hashes 所覆盖的完整 block。
+        """
+        hashes = self._compute_block_hashes(token_ids)
+        for block_hash, phys_block in zip(hashes, block_table):
+            if block_hash in self._prefix_cache:
+                self._lru.move_to_end(block_hash)
+                continue
+            self._prefix_cache[block_hash] = phys_block
+            self._lru[block_hash] = None
+            # cache 额外持有一个引用
+            self._ref_count[phys_block] = self._ref_count.get(phys_block, 1) + 1
+
+    def register_prefix_blocks_for_request(self, request_id: str, token_ids: list[int]) -> None:
+        """按 request_id 查找 block_table 后调用 register_prefix_blocks。"""
+        block_table = self._block_tables.get(request_id, [])
+        self.register_prefix_blocks(token_ids, block_table)
+
+    def evict_lru_prefix_block(self) -> bool:
+        """
+        淘汰最久未使用的前缀缓存 block（只淘汰 ref_count == 1 即仅 cache 持有的 block）。
+        返回 True 表示成功淘汰，False 表示没有可淘汰的 block。
+        """
+        for block_hash in list(self._lru.keys()):  # 从最旧遍历
+            phys_block = self._prefix_cache[block_hash]
+            if self._ref_count.get(phys_block, 1) == 1:
+                # 只有 cache 持有，可以淘汰
+                del self._prefix_cache[block_hash]
+                del self._lru[block_hash]
+                self._ref_count.pop(phys_block, None)
+                self._free_blocks.append(phys_block)
+                return True
+        return False
+
+    def write_prefill_kv_suffix(
+        self,
+        request_id: str,
+        past_key_values: tuple,
+        cached_len: int,
+    ) -> None:
+        """
+        把 prefill 输出的 past_key_values 中后缀部分（cached_len 之后）写入 block tensor。
+
+        前 cached_len 个 token 的 KV 已在共享 block 中，跳过不写，避免覆盖共享数据。
+        past_key_values[l] 形状：(k[1, kv_heads, prompt_len, head_dim],
+                                   v[1, kv_heads, prompt_len, head_dim])
+        """
+        if self._dry_run:
+            return
+
+        prompt_len = past_key_values[0][0].shape[2]
+        block_table = self._block_tables[request_id]
+        # 新块从这个索引开始（cached_len 是 block_size 整数倍）
+        first_new_block_idx = cached_len // self.block_size
+
+        for l in range(self.num_layers):
+            k = past_key_values[l][0][0].permute(1, 0, 2)  # [prompt_len, kv_heads, head_dim]
+            v = past_key_values[l][1][0].permute(1, 0, 2)
+            for blk_idx in range(first_new_block_idx, len(block_table)):
+                phys_blk = block_table[blk_idx]
+                start = blk_idx * self.block_size
+                end = min(start + self.block_size, prompt_len)
+                n = end - start
+                if n <= 0:
+                    break
+                self.k_cache[l][phys_blk, :n] = k[start:end]
+                self.v_cache[l][phys_blk, :n] = v[start:end]
+
+    def get_prefix_kv(self, phys_block_ids: list[int], cached_len: int):
+        """
+        从 block tensor 重建前缀 KV，返回 DynamicCache（供 HF model forward 作为 past_key_values）。
+
+        返回的 DynamicCache 包含 cached_len 个 token 的 KV，形状：
+            key_cache[l]: [1, num_kv_heads, cached_len, head_dim]
+        只在 dry_run=False 路径使用（dry_run 下无 GPU tensor）。
+        """
+        if self._dry_run:
+            raise RuntimeError("get_prefix_kv 不支持 dry_run 模式（无 GPU tensor）")
+
+        from transformers import DynamicCache
+        cache = DynamicCache()
+        for l in range(self.num_layers):
+            k_tensor = torch.zeros(
+                1, self.num_kv_heads, cached_len, self.head_dim,
+                device=self.device, dtype=self.k_cache[l].dtype,
+            )
+            v_tensor = torch.zeros_like(k_tensor)
+            for blk_idx, phys_blk in enumerate(phys_block_ids):
+                start = blk_idx * self.block_size
+                end = min(start + self.block_size, cached_len)
+                n = end - start
+                if n <= 0:
+                    break
+                # k_cache[l][phys_blk, :n]: [n, kv_heads, head_dim] → [1, kv_heads, n, head_dim]
+                k_tensor[0, :, start:end, :] = self.k_cache[l][phys_blk, :n].permute(1, 0, 2)
+                v_tensor[0, :, start:end, :] = self.v_cache[l][phys_blk, :n].permute(1, 0, 2)
+            cache.update(k_tensor, v_tensor, l)
+        return cache
+
+    def prefix_cache_size(self) -> int:
+        """返回当前前缀缓存中的 block 数，供测试和监控使用。"""
+        return len(self._prefix_cache)
 
     # ------------------------------------------------------------------
     # 废弃接口（保留以减少测试迁移成本，不再有实际功能）

@@ -58,6 +58,7 @@ def run_scenario(engine: LLMEngine, long_prompt: str, short_prompts: list[str]) 
         for p in short_prompts
     ]
     short_set = set(rid_shorts)
+    tracked_rids = set(rid_shorts)
 
     # 连续记录 token 时间戳（全程）
     short_token_times: dict[str, list[float]] = {r: [] for r in rid_shorts}
@@ -65,33 +66,43 @@ def run_scenario(engine: LLMEngine, long_prompt: str, short_prompts: list[str]) 
     long_prefill_done = False
     total_tokens = 0
     t0 = time.perf_counter()
+    prev_lens: dict[str, int] = {rid: 0 for rid in rid_shorts}
 
     # ── 阶段 1：warmup 直到所有短请求完成 prefill ─────────────────────────
     while not all(engine._step_states[r].prefilled for r in rid_shorts):
-        new_tokens = engine.step()
+        engine.step()
         t_now = time.perf_counter()
-        for rid, tokens in new_tokens.items():
-            total_tokens += len(tokens)
-            if rid in short_set:
-                short_token_times[rid].append(t_now)
+        for rid in rid_shorts:
+            curr_len = len(engine._step_states[rid].generated_token_ids)
+            inc = curr_len - prev_lens[rid]
+            if inc > 0:
+                total_tokens += inc
+                short_token_times[rid].extend([t_now] * inc)
+                prev_lens[rid] = curr_len
 
     # ── 阶段 2：提交长请求 ────────────────────────────────────────────────
     t_long_start = time.perf_counter()
     rid_long = engine.add_request(long_prompt, max_new_tokens=MAX_NEW_TOKENS_LONG)
+    tracked_rids.add(rid_long)
+    prev_lens[rid_long] = 0
 
     # ── 阶段 3：运行直到所有请求完成 ──────────────────────────────────────
     while engine.has_unfinished_requests():
-        new_tokens = engine.step()
+        engine.step()
         t_now = time.perf_counter()
 
-        for rid, tokens in new_tokens.items():
-            total_tokens += len(tokens)
+        for rid in tracked_rids:
+            curr_len = len(engine._step_states[rid].generated_token_ids)
+            inc = curr_len - prev_lens[rid]
+            if inc <= 0:
+                continue
+            total_tokens += inc
+            prev_lens[rid] = curr_len
             if rid in short_set:
-                short_token_times[rid].append(t_now)
-            elif rid == rid_long:
-                if ttft_long is None:
-                    ttft_long = t_now - t_long_start
-                    long_prefill_done = True  # 此 step 完成了长请求的 prefill
+                short_token_times[rid].extend([t_now] * inc)
+            elif rid == rid_long and ttft_long is None:
+                ttft_long = t_now - t_long_start
+                long_prefill_done = True  # 此 step 完成了长请求的 prefill
 
     t_end = time.perf_counter()
     total_wall = t_end - t0
