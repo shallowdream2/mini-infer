@@ -111,8 +111,8 @@ def section1_theory():
     # ── 扩展性说明 ──
     print()
     print("─" * 60)
-    print("扩展性对比（相同 VRAM 下的并发上限估算，32 GB 可用显存）：")
-    vram = 32 * 1024 * 1024 * 1024  # 32 GB
+    print("扩展性对比（相同 VRAM 下的并发上限估算，假设 32 GB 可用显存，仅供参考）：")
+    vram = 32 * 1024 * 1024 * 1024  # 32 GB（假设值，非实测）
     for name, b in [("GQA", gqa_b), ("MLA latent", latent_b)]:
         max_tokens = vram // (b * num_layers)
         print(f"  {name:<12}：最多 {max_tokens:,} token（{max_tokens//seq_len:,} × seq={seq_len}）")
@@ -261,8 +261,6 @@ def section3_latency(model_path: str):
                     m.q_proj.weight.copy_(hf_attn.q_proj.weight)
         return naive, latent, absorbed
 
-    del hf_model
-
     WARMUP, REPEAT = 10, 50
     seq_lens = [1, 64, 256, 1024]
 
@@ -310,12 +308,15 @@ def section3_latency(model_path: str):
         ratio = t_absorbed / t_naive
         print(f"{seq_len:>8}  {t_naive:>12.3f}  {t_latent:>12.3f}  {t_absorbed:>14.3f}  {ratio:>13.2f}x")
 
+    # 循环结束后释放 hf 模型权重
+    del hf_attn, hf_model
+
     print("─" * 70)
     print()
     print("说明：")
-    print("  naive    ：每步从 compressed_kv 展开完整 K/V，cache 大（10,240 bytes/token/layer）")
+    print("  naive    ：缓存完整展开的 key_states/value_states，每步只展开新 token，cache 大（10,240 bytes/token/layer）")
     print("  latent   ：每步对全部历史 compressed_kv 做 kv_b_proj 展开，cache 小（1,152 bytes/token/layer）")
-    print("  absorbed ：矩阵吸收，直接用 compressed_kv 计算 score/output，cache 同 latent")
+    print("  absorbed ：矩阵吸收，直接用 compressed_kv_normed 计算 score/output，cache 同 latent，避免显式 k_nope 展开")
     print()
 
 

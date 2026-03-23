@@ -2,10 +2,14 @@
 Phase 14 MLA 注意力测试。
 
 覆盖范围：
-  1. MLAAttentionNaive 与 MLAAttentionLatentCache 在相同权重下的数值等价性（CPU，无需 GPU）
-  2. KV cache 大小压缩比：MLA latent / GQA(4KV,128dim) < 60%
-  3. prefill 后继续 decode 的增量 forward（模拟生成循环）
-  4. GPU 单层等价性测试（需要 DeepSeek-V2-Lite 权重，用 --gpu 标记跳过）
+  1. MLAAttentionNaive 与 MLAAttentionLatentCache 在相同权重下的数值等价性（CPU）
+  2. MLAAttentionAbsorbed 与 MLAAttentionNaive 等价性（CPU，含 decode step）
+  3. KV cache 大小压缩比：MLA latent / GQA(4KV,128dim) < 60%
+  4. KV cache dataclass 形状检查
+  5. q_lora_rank 路径覆盖（V2/V3 有 Q 压缩）
+  6. GPU 单层等价性（需要 DeepSeek-V2-Lite 权重，模型未就绪时自动 skip）
+  7. batch>1 decode step 等价性
+  8. 多步连续 decode（cache 逐步增长）
 """
 
 import os
@@ -142,11 +146,13 @@ def test_naive_vs_latent_decode_step(cfg):
 def test_kv_cache_compression_ratio():
     """
     MLA latent cache 相对于 GQA(4KV, 128dim) 的压缩比必须 < 60%。
+    GQA 基准：Qwen2.5-7B 风格（4 KV heads，head_dim=128）。
     DeepSeek-V2-Lite 理论值：(512+64)*2 / (4*128*2*2) = 1152/2048 ≈ 56.25%。
+    注：seq_len/num_layers 只影响 total_gb，不影响 ratio 和 per_token_layer 断言。
     """
     result = compute_kv_cache_bytes(
-        seq_len=1024,
-        num_layers=27,
+        seq_len=1,      # ratio 与 seq_len 无关，传 1 避免误导
+        num_layers=1,   # ratio 与 num_layers 无关，传 1 避免误导
         gqa_num_kv_heads=4,
         gqa_head_dim=128,
         mla_num_heads=16,
@@ -401,3 +407,77 @@ def test_absorbed_decode_step(cfg):
 
     max_diff = (out_naive - out_absorbed).abs().max().item()
     assert max_diff < 1e-4, f"absorbed decode step max diff = {max_diff:.2e}"
+
+
+# ─────────────────────────────────────────
+# 测试 9：batch>1 decode step 等价性
+# ─────────────────────────────────────────
+
+
+def test_batch_decode_step(cfg):
+    """
+    batch=2 prefill 后，decode step 两种实现输出一致。
+    验证 batch 维度在 torch.cat 和 view 中正确传播。
+    """
+    torch.manual_seed(11)
+    naive = MLAAttentionNaive(cfg)
+    latent = MLAAttentionLatentCache(cfg)
+    _copy_weights(naive, latent)
+    naive.eval()
+    latent.eval()
+
+    bsz = 2
+    x_prefill = torch.randn(bsz, 5, cfg.hidden_size)
+    with torch.no_grad():
+        _, cache_naive = naive(x_prefill)
+        _, cache_latent = latent(x_prefill)
+
+    x_decode = torch.randn(bsz, 1, cfg.hidden_size)
+    with torch.no_grad():
+        out_naive, _ = naive(x_decode, past_cache=cache_naive)
+        out_latent, _ = latent(x_decode, past_cache=cache_latent)
+
+    assert out_naive.shape == (bsz, 1, cfg.hidden_size)
+    assert torch.allclose(out_naive, out_latent, atol=1e-5), (
+        f"batch decode max diff = {(out_naive - out_latent).abs().max().item():.2e}"
+    )
+
+
+# ─────────────────────────────────────────
+# 测试 10：多步连续 decode（cache 逐步增长）
+# ─────────────────────────────────────────
+
+
+def test_multi_step_decode(cfg):
+    """
+    连续 4 步 decode，每步把返回的 cache 传入下一步。
+    验证 naive 和 latent 在 cache 增长过程中输出始终一致。
+    """
+    torch.manual_seed(13)
+    naive = MLAAttentionNaive(cfg)
+    latent = MLAAttentionLatentCache(cfg)
+    _copy_weights(naive, latent)
+    naive.eval()
+    latent.eval()
+
+    # prefill
+    x_prefill = torch.randn(1, 4, cfg.hidden_size)
+    with torch.no_grad():
+        _, cache_naive = naive(x_prefill)
+        _, cache_latent = latent(x_prefill)
+
+    # 连续 4 步 decode
+    for step in range(4):
+        x_decode = torch.randn(1, 1, cfg.hidden_size)
+        with torch.no_grad():
+            out_naive, cache_naive = naive(x_decode, past_cache=cache_naive)
+            out_latent, cache_latent = latent(x_decode, past_cache=cache_latent)
+
+        max_diff = (out_naive - out_latent).abs().max().item()
+        assert max_diff < 1e-5, (
+            f"step {step} max diff = {max_diff:.2e}"
+        )
+        # cache 应逐步增长
+        assert cache_naive.seq_len == 4 + step + 1
+        assert cache_latent.seq_len == 4 + step + 1
+

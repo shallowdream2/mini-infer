@@ -53,7 +53,7 @@
 | Phase 12 | ✅ |
 | Phase 12.5 | ✅ |
 | Phase 13 | ✅ |
-| Phase 14 | ⬜ |
+| Phase 14 | ✅ |
 | Phase 15 | ⬜ |
 
 ## 使用约定

@@ -93,8 +93,8 @@ class MLAKVCacheNaive:
     Naive 版 KV cache：存储完整展开的 key / value。
     与标准 MHA KV cache 格式相同，HF DynamicCache 兼容。
 
-    每层大小 = num_heads × (q_head_dim + v_head_dim) × 2 bytes / token
-    DeepSeek-V2-Lite = 16 × 320 × 2 = 10,240 bytes / token / layer
+    每层大小 = (num_heads × q_head_dim + num_heads × v_head_dim) × 2 bytes / token
+    DeepSeek-V2-Lite = (16×192 + 16×128) × 2 = 10,240 bytes / token / layer
     """
     key_states: torch.Tensor    # (batch, num_heads, seq_len, q_head_dim)
     value_states: torch.Tensor  # (batch, num_heads, seq_len, v_head_dim)
@@ -119,6 +119,7 @@ class MLAKVCacheLatent:
     每层大小 = (kv_lora_rank + qk_rope_head_dim) × 2 bytes / token
     DeepSeek-V2-Lite = (512 + 64) × 2 = 1,152 bytes / token / layer
     约为 naive cache 的 11.25%，或 GQA(4KV,128dim) 的 56.25%
+    （GQA 基准：Qwen2.5-7B 风格，4 KV heads，head_dim=128）
     """
     compressed_kv: torch.Tensor  # (batch, seq_len, kv_lora_rank)
     k_pe: torch.Tensor           # (batch, seq_len, qk_rope_head_dim) — 所有 head 共享
@@ -127,8 +128,9 @@ class MLAKVCacheLatent:
     def seq_len(self) -> int:
         return self.compressed_kv.shape[1]
 
-    def bytes_per_token_per_layer(self, kv_lora_rank: int, qk_rope_head_dim: int) -> int:
-        return (kv_lora_rank + qk_rope_head_dim) * 2  # fp16
+    def bytes_per_token_per_layer(self) -> int:
+        """从 tensor shape 推导，与 MLAKVCacheNaive.bytes_per_token_per_layer 接口一致。"""
+        return (self.compressed_kv.shape[-1] + self.k_pe.shape[-1]) * 2  # fp16
 
 
 # ──────────────────────────────────────────────
@@ -493,7 +495,7 @@ class MLAAttentionAbsorbed(nn.Module):
         )
         self.kv_a_layernorm = RMSNorm(c.kv_lora_rank)
 
-        # kv_b_proj 保留（用于初始化 absorbed 权重 + prefill 时展开 V）
+        # kv_b_proj 保留仅用于 _build_absorbed() 提取权重，forward 中不直接调用
         self.kv_b_proj = nn.Linear(
             c.kv_lora_rank, c.num_heads * (c.qk_nope_head_dim + c.v_head_dim), bias=False
         )
@@ -511,6 +513,11 @@ class MLAAttentionAbsorbed(nn.Module):
             "W_v_absorbed",
             torch.zeros(c.num_heads, c.kv_lora_rank, c.v_head_dim),
         )
+        # _absorbed_built：标记 absorbed 权重是否已从 kv_b_proj 派生。
+        # 注意：这是普通 Python 属性，不随 state_dict 保存。
+        # load_state_dict 后 kv_b_proj.weight 已更新，_absorbed_built 重置为 False，
+        # 下次 forward 时会自动重建 absorbed 权重，行为正确。
+        # 如果在 forward 之后手动修改 kv_b_proj.weight，需要手动调用 _build_absorbed()。
         self._absorbed_built = False
 
     def _build_absorbed(self) -> None:

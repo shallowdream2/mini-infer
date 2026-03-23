@@ -111,6 +111,7 @@
 - `mini_infer/tp_model_runner.py` — TensorParallelModelRunner（Phase 13，Megatron-LM 风格权重切分 + all-reduce hook）
 - `mini_infer/spec_engine.py` — SpecEngine（Phase 11，draft+target 双模型 speculative decoding）
 - `mini_infer/triton_flash_decode.py` — Flash Decoding split-K kernel（Phase 12.5，实验性，密 KV，不接入主路径）
+- `mini_infer/mla_attention.py` — MLA 注意力三种实现（Phase 14，MLAAttentionNaive / MLAAttentionLatentCache / MLAAttentionAbsorbed + compute_kv_cache_bytes）
 - `serve.py` — HTTP server CLI 启动脚本（argparse + uvicorn，Phase 8）
 - `chat.py` / `quick_chat.py` / `mini_infer/clients/chat_client.py` — 本地聊天入口与临时服务 quick mode
 

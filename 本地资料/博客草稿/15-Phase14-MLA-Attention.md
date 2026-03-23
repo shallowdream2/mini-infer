@@ -166,6 +166,28 @@ kv_for_score = torch.einsum("bsd,hde->bhse", compressed_kv_normed, self.W_k_abso
 
 修复后 max diff < 1e-4。
 
+### 坑 4：`del hf_model` 在闭包定义后立即执行导致 NameError
+
+benchmark 里用闭包 `make_modules()` 复制权重，`hf_attn` 是闭包捕获的外部变量：
+
+```python
+hf_attn = hf_model.model.layers[0].self_attn
+
+def make_modules():
+    for m in modules:
+        m.weight.copy_(hf_attn.weight)  # 闭包引用 hf_attn
+    ...
+
+del hf_attn, hf_model  # ← 在闭包定义后立即删除
+```
+
+运行时触发：
+```
+NameError: free variable 'hf_attn' referenced before assignment in enclosing scope
+```
+
+修复：把 `del` 移到 benchmark 循环结束后，确保所有 `make_modules()` 调用完成后再释放。
+
 ---
 
 ## 实验结果
@@ -182,13 +204,13 @@ kv_for_score = torch.einsum("bsd,hde->bhse", compressed_kv_normed, self.W_k_abso
 
 | seq_len | naive (ms) | latent (ms) | absorbed (ms) |
 |---------|-----------|------------|--------------|
-| 1 | 0.140 | 0.137 | 0.161 |
-| 256 | 0.132 | 0.134 | 0.159 |
-| 1024 | 0.131 | 0.154 | 0.167 |
+| 1 | 0.131 | 0.128 | 0.162 |
+| 256 | 0.133 | 0.138 | 0.167 |
+| 1024 | 0.133 | 0.154 | 0.171 |
 
 **观察**：
-- latent 在 seq=1024 时比 naive 慢 18%（每步需对全部历史 latent 做 kv_b_proj 展开）
-- absorbed 在当前规模下比 naive 慢 16~28%，`torch.einsum` 在小 batch 下开销大于 matmul
+- latent 在 seq=1024 时比 naive 慢 16%（每步需对全部历史 latent 做 kv_b_proj 展开）
+- absorbed 在当前规模下比 naive 慢 19~29%，`torch.einsum` 在小 batch 下开销大于 matmul
 - 矩阵吸收的理论优势需在 batch 更大或 seq_len >> kv_lora_rank=512 时才能体现
 
 ### GPU 单层等价性（真实权重）

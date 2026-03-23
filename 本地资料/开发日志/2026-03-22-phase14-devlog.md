@@ -62,3 +62,19 @@ Phase 13 完成 Tensor Parallelism 后，开始 Phase 14：理解 DeepSeek-V2 �
 
 - `_absorbed_built` 在 `load_state_dict` 后可能失效（建议修复，非阻塞）
 - absorbed 版在小 batch 下无性能优势，需更大规模验证
+
+---
+
+## 审核修复（infer-review 后补）
+
+审核发现 10 个问题，全部修复：
+
+- `MLAKVCacheLatent.bytes_per_token_per_layer` 改为从 self 读取
+- `MLAKVCacheNaive` docstring 公式描述修正
+- `kv_b_proj` 注释修正（只用于 `_build_absorbed`）
+- `_absorbed_built` 加注释说明 state_dict 行为
+- `benchmark_mla.py` naive 描述修正、`del hf_attn, hf_model`、32 GB 加说明
+- `test_kv_cache_compression_ratio` 移除 dead args
+- 新增 `test_batch_decode_step`（batch=2）
+- 新增 `test_multi_step_decode`（4 步连续 decode）
+- 最终：10 passed
