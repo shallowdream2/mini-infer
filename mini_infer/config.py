@@ -30,6 +30,8 @@ class EngineConfig:
     # Phase 12：CUDA Graph。True 时在引擎初始化后 warmup 并捕获 decode_batch 图。
     # 仅在 dry_run=False 时生效；与 chunked prefill 兼容（prefill 步走 eager 模式）。
     use_cuda_graph: bool = False
+    # Phase 16：量化模式。"" = 不量化（fp16 默认路径）；"w8a8" = W8A8 per-tensor 对称量化。
+    quant_mode: str = ""
 
     def __post_init__(self) -> None:
         if self.max_batch_size <= 0:
@@ -52,3 +54,5 @@ class EngineConfig:
             raise ValueError("head_dim 必须大于 0")
         if self.chunk_prefill_size < 0:
             raise ValueError("chunk_prefill_size 不能小于 0")
+        if self.quant_mode not in {"", "w8a8"}:
+            raise ValueError(f"quant_mode 只支持 '' 或 'w8a8'，得到: {self.quant_mode!r}")

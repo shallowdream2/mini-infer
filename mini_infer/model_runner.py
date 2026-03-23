@@ -1,5 +1,10 @@
 """
-Phase 3/5/6/9/10/12 模型执行器。
+Phase 3/5/6/9/10/12/16 模型执行器。
+
+Phase 16 新增（W8A8 量化）：
+  - 加载模型后，若 config.quant_mode == "w8a8"，调用 quantize_model() 原地替换线性层。
+  - embed_tokens / lm_head / attention qkv/o_proj / 小层保持 fp16，不参与量化。
+  - 量化不影响 quant_mode="" 的默认 fp16 路径。
 
 Phase 12 新增（CUDA Graph）：
   - warmup_cuda_graphs(batch_sizes)：引擎启动时调用，为每个 batch_size 预热 + 捕获 CUDA 图
@@ -132,6 +137,11 @@ class ModelRunner:
                 device_map=config.device,
             )
             self.model.eval()
+
+            # Phase 16：W8A8 量化（quant_mode="w8a8" 时原地替换线性层）
+            if config.quant_mode == "w8a8":
+                from .quantization import quantize_model
+                quantize_model(self.model)
 
             # Phase 6：永久 patch attention 层，decode 时走 paged attention 路径
             from .attention import patch_model_for_paged_decode
@@ -525,4 +535,3 @@ class ModelRunner:
             return logits
         finally:
             self._paged_ctx.clear()
-

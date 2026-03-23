@@ -22,10 +22,10 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **Tensor Parallelism**：Megatron-LM 风格，column/row parallel 权重切分 + NCCL all-reduce forward hook，TP=2 greedy 输出与单卡完全一致
 - **MLA（Multi-head Latent Attention）**：DeepSeek-V2/V3 架构，latent cache 压缩 56.25% vs GQA，矩阵吸收优化
 - **PD 解耦（Disaggregated Prefill/Decode）**：同机双进程原型，KV 序列化传输，TTFT 三段分解（prefill/transfer/decode）
-- **量化推理**（Phase 16，规划已完成，待实现）：W8A8 主线；FP8 / Triton INT8 为后续量化扩展
+- **量化推理**（Phase 16，开发中，尚未验收）：W8A8 主线，当前先闭环正确性 / 显存 / decode& e2e benchmark 口径；FP8 / Triton INT8 为后续量化扩展
 - **MoE + Expert Parallelism**（Phase 17，规划中）：Top-K 路由 + all-to-all EP
 
-项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。当前主线实现已完成到 Phase 15；Phase 16/17 仅保留规划，不计入当前代码实现面。
+项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。当前主线实现已完成到 Phase 15；Phase 16 已开始实现但尚未完成 benchmark / review / 验收，Phase 17 仍为规划。
 
 **权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
 
