@@ -42,7 +42,7 @@
 | Phase 12.5 | Flash Decoding（Split-K attention，长序列并行，Triton 实现，1.5B seq=4096 3.31× vs triton_65）| ✅ |
 | Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce，column/row parallel）| ✅ |
 | Phase 14 | MLA（Multi-head Latent Attention，DeepSeek-V2/V3 架构）| ✅ |
-| Phase 15 | PD 解耦（Disaggregated Prefill/Decode，KV 网络传输）| ⬜ |
+| Phase 15 | PD 解耦（Disaggregated Prefill/Decode，KV 网络传输）| ✅ |
 
 **权威来源说明**：当前状态与未来计划以本文件（`CLAUDE.md`）为权威来源；详细技术规划参考 `本地资料/Claude计划/00-长期路线图.md`；`README.md` 仅作快速索引；带日期的里程碑总结、开发日志和实验记录默认视为历史快照。
 

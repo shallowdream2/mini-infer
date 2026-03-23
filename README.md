@@ -282,6 +282,21 @@ conda run -n ai-infra python benchmarks/benchmark_mla.py --section 3
 conda run -n ai-infra python -m pytest tests/test_mla_attention.py -v
 ```
 
+# PD 解耦（Phase 15）
+```bash
+# 理论 KV 传输大小（无需模型权重、无需 GPU）
+TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 conda run -n ai-infra python benchmarks/benchmark_pd_disagg.py --section 1
+
+# 端到端正确性验证（需要 Qwen2.5-1.5B）
+TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 conda run -n ai-infra python benchmarks/benchmark_pd_disagg.py --section 2
+
+# TTFT 分解（prefill / transfer / decode）
+TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 conda run -n ai-infra python benchmarks/benchmark_pd_disagg.py --section 3
+
+# PD 解耦测试（7 个 dry_run 测试，无需 GPU）
+conda run -n ai-infra python -m pytest tests/test_pd_disagg.py -v
+```
+
 ### 测试命令（大部分无需 GPU）
 
 ```bash
@@ -353,6 +368,7 @@ benchmarks/
   benchmark_flash_decode.py Phase 12.5 Flash Decoding benchmark（seq_len sweep，split-K vs triton_65 vs flash_attn）
   benchmark_tp.py        Phase 13 Tensor Parallel benchmark（single/pp/torchrun_tp 吞吐 + VRAM 对比）
   benchmark_mla.py       Phase 14 MLA benchmark（理论 KV cache 对比 / 真实显存 / 三种实现延迟）
+  benchmark_pd_disagg.py Phase 15 PD 解耦 benchmark（理论 KV 大小 / 端到端正确性 / TTFT 三段分解）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
 
 tests/
@@ -369,6 +385,7 @@ tests/
   test_cuda_graph.py       Phase 12 CUDA Graph 测试（dry_run：graph pool 为空时降级、_find_padded_bs 边界）
   test_flash_decode.py     Phase 12.5 Flash Decoding 正确性测试（21 tests：GQA、empty split、非整除 seq_len）
   test_tp_engine.py        Phase 13 Tensor Parallel 测试（dry_run，13 tests：col/row shard、数学等价、attn 属性、mock all-reduce）
+  test_pd_disagg.py        Phase 15 PD 解耦测试（dry_run + GPU，7 tests：KVPayload/Queue/extract/rebuild/engine）
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
@@ -399,6 +416,6 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 12.5 | Flash Decoding（Split-K，Triton 实现；1.5B seq=4096 3.31× vs triton_65）| ✅ 完成 |
 | Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce；1.5B TP=2 正确性验证通过，tp=2 76.5 tok/s vs single 98.0）| ✅ 完成 |
 | Phase 14 | MLA（Multi-head Latent Attention，DeepSeek 架构；latent cache 56.25% vs GQA，10 tests pass）| ✅ 完成 |
-| Phase 15 | PD 解耦（Disaggregated Prefill/Decode）| ⬜ 计划中 |
+| Phase 15 | PD 解耦（同机双进程原型；greedy 输出一致，TTFT 三段分解：prefill 12.3ms/transfer≈14.7ms/decode 519ms；1.19× overhead vs unified）| ✅ 完成 |
 
 后续阶段验收口径详见 `CLAUDE.md`。
