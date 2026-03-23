@@ -1,4 +1,0 @@
-interface:
-  display_name: "infer-plan"
-  short_description: "Claude-equivalent planning for mini-infer"
-  default_prompt: "Use $infer-plan to plan the next mini-infer phase or scoped change."

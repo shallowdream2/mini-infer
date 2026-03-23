@@ -1,4 +1,0 @@
-interface:
-  display_name: "infer-summarize"
-  short_description: "Claude-equivalent summaries for mini-infer"
-  default_prompt: "Use $infer-summarize to write the current mini-infer phase summary."

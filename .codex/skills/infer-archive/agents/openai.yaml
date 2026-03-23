@@ -1,4 +1,0 @@
-interface:
-  display_name: "infer-archive"
-  short_description: "Claude-equivalent archive flow for mini-infer"
-  default_prompt: "Use $infer-archive to audit and close out the current mini-infer phase."

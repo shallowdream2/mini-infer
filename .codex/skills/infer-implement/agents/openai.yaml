@@ -1,4 +1,0 @@
-interface:
-  display_name: "infer-implement"
-  short_description: "Claude-equivalent implementation for mini-infer"
-  default_prompt: "Use $infer-implement to implement the planned mini-infer change."

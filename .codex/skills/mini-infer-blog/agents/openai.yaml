@@ -1,4 +1,0 @@
-interface:
-  display_name: "Mini-Infer Blog Writing"
-  short_description: "Write mini-infer blog drafts from real work"
-  default_prompt: "Use $mini-infer-blog to draft a mini-infer technical blog post."

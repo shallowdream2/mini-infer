@@ -1,4 +1,0 @@
-interface:
-  display_name: "Mini-Infer Summaries"
-  short_description: "Summarize mini-infer phases with real data"
-  default_prompt: "Use $mini-infer-summarize to write the current mini-infer phase summary."

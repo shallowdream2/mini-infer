@@ -15,3 +15,9 @@ htmlcov/
 
 # 个人本地资料（实验记录、博客草稿、知识笔记等），不纳入版本控制
 本地资料/
+
+# AI 协作配置（Claude Code、Codex 规则和 skill），不纳入版本控制
+.claude/
+.codex/
+CLAUDE.md
+CODEX.md
