@@ -41,7 +41,7 @@
 | Phase 12 | CUDA Graph（decode_batch 静态捕获，消除 Python dispatch 开销，1.5B +28.9%）| ✅ |
 | Phase 12.5 | Flash Decoding（Split-K attention，长序列并行，Triton 实现，1.5B seq=4096 3.31× vs triton_65）| ✅ |
 | Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce，column/row parallel）| ✅ |
-| Phase 14 | MLA（Multi-head Latent Attention，DeepSeek-V2/V3 架构）| 🔄 |
+| Phase 14 | MLA（Multi-head Latent Attention，DeepSeek-V2/V3 架构）| ✅ |
 | Phase 15 | PD 解耦（Disaggregated Prefill/Decode，KV 网络传输）| ⬜ |
 
 **权威来源说明**：当前状态与未来计划以本文件（`CLAUDE.md`）为权威来源；详细技术规划参考 `本地资料/Claude计划/00-长期路线图.md`；`README.md` 仅作快速索引；带日期的里程碑总结、开发日志和实验记录默认视为历史快照。
@@ -74,6 +74,7 @@
 | Qwen2.5-0.5B-Instruct | `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-0.5B-Instruct/snapshots/7ae557604adf67be50417f59c2c2f167def9a775` | ~1.9 GB | 24层, 14Q/2KV heads, head_dim=64, vocab=151936 | spec draft 模型；快速 dev/test |
 | Qwen2.5-1.5B-Instruct | `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306` | ~3 GB | 28层, 12Q/2KV heads, head_dim=128, vocab=151936 | Phase 12+ 主要开发用模型 |
 | Qwen2.5-7B-Instruct | `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct`（**根目录**，非 snapshot） | ~18.2 GB | 28层, 28Q/4KV heads, head_dim=128, vocab=152064 | 最终 benchmark 验证；snapshot 子目录不可用 |
+| DeepSeek-V2-Lite | `~/.cache/huggingface/hub/models--deepseek-ai--DeepSeek-V2-Lite/snapshots/604d5664dddd88a0433dbae533b7fe9472482de0` | ~15.2 GB（fp16，2×4090） | 27层 MoE, 16Q heads, kv_lora_rank=512, qk_rope_head_dim=64, hidden=2048 | Phase 14 MLA 验证；trust_remote_code=True 必须 |
 
 **模型使用注意事项：**
 - 所有本地模型必须配合 `HF_HUB_OFFLINE=1` 使用，防止 transformers 联网检查触发重下载

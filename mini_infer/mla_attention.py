@@ -437,3 +437,187 @@ def compute_kv_cache_bytes(
         "mla_latent_vs_gqa_ratio": mla_latent_per_token_layer / gqa_per_token_layer,
         "mla_latent_vs_mla_naive_ratio": mla_latent_per_token_layer / mla_naive_per_token_layer,
     }
+
+
+# ──────────────────────────────────────────────
+# MLAAttentionAbsorbed：矩阵吸收优化
+# ──────────────────────────────────────────────
+
+
+class MLAAttentionAbsorbed(nn.Module):
+    """
+    矩阵吸收（Matrix Absorption）优化版 MLA。
+
+    标准 latent cache 版在 decode 时需要：
+      1. kv_b_proj(compressed_kv) → k_nope  [O(seq × d_c × num_heads × d_nope)]
+      2. q_nope @ k_nope^T                  [O(num_heads × q_len × seq × d_nope)]
+
+    矩阵吸收预计算 W_absorbed = W_uq_nope^T @ W_uk_nope，decode 时直接：
+      q_absorbed = q_nope @ W_absorbed      [O(num_heads × q_len × d_nope × d_c)]
+      score_nope = q_absorbed @ compressed_kv^T  [O(num_heads × q_len × seq × d_c)]
+
+    避免了对全部历史 compressed_kv 做 kv_b_proj 展开，
+    在长序列（seq_len >> kv_lora_rank）时计算量更低。
+
+    同理，V 的计算也可以吸收：
+      W_uv_absorbed = W_uv（kv_b_proj 后半部分）
+      attn_output = attn_weights @ (compressed_kv @ W_uv_absorbed^T)
+                  = (attn_weights @ compressed_kv) @ W_uv_absorbed^T
+
+    KV cache：与 MLAAttentionLatentCache 相同（compressed_kv + k_pe），
+    cache 大小不变，只是 attention 计算路径不同。
+
+    参考：DeepSeek-V2 技术报告 Section 2.1.2 "Efficient Inference"
+    """
+
+    def __init__(self, config: MLAConfig) -> None:
+        super().__init__()
+        self.cfg = config
+        c = config
+
+        # Q 投影（同 naive）
+        if c.q_lora_rank is None:
+            self.q_proj = nn.Linear(c.hidden_size, c.num_heads * c.q_head_dim, bias=False)
+            self.q_a_proj = None
+            self.q_a_layernorm = None
+            self.q_b_proj = None
+        else:
+            self.q_proj = None
+            self.q_a_proj = nn.Linear(c.hidden_size, c.q_lora_rank, bias=False)
+            self.q_a_layernorm = RMSNorm(c.q_lora_rank)
+            self.q_b_proj = nn.Linear(c.q_lora_rank, c.num_heads * c.q_head_dim, bias=False)
+
+        # KV 压缩（同 naive）
+        self.kv_a_proj_with_mqa = nn.Linear(
+            c.hidden_size, c.kv_lora_rank + c.qk_rope_head_dim, bias=False
+        )
+        self.kv_a_layernorm = RMSNorm(c.kv_lora_rank)
+
+        # kv_b_proj 保留（用于初始化 absorbed 权重 + prefill 时展开 V）
+        self.kv_b_proj = nn.Linear(
+            c.kv_lora_rank, c.num_heads * (c.qk_nope_head_dim + c.v_head_dim), bias=False
+        )
+
+        self.o_proj = nn.Linear(c.num_heads * c.v_head_dim, c.hidden_size, bias=False)
+
+        # 预计算 absorbed 权重（在 _build_absorbed 中填充）
+        # W_k_absorbed: (num_heads, kv_lora_rank, qk_nope_head_dim) → 用于 q_nope @ W_k_absorbed
+        # W_v_absorbed: (num_heads, kv_lora_rank, v_head_dim)
+        self.register_buffer(
+            "W_k_absorbed",
+            torch.zeros(c.num_heads, c.kv_lora_rank, c.qk_nope_head_dim),
+        )
+        self.register_buffer(
+            "W_v_absorbed",
+            torch.zeros(c.num_heads, c.kv_lora_rank, c.v_head_dim),
+        )
+        self._absorbed_built = False
+
+    def _build_absorbed(self) -> None:
+        """
+        从 kv_b_proj.weight 预计算 absorbed 权重。
+
+        kv_b_proj.weight shape: (num_heads × (qk_nope_head_dim + v_head_dim), kv_lora_rank)
+        即 W_kv: [d_c → num_heads × (d_nope + d_v)]
+
+        拆分：
+          W_uk: (num_heads, kv_lora_rank, qk_nope_head_dim)  ← k_nope 展开权重
+          W_uv: (num_heads, kv_lora_rank, v_head_dim)         ← v 展开权重
+
+        直接存储 W_uk 和 W_uv 作为 absorbed 权重（无需与 W_q 相乘，
+        因为 q_nope 已经是投影后的向量，直接与 W_uk 做矩阵乘即可）。
+        """
+        c = self.cfg
+        with torch.no_grad():
+            # kv_b_proj.weight: (num_heads*(d_nope+d_v), d_c)
+            W = self.kv_b_proj.weight  # (num_heads*(d_nope+d_v), d_c)
+            W = W.view(c.num_heads, c.qk_nope_head_dim + c.v_head_dim, c.kv_lora_rank)
+            # W_uk: (num_heads, d_nope, d_c) → transpose → (num_heads, d_c, d_nope)
+            W_uk = W[:, : c.qk_nope_head_dim, :].transpose(1, 2)  # (num_heads, d_c, d_nope)
+            # W_uv: (num_heads, d_v, d_c) → transpose → (num_heads, d_c, d_v)
+            W_uv = W[:, c.qk_nope_head_dim :, :].transpose(1, 2)  # (num_heads, d_c, d_v)
+
+            self.W_k_absorbed.copy_(W_uk)
+            self.W_v_absorbed.copy_(W_uv)
+        self._absorbed_built = True
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        past_cache: Optional[MLAKVCacheLatent] = None,
+    ) -> Tuple[torch.Tensor, MLAKVCacheLatent]:
+        c = self.cfg
+        bsz, q_len, _ = hidden_states.shape
+
+        # 首次 forward 时构建 absorbed 权重
+        if not self._absorbed_built:
+            self._build_absorbed()
+
+        # ── Q 投影（同 naive）──
+        if c.q_lora_rank is None:
+            q = self.q_proj(hidden_states)
+        else:
+            q = self.q_b_proj(self.q_a_layernorm(self.q_a_proj(hidden_states)))
+        q = q.view(bsz, q_len, c.num_heads, c.q_head_dim).transpose(1, 2)
+        q_nope, q_pe = q.split([c.qk_nope_head_dim, c.qk_rope_head_dim], dim=-1)
+        # q_nope: (bsz, num_heads, q_len, qk_nope_head_dim)
+
+        # ── KV 压缩（同 latent cache）──
+        compressed_kv_and_kpe = self.kv_a_proj_with_mqa(hidden_states)
+        compressed_kv = compressed_kv_and_kpe[..., : c.kv_lora_rank]
+        k_pe = compressed_kv_and_kpe[..., c.kv_lora_rank :]
+
+        # ── 拼接历史 latent cache ──
+        if past_cache is not None:
+            compressed_kv = torch.cat([past_cache.compressed_kv, compressed_kv], dim=1)
+            k_pe = torch.cat([past_cache.k_pe, k_pe], dim=1)
+
+        kv_seq_len = compressed_kv.shape[1]
+        new_cache = MLAKVCacheLatent(compressed_kv=compressed_kv, k_pe=k_pe)
+
+        # kv_a_layernorm 必须在 attention 计算前应用（与 naive/latent 一致）
+        # 注意：cache 存储的是 raw compressed_kv（未 norm），norm 在 attention 时即时做
+        compressed_kv_normed = self.kv_a_layernorm(compressed_kv)
+
+        # ── 矩阵吸收：用 W_k_absorbed 直接从 compressed_kv_normed 计算 attention score ──
+        # compressed_kv_normed: (bsz, kv_seq_len, d_c)
+        # W_k_absorbed:         (num_heads, d_c, d_nope)
+        # q_nope:               (bsz, num_heads, q_len, d_nope)
+        #
+        # kv_for_score = compressed_kv_normed @ W_k_absorbed
+        #              → (bsz, num_heads, kv_seq_len, d_nope)
+        kv_for_score = torch.einsum(
+            "bsd,hde->bhse", compressed_kv_normed, self.W_k_absorbed
+        )  # (bsz, num_heads, kv_seq_len, d_nope)
+
+        # score_nope = q_nope @ kv_for_score^T
+        score_nope = torch.matmul(q_nope, kv_for_score.transpose(2, 3))
+        # (bsz, num_heads, q_len, kv_seq_len)
+
+        # ── RoPE 分量 score ──
+        k_pe_full = k_pe.view(bsz, kv_seq_len, 1, c.qk_rope_head_dim).transpose(1, 2)
+        # (bsz, 1, kv_seq_len, qk_rope_head_dim)
+        score_pe = torch.matmul(q_pe, k_pe_full.transpose(2, 3))
+        # (bsz, num_heads, q_len, kv_seq_len)
+
+        # ── 合并 score 并 softmax ──
+        attn_weights = (score_nope + score_pe) * c.softmax_scale
+        attn_weights = torch.softmax(attn_weights, dim=-1)
+        # (bsz, num_heads, q_len, kv_seq_len)
+
+        # ── 矩阵吸收：用 W_v_absorbed 直接从 compressed_kv_normed 计算输出 ──
+        # kv_for_v = compressed_kv_normed @ W_v_absorbed
+        #   → (bsz, num_heads, kv_seq_len, d_v)
+        kv_for_v = torch.einsum(
+            "bsd,hdv->bhsv", compressed_kv_normed, self.W_v_absorbed
+        )  # (bsz, num_heads, kv_seq_len, d_v)
+
+        attn_output = torch.matmul(attn_weights, kv_for_v)
+        # (bsz, num_heads, q_len, d_v)
+
+        # ── 输出投影 ──
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, c.num_heads * c.v_head_dim)
+        output = self.o_proj(attn_output)
+
+        return output, new_cache
