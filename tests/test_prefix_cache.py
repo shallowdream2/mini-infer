@@ -238,7 +238,7 @@ class TestEvictLRU:
         # evict 应跳过这个 block（唯一 cached block 被 r2 引用，不可淘汰）
         result = mgr.evict_lru_prefix_block()
         assert result is False
-        assert phys_block in mgr._prefix_cache.values()
+        assert phys_block in mgr._pfx._cache.values()
 
 
 # ---------------------------------------------------------------------------

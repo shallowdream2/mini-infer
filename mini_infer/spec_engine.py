@@ -35,6 +35,7 @@ v1 局限性（设计文档中已说明）：
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import torch
@@ -42,6 +43,131 @@ import torch
 from .config import EngineConfig
 from .engine import LLMEngine
 from .request import Request, RequestState, SamplingParams
+
+if TYPE_CHECKING:
+    from .model_runner import ModelRunner
+
+
+# ------------------------------------------------------------------
+# Phase 11：Speculative Decoding 辅助函数（原位于 ModelRunner）
+#
+# 从 ModelRunner 方法改为模块级私有函数，接受 ModelRunner 实例作为首个参数。
+# 职责边界：spec 策略逻辑属于 spec_engine，不应污染通用推理路径。
+# ------------------------------------------------------------------
+
+def _spec_decode_one(mr: "ModelRunner", state: RequestState) -> torch.Tensor:
+    """
+    Draft 模型一步 decode，返回 logit tensor [vocab_size]（不采样，不更新 state）。
+
+    调用方负责：
+      - 调用前先调用 kv_cache.ensure_next_slot([request_id])
+      - 调用后从返回的 logit 采样 token，并调用 kv_cache.advance_seq_lens 和更新 state
+
+    dry_run：返回全 0 的固定大小 logit（256 = StubTokenizer 词表大小）。
+    """
+    if mr.config.dry_run:
+        return torch.zeros(256)
+
+    request_id = state.request.request_id
+    last_token = (
+        state.generated_token_ids[-1]
+        if state.generated_token_ids
+        else state.prompt_token_ids[-1]
+    )
+    input_ids = torch.tensor([[last_token]], dtype=torch.long, device=mr.config.device)
+    block_table, cache_seqlens = mr.kv_cache.build_block_tables([request_id])
+    position_ids = cache_seqlens.long().unsqueeze(1)
+    max_kv_len = int(cache_seqlens.max().item()) + 1
+    mr._paged_ctx.set(block_table, cache_seqlens, max_kv_len)
+    try:
+        with torch.no_grad():
+            out = mr.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+        return out.logits[0, 0, :].clone()  # [vocab_size]
+    finally:
+        mr._paged_ctx.clear()
+
+
+def _spec_verify_target(
+    mr: "ModelRunner", state: RequestState, draft_tokens: list[int]
+) -> torch.Tensor:
+    """
+    目标模型一次 forward 验证 K 个 draft token，返回 logits[K, vocab_size]。
+
+    从 block tensor 重建当前完整 KV，以 draft_tokens 为输入做 HF forward。
+    不修改 block tensor 也不更新 state，只返回 logits 供 rejection sampling 使用。
+    调用方在 rejection sampling 后决定接受哪些 token，再调用 _spec_advance_target_kv 提交。
+
+    dry_run：返回全 0 的 Tensor[K, 256]。
+    """
+    K = len(draft_tokens)
+    if mr.config.dry_run:
+        return torch.zeros(K, 256)
+
+    request_id = state.request.request_id
+    seq_len = mr.kv_cache._seq_lens[request_id]
+    block_table = mr.kv_cache._block_tables[request_id]
+    current_kv = mr.kv_cache.get_prefix_kv(block_table, seq_len)
+
+    input_ids = torch.tensor([draft_tokens], dtype=torch.long, device=mr.config.device)
+    with torch.no_grad():
+        out = mr.model(
+            input_ids=input_ids,
+            past_key_values=current_kv,
+            use_cache=False,
+        )
+    return out.logits[0].clone()  # [K, vocab_size]
+
+
+def _spec_advance_target_kv(
+    mr: "ModelRunner", state: RequestState, token_ids: list[int]
+) -> torch.Tensor:
+    """
+    将已接受的 token_ids 提交到目标模型的 block tensor，返回末位 logit [vocab_size]。
+
+    类似 mini-prefill：从 block tensor 重建当前 KV，以 token_ids 做 HF forward，
+    将新 KV 写入 block tensor 并更新 seq_len。
+    返回值供下一轮 spec 迭代的 last_logit 缓存使用。
+
+    调用前提：kv_cache 已有足够的空闲块容纳 len(token_ids) 个新 token。
+    dry_run：直接推进 seq_len，返回全 0 logit。
+    """
+    if mr.config.dry_run:
+        request_id = state.request.request_id
+        mr.kv_cache._seq_lens[request_id] += len(token_ids)
+        for _ in token_ids:
+            block_idx = (mr.kv_cache._seq_lens[request_id] - 1) // mr.kv_cache.block_size
+            while block_idx >= len(mr.kv_cache._block_tables[request_id]):
+                mr.kv_cache._block_tables[request_id].append(
+                    mr.kv_cache._allocate_block()
+                )
+        return torch.zeros(256)
+
+    request_id = state.request.request_id
+    seq_len = mr.kv_cache._seq_lens[request_id]
+    block_table = mr.kv_cache._block_tables[request_id]
+    current_kv = mr.kv_cache.get_prefix_kv(block_table, seq_len)
+
+    # 预分配目标块
+    for _ in token_ids:
+        mr.kv_cache.ensure_next_slot([request_id])
+        mr.kv_cache._seq_lens[request_id] += 1
+    mr.kv_cache._seq_lens[request_id] = seq_len  # 重置，让 write_prefill_kv_suffix 正确计算偏移
+
+    input_ids = torch.tensor([token_ids], dtype=torch.long, device=mr.config.device)
+    with torch.no_grad():
+        out = mr.model(
+            input_ids=input_ids,
+            past_key_values=current_kv,
+            use_cache=True,
+        )
+
+    mr.kv_cache.write_prefill_kv_suffix(request_id, out.past_key_values, seq_len)
+    mr.kv_cache._seq_lens[request_id] = seq_len + len(token_ids)
+    return out.logits[0, -1, :].clone()  # [vocab_size]
 
 
 def _softmax(logits: torch.Tensor) -> torch.Tensor:
@@ -239,8 +365,8 @@ class SpecEngine:
         # spec_verify_target 的 KV 上下文少 1 个 token，attention 偏移 1 位。
         first_token_list = t_state.generated_token_ids[:1]
         if first_token_list:
-            target_prev_logit = self.target.model_runner.spec_advance_target_kv(
-                t_state, first_token_list
+            target_prev_logit = _spec_advance_target_kv(
+                self.target.model_runner, t_state, first_token_list
             )
         else:
             vocab_size = (
@@ -262,8 +388,8 @@ class SpecEngine:
             draft_tokens, draft_probs = self._draft_k_steps(d_state, K)
 
             # 3b. Target：一次 K-token forward 验证
-            target_verify_logits = self.target.model_runner.spec_verify_target(
-                t_state, draft_tokens
+            target_verify_logits = _spec_verify_target(
+                self.target.model_runner, t_state, draft_tokens
             )  # [K, vocab]
 
             # 3c. Rejection sampling
@@ -295,8 +421,8 @@ class SpecEngine:
 
             if not t_state.finished:
                 # 将接受的 token 写入 target KV block tensor
-                target_prev_logit = self.target.model_runner.spec_advance_target_kv(
-                    t_state, accepted_tokens
+                target_prev_logit = _spec_advance_target_kv(
+                    self.target.model_runner, t_state, accepted_tokens
                 )
 
             # 3f. 同步 draft state（generated_token_ids 与 target 对齐）
@@ -344,7 +470,7 @@ class SpecEngine:
             self.draft.kv_cache.ensure_next_slot([rid])
 
             # 获取 logit（不采样）
-            logit = self.draft.model_runner.spec_decode_one(state)
+            logit = _spec_decode_one(self.draft.model_runner, state)
             probs = _softmax(logit)
             draft_probs.append(probs)
 

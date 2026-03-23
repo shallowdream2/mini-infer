@@ -57,6 +57,115 @@ class KVAllocation:
     cached_tokens: int = 0
 
 
+class PrefixCacheManager:
+    """
+    前缀缓存管理（Phase 10）：维护 block-level hash → 物理块映射和 LRU 淘汰顺序。
+
+    只负责 hash/LRU 查找逻辑，不直接操作 GPU tensor 或物理块生命周期。
+    物理块的 ref_count 和 free_blocks 由 KVCacheManager 持有，由调用方更新。
+
+    设计原则：
+      - compute_hashes / find / register 只读写 self._cache / self._lru
+      - try_evict 接收 ref_count dict，清理后返回物理块 id，调用方负责归还 free_blocks
+      这样 PrefixCacheManager 可以被替换（如换成 RadixAttention 的 trie 结构）
+      而不影响 KVCacheManager 的块池管理逻辑。
+    """
+
+    def __init__(self, block_size: int) -> None:
+        self.block_size = block_size
+        # hash → phys_block_id
+        self._cache: dict[int, int] = {}
+        # LRU 顺序（最近使用在末尾，淘汰时从头取）
+        self._lru: OrderedDict[int, None] = OrderedDict()
+
+    def compute_hashes(self, token_ids: list[int]) -> list[int]:
+        """
+        计算 token_ids 各完整 block 的链式 hash。
+
+        每个 block 的 hash 包含前缀历史（chain），避免相同 token 在不同位置错误命中。
+        只计算完整 block（末尾不足 block_size 的部分不参与 hash）。
+
+        限制最大可缓存 block 数：
+          - prompt_len % block_size == 0：只缓存前 N-1 块，保留最后一块作为 suffix
+          - 否则：缓存所有完整 block（partial tail 自然成为 suffix）
+        保证 find 返回的 cached_len < prompt_len，避免 suffix 为空时传入空 input_ids。
+        """
+        num_full_blocks = len(token_ids) // self.block_size
+        max_cacheable = (num_full_blocks - 1) if (
+            len(token_ids) > 0 and len(token_ids) % self.block_size == 0
+        ) else num_full_blocks
+
+        hashes: list[int] = []
+        prev_hash = 0
+        for i in range(max_cacheable):
+            start = i * self.block_size
+            end = start + self.block_size
+            # SHA-256 确保确定性（避免 PYTHONHASHSEED 随机化）和低碰撞概率
+            buf = struct.pack(
+                f">Q{end - start}i",
+                prev_hash & 0xFFFFFFFFFFFFFFFF,
+                *token_ids[start:end],
+            )
+            block_hash = int.from_bytes(hashlib.sha256(buf).digest()[:8], "big")
+            hashes.append(block_hash)
+            prev_hash = block_hash
+        return hashes
+
+    def find(self, token_ids: list[int]) -> tuple[int, list[int]]:
+        """
+        查找最长前缀命中，返回 (cached_len, phys_block_ids)。
+
+        cached_len 按 block_size 对齐，且 < len(token_ids)（保证非空 suffix）。
+        命中时更新 LRU 顺序。
+        """
+        hashes = self.compute_hashes(token_ids)
+        cached_blocks: list[int] = []
+        for block_hash in hashes:
+            if block_hash not in self._cache:
+                break
+            cached_blocks.append(self._cache[block_hash])
+            self._lru.move_to_end(block_hash)
+        return len(cached_blocks) * self.block_size, cached_blocks
+
+    def register(self, token_ids: list[int], block_table: list[int]) -> list[int]:
+        """
+        将 prompt 完整 block 注册到前缀缓存，更新 LRU。
+
+        已缓存的 block 只刷新 LRU 顺序；新 block 加入缓存。
+        返回新加入缓存的物理块列表，调用方负责对这些块执行 ref_count += 1。
+        """
+        hashes = self.compute_hashes(token_ids)
+        new_blocks: list[int] = []
+        for block_hash, phys_block in zip(hashes, block_table):
+            if block_hash in self._cache:
+                self._lru.move_to_end(block_hash)
+                continue
+            self._cache[block_hash] = phys_block
+            self._lru[block_hash] = None
+            new_blocks.append(phys_block)
+        return new_blocks
+
+    def try_evict(self, ref_count: dict[int, int]) -> int | None:
+        """
+        尝试淘汰 LRU 中 ref_count == 1 的块（仅 cache 持有，无请求引用）。
+
+        成功：从 cache / LRU 中移除并清理 ref_count，返回物理块 id（调用方归还 free_blocks）。
+        失败：返回 None（所有缓存块均被请求引用，不可淘汰）。
+        """
+        for block_hash in list(self._lru.keys()):
+            phys_block = self._cache[block_hash]
+            if ref_count.get(phys_block, 1) == 1:
+                del self._cache[block_hash]
+                del self._lru[block_hash]
+                ref_count.pop(phys_block, None)
+                return phys_block
+        return None
+
+    def size(self) -> int:
+        """返回当前缓存的 block 数。"""
+        return len(self._cache)
+
+
 class KVCacheManager:
     """
     Paged KV cache manager：预分配 GPU block tensor 池，用 BlockTable 管理每个请求。
@@ -102,12 +211,8 @@ class KVCacheManager:
         # 每个请求已存入的 KV token 数量
         self._seq_lens: dict[str, int] = {}
 
-        # Phase 10：前缀缓存
-        # block_chained_hash → phys_block_id（命中时直接复用物理块）
-        self._prefix_cache: dict[int, int] = {}
-        # LRU 顺序（OrderedDict，最近使用在末尾，淘汰时从头取）
-        self._lru: OrderedDict[int, None] = OrderedDict()
-        # 物理块引用计数（request 持有 + cache 持有之和）
+        # Phase 10：前缀缓存管理器（hash/LRU 逻辑）+ 物理块引用计数
+        self._pfx = PrefixCacheManager(self.block_size)
         self._ref_count: dict[int, int] = {}
 
     # ------------------------------------------------------------------
@@ -472,62 +577,16 @@ class KVCacheManager:
             self._seq_lens[rid] += 1
 
     # ------------------------------------------------------------------
-    # Phase 10：Prefix Caching
+    # Phase 10：Prefix Caching（查找/注册/淘汰委托给 PrefixCacheManager）
     # ------------------------------------------------------------------
-
-    def _compute_block_hashes(self, token_ids: list[int]) -> list[int]:
-        """
-        计算 token_ids 各完整 block 的链式 hash。
-
-        每个 block 的 hash 包含前缀历史（chain），避免相同 token 在不同位置错误命中。
-        只计算完整 block（末尾不足 block_size 的部分不参与 hash）。
-
-        限制最大可缓存 block 数：
-          - prompt_len % block_size == 0：只缓存前 N-1 块，保留最后一块作为 suffix
-          - 否则：缓存所有完整 block（partial tail 自然成为 suffix）
-        这样保证 find_prefix_cache 返回的 cached_len < prompt_len，
-        避免 suffix 为空时向模型传入空 input_ids 的问题。
-        """
-        num_full_blocks = len(token_ids) // self.block_size
-        # 若 prompt 恰好 block 对齐，留最后一块不缓存（保证至少 1 block suffix）
-        max_cacheable = (num_full_blocks - 1) if (
-            len(token_ids) > 0 and len(token_ids) % self.block_size == 0
-        ) else num_full_blocks
-
-        hashes: list[int] = []
-        prev_hash = 0
-        for i in range(max_cacheable):
-            start = i * self.block_size
-            end = start + self.block_size
-            # 使用 SHA-256 确保确定性（避免 PYTHONHASHSEED 随机化）和低碰撞概率。
-            # struct.pack: 8 字节无符号 prev_hash + block_size 个有符号 token id
-            buf = struct.pack(
-                f">Q{end - start}i",
-                prev_hash & 0xFFFFFFFFFFFFFFFF,
-                *token_ids[start:end],
-            )
-            block_hash = int.from_bytes(hashlib.sha256(buf).digest()[:8], "big")
-            hashes.append(block_hash)
-            prev_hash = block_hash
-        return hashes
 
     def find_prefix_cache(self, token_ids: list[int]) -> tuple[int, list[int]]:
         """
         查找 token_ids 的最长前缀命中，返回 (cached_len, phys_block_ids)。
 
         cached_len 按 block_size 对齐，且 < len(token_ids)（保证非空 suffix）。
-        命中时更新 LRU 顺序。
         """
-        hashes = self._compute_block_hashes(token_ids)
-        cached_blocks: list[int] = []
-        for block_hash in hashes:
-            if block_hash not in self._prefix_cache:
-                break
-            phys_block = self._prefix_cache[block_hash]
-            cached_blocks.append(phys_block)
-            self._lru.move_to_end(block_hash)  # 标记为最近使用
-        cached_len = len(cached_blocks) * self.block_size
-        return cached_len, cached_blocks
+        return self._pfx.find(token_ids)
 
     def init_request_with_prefix(
         self,
@@ -562,18 +621,10 @@ class KVCacheManager:
         """
         prefill 完成后，将 prompt 的完整 block 注册到前缀缓存。
 
-        已缓存的 block 只更新 LRU；新 block 加入缓存并增加引用计数。
-        只注册 _compute_block_hashes 所覆盖的完整 block。
+        新加入缓存的块 ref_count += 1（cache 额外持有一个引用）。
         """
-        hashes = self._compute_block_hashes(token_ids)
-        for block_hash, phys_block in zip(hashes, block_table):
-            if block_hash in self._prefix_cache:
-                self._lru.move_to_end(block_hash)
-                continue
-            self._prefix_cache[block_hash] = phys_block
-            self._lru[block_hash] = None
-            # cache 额外持有一个引用
-            self._ref_count[phys_block] = self._ref_count.get(phys_block, 1) + 1
+        for block in self._pfx.register(token_ids, block_table):
+            self._ref_count[block] = self._ref_count.get(block, 1) + 1
 
     def register_prefix_blocks_for_request(self, request_id: str, token_ids: list[int]) -> None:
         """按 request_id 查找 block_table 后调用 register_prefix_blocks。"""
@@ -582,18 +633,13 @@ class KVCacheManager:
 
     def evict_lru_prefix_block(self) -> bool:
         """
-        淘汰最久未使用的前缀缓存 block（只淘汰 ref_count == 1 即仅 cache 持有的 block）。
+        淘汰 LRU 中 ref_count == 1 的块（仅 cache 持有），归还 free_blocks。
         返回 True 表示成功淘汰，False 表示没有可淘汰的 block。
         """
-        for block_hash in list(self._lru.keys()):  # 从最旧遍历
-            phys_block = self._prefix_cache[block_hash]
-            if self._ref_count.get(phys_block, 1) == 1:
-                # 只有 cache 持有，可以淘汰
-                del self._prefix_cache[block_hash]
-                del self._lru[block_hash]
-                self._ref_count.pop(phys_block, None)
-                self._free_blocks.append(phys_block)
-                return True
+        block = self._pfx.try_evict(self._ref_count)
+        if block is not None:
+            self._free_blocks.append(block)
+            return True
         return False
 
     def write_prefill_kv_suffix(
@@ -663,7 +709,7 @@ class KVCacheManager:
 
     def prefix_cache_size(self) -> int:
         """返回当前前缀缓存中的 block 数，供测试和监控使用。"""
-        return len(self._prefix_cache)
+        return self._pfx.size()
 
     # ------------------------------------------------------------------
     # Phase 11：Speculative Decoding — KV 回滚
