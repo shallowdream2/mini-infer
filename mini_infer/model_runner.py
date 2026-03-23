@@ -3,6 +3,7 @@ Phase 3/5/6/9/10/12/16 模型执行器。
 
 Phase 16 新增（W8A8 量化）：
   - 加载模型后，若 config.quant_mode == "w8a8"，调用 quantize_model() 原地替换线性层。
+  - 第一版 contract：activation per-row + weight per-channel。
   - embed_tokens / lm_head / attention qkv/o_proj / 小层保持 fp16，不参与量化。
   - 量化不影响 quant_mode="" 的默认 fp16 路径。
 

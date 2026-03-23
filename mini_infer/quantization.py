@@ -48,6 +48,14 @@ class QuantLinear(nn.Module):
         "int_mm_rows": 0,
         "fallback_rows": 0,
     }
+    _contract: ClassVar[dict[str, object]] = {
+        "activation_granularity": "per_row",
+        "weight_granularity": "per_channel",
+        "int_mm_min_rows": 17,
+        "skip_suffixes": ("lm_head", "embed_tokens", "q_proj", "k_proj", "v_proj", "o_proj"),
+        "min_param_size": 4096,
+        "in_feat_align": 8,
+    }
 
     def __init__(self, weight: torch.Tensor, bias: Optional[torch.Tensor]) -> None:
         """用 nn.Linear 的 weight/bias 初始化。
@@ -59,16 +67,7 @@ class QuantLinear(nn.Module):
         super().__init__()
         out_features, in_features = weight.shape
 
-        # weight per-channel 对称量化：每个输出通道独立一个 scale_w
-        abs_max = weight.abs().amax(dim=1).float()  # [out_features]
-        scale_w = torch.clamp(abs_max / 127.0, min=1e-8)
-
-        # 预计算 int8 权重，并转置为 [in_features, out_features]（适配 _int_mm 的 [K,N] 布局）
-        weight_fp = weight.float()
-        weight_int8 = (
-            weight_fp / scale_w.unsqueeze(1)
-        ).round().clamp(-128, 127).to(torch.int8)
-        weight_int8_T = weight_int8.T.contiguous()  # [in_features, out_features]
+        weight_int8_T, scale_w = self._quantize_weight_per_channel(weight)
 
         # 注册为 buffer（不参与梯度、随模型 state_dict 保存）
         self.register_buffer("weight_int8", weight_int8_T)  # [K, N]
@@ -94,13 +93,11 @@ class QuantLinear(nn.Module):
         x_fp = x_2d.float()
 
         # 激活量化（per-row）：比整 batch 共用一个 scale 更稳，尤其适合小 batch decode
-        abs_max_a = x_fp.abs().amax(dim=1, keepdim=True)
-        scale_a = torch.clamp(abs_max_a / 127.0, min=1e-8)
-        x_int8 = (x_fp / scale_a).round().clamp(-128, 127).to(torch.int8)
+        x_int8, scale_a = self._quantize_activation_per_row(x_fp)
 
         # 矩阵乘：CPU fallback 或 CUDA _int_mm
         M = x_int8.shape[0]
-        if x.device.type == "cpu" or M <= 16:
+        if not self._should_use_int_mm(x.device.type, M):
             # CPU 不支持 _int_mm；CUDA 要求 M > 16（decode 时 batch 小于 16 走此路径）
             # 仍能享受权重显存降低，compute 路径退化为 fp32 matmul
             self.__class__._runtime_stats["fallback_calls"] += 1
@@ -141,6 +138,41 @@ class QuantLinear(nn.Module):
         """返回当前运行时统计快照。"""
         return dict(cls._runtime_stats)
 
+    @classmethod
+    def get_contract(cls) -> dict[str, object]:
+        """返回第一版 W8A8 contract，供测试和 benchmark 解释使用。"""
+        return dict(cls._contract)
+
+    @classmethod
+    def _quantize_weight_per_channel(
+        cls,
+        weight: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """按输出通道量化权重，返回 [K, N] int8 权重和 [N] scale。"""
+        abs_max = weight.abs().amax(dim=1).float()  # [out_features]
+        scale_w = torch.clamp(abs_max / 127.0, min=1e-8)
+        weight_fp = weight.float()
+        weight_int8 = (
+            weight_fp / scale_w.unsqueeze(1)
+        ).round().clamp(-128, 127).to(torch.int8)
+        return weight_int8.T.contiguous(), scale_w
+
+    @classmethod
+    def _quantize_activation_per_row(
+        cls,
+        x_fp: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """按输入行量化激活，返回 int8 激活和 [M,1] scale。"""
+        abs_max_a = x_fp.abs().amax(dim=1, keepdim=True)
+        scale_a = torch.clamp(abs_max_a / 127.0, min=1e-8)
+        x_int8 = (x_fp / scale_a).round().clamp(-128, 127).to(torch.int8)
+        return x_int8, scale_a
+
+    @classmethod
+    def _should_use_int_mm(cls, device_type: str, rows: int) -> bool:
+        """判断本次前向是否应命中 CUDA _int_mm 快路径。"""
+        return device_type != "cpu" and rows >= int(cls._contract["int_mm_min_rows"])
+
 
 # --------------------------------------------------------------------------- #
 # 跳过量化的条件
@@ -149,20 +181,13 @@ class QuantLinear(nn.Module):
 # 按层名后缀跳过：embed/output head 保持 fp16
 # Attention 投影层（q/k/v/o_proj）对第一版 W8A8 更敏感，跳过保留 fp16 以保证正确性
 # MLP 层（gate_proj / up_proj / down_proj）权重较大且分布较均匀，是量化主要收益来源
-_SKIP_SUFFIXES = (
-    "lm_head",
-    "embed_tokens",
-    "q_proj",
-    "k_proj",
-    "v_proj",
-    "o_proj",
-)
+_SKIP_SUFFIXES = tuple(QuantLinear.get_contract()["skip_suffixes"])
 
 # 参数量下限（太小的层 INT8 GEMM 收益极低，且可能触发 _int_mm 的 size 约束）
-_MIN_PARAM_SIZE = 4096
+_MIN_PARAM_SIZE = int(QuantLinear.get_contract()["min_param_size"])
 
 # in_features 必须是 8 的倍数（INT8 GEMM 对齐要求）
-_IN_FEAT_ALIGN = 8
+_IN_FEAT_ALIGN = int(QuantLinear.get_contract()["in_feat_align"])
 
 
 def _should_skip(name: str, module: nn.Linear) -> bool:
@@ -183,8 +208,8 @@ def quantize_model(model: nn.Module) -> nn.Module:
 
     跳过规则：
     - 名称后缀为 lm_head / embed_tokens
-    - in_features × out_features < 4096
-    - in_features % 8 != 0
+    - in_features × out_features < min_param_size（当前 4096）
+    - in_features % in_feat_align != 0（当前 8）
 
     Args:
         model: 已加载到目标 device 的 fp16/fp32 模型（原地修改）

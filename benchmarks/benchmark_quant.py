@@ -8,6 +8,11 @@
 - greedy token match rate / sequence exact match
 - W8A8 quant 路径中 _int_mm vs fallback 命中情况
 
+评估口径：
+- 固定使用 12 条 prompt 做正确性对比
+- `batch_size` 表示引擎每次处理的 engine batch 大小，而不是评估 prompt 总数
+- 模型结构参数从 HuggingFace config 推导，不再把 benchmark 限死在 1.5B
+
 用法示例：
   # 单模式运行
   HF_HUB_OFFLINE=1 conda run -n ai-infra python benchmarks/benchmark_quant.py \\
@@ -16,13 +21,19 @@
   # 对比运行（fp16 + W8A8 一次性比较）
   HF_HUB_OFFLINE=1 conda run -n ai-infra python benchmarks/benchmark_quant.py \\
       --model <path> --compare --batch-size 4 --max-new-tokens 64
+
+  # 对当前量化 contract 做线性层 M-sweep，观察 _int_mm 何时命中
+  HF_HUB_OFFLINE=1 conda run -n ai-infra python benchmarks/benchmark_quant.py \\
+      --model <path> --compare --linear-bench-iters 50
 """
 
 import argparse
 import gc
 import time
 import torch
+import torch.nn as nn
 from typing import Optional
+from transformers import AutoConfig
 
 from mini_infer.config import EngineConfig
 from mini_infer.kv_cache import KVCacheManager
@@ -49,6 +60,8 @@ PROMPTS = [
     "The Great Wall of China was built during",
     "DNA stands for",
 ]
+
+LINEAR_SWEEP_ROWS = (1, 2, 4, 8, 16, 32, 64)
 
 
 def measure_weight_memory(model: torch.nn.Module) -> float:
@@ -126,23 +139,136 @@ def _format_quant_stats(stats: Optional[dict[str, int]]) -> str:
     )
 
 
-def run_benchmark(
+def format_linear_quant_stats(stats: Optional[dict[str, int]]) -> str:
+    """格式化 linear sweep 中单个 M 的量化路径统计。"""
+    return _format_quant_stats(stats)
+
+
+def build_prompt_batches(
+    batch_size: int,
+    prompts: Optional[list[str]] = None,
+) -> list[list[str]]:
+    """把固定 prompt 集切成多个 engine batch。"""
+    if batch_size <= 0:
+        raise ValueError("batch_size 必须大于 0")
+    prompt_list = PROMPTS if prompts is None else prompts
+    return [
+        prompt_list[start:start + batch_size]
+        for start in range(0, len(prompt_list), batch_size)
+    ]
+
+
+def build_linear_sweep_rows(max_rows: int = 64) -> list[int]:
+    """构造 <= max_rows 的标准 M-sweep。"""
+    return [rows for rows in LINEAR_SWEEP_ROWS if rows <= max_rows]
+
+
+def infer_model_geometry(model_path: str) -> dict[str, int]:
+    """从 HuggingFace config 推导 ModelRunner 所需的几何参数。"""
+    cfg = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
+
+    num_hidden_layers = getattr(cfg, "num_hidden_layers", None)
+    num_attention_heads = getattr(cfg, "num_attention_heads", None)
+    hidden_size = getattr(cfg, "hidden_size", None)
+    if num_hidden_layers is None or num_attention_heads is None or hidden_size is None:
+        raise RuntimeError(
+            "模型 config 缺少 num_hidden_layers / num_attention_heads / hidden_size，"
+            "无法自动构建 quant benchmark 的 EngineConfig"
+        )
+
+    num_kv_heads = getattr(cfg, "num_key_value_heads", num_attention_heads)
+    head_dim = getattr(cfg, "head_dim", hidden_size // num_attention_heads)
+    return {
+        "num_hidden_layers": int(num_hidden_layers),
+        "num_kv_heads": int(num_kv_heads),
+        "head_dim": int(head_dim),
+    }
+
+
+def find_benchmark_linear(model: torch.nn.Module, mode: str) -> tuple[str, torch.nn.Module]:
+    """选择最能代表当前 Phase 16 主线的线性层。
+
+    优先选 MLP 的 gate/up/down_proj；fp16 选 nn.Linear，W8A8 选 QuantLinear。
+    """
+    target_type = QuantLinear if mode == "w8a8" else nn.Linear
+    candidates: list[tuple[str, torch.nn.Module]] = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(module, target_type)
+    ]
+    if not candidates:
+        raise RuntimeError(f"未找到适合 mode={mode!r} 的 benchmark linear 模块")
+
+    preferred_suffixes = ("gate_proj", "up_proj", "down_proj")
+    for suffix in preferred_suffixes:
+        for name, module in candidates:
+            if name.endswith(suffix):
+                return name, module
+    return candidates[0]
+
+
+def run_linear_sweep(
+    runner: ModelRunner,
+    mode: str,
+    warmup_iters: int = 10,
+    bench_iters: int = 50,
+    sweep_rows: Optional[list[int]] = None,
+) -> dict:
+    """对单个代表性线性层做 M-sweep，回答 _int_mm 何时才会命中。"""
+    if sweep_rows is None:
+        sweep_rows = build_linear_sweep_rows()
+
+    layer_name, module = find_benchmark_linear(runner.model, mode)
+    dtype = {
+        "float16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "float32": torch.float32,
+    }[runner.config.dtype]
+    device = runner.config.device
+    rows_results = []
+
+    for rows in sweep_rows:
+        x = torch.randn(rows, module.in_features, device=device, dtype=dtype)
+        with torch.inference_mode():
+            if mode == "w8a8":
+                QuantLinear.reset_runtime_stats()
+            for _ in range(warmup_iters):
+                _ = module(x)
+            _sync_cuda()
+            if mode == "w8a8":
+                QuantLinear.reset_runtime_stats()
+            t0 = time.perf_counter()
+            for _ in range(bench_iters):
+                _ = module(x)
+            _sync_cuda()
+            t1 = time.perf_counter()
+
+        quant_stats = QuantLinear.get_runtime_stats() if mode == "w8a8" else None
+        rows_results.append(
+            {
+                "rows": rows,
+                "latency_ms": 1000.0 * (t1 - t0) / bench_iters,
+                "quant_stats": quant_stats,
+            }
+        )
+
+    return {
+        "mode": mode,
+        "layer_name": layer_name,
+        "in_features": module.in_features,
+        "out_features": module.out_features,
+        "rows": rows_results,
+    }
+
+
+def build_runner(
     model_path: str,
     mode: str,
     batch_size: int,
-    max_new_tokens: int,
     num_gpu_blocks: int = 200,
-    warmup_iters: int = 2,
-    bench_iters: int = 5,
-    reference_token_ids: Optional[list[list[int]]] = None,
-) -> dict:
-    """运行单次 benchmark，返回结果字典。
-
-    Args:
-        reference_token_ids: fp16 模式的参考 token 序列，用于 W8A8 token match 计算。
-                             如果 mode == "fp16"，传 None；W8A8 模式传 fp16 的 token id 列表。
-    """
-    # 构建最小 EngineConfig
+) -> tuple[EngineConfig, KVCacheManager, ModelRunner]:
+    """构建用于 engine_compare 与 linear_sweep 共享的 runner。"""
+    geometry = infer_model_geometry(model_path)
     cfg = EngineConfig(
         model_name=model_path,
         device="cuda:0",
@@ -151,84 +277,121 @@ def run_benchmark(
         max_model_len=512,
         block_size=256,
         num_gpu_blocks=num_gpu_blocks,
-        # 1.5B 参数
-        num_hidden_layers=28,
-        num_kv_heads=2,
-        head_dim=128,
+        num_hidden_layers=geometry["num_hidden_layers"],
+        num_kv_heads=geometry["num_kv_heads"],
+        head_dim=geometry["head_dim"],
         quant_mode="w8a8" if mode == "w8a8" else "",
     )
 
     kv_cache = KVCacheManager(cfg)
     runner = ModelRunner(cfg, kv_cache)
+    return cfg, kv_cache, runner
 
+
+def run_benchmark(
+    runner: ModelRunner,
+    kv_cache: KVCacheManager,
+    mode: str,
+    batch_size: int,
+    max_new_tokens: int,
+    warmup_iters: int = 2,
+    bench_iters: int = 5,
+    reference_token_ids: Optional[list[list[int]]] = None,
+) -> dict:
+    """运行 engine compare benchmark，返回结果字典。"""
     weight_mem_mb = measure_weight_memory(runner.model)
-
-    # 准备 prompt
-    prompts = PROMPTS[:batch_size]
+    prompt_batches = build_prompt_batches(batch_size)
+    prompt_count = sum(len(prompt_batch) for prompt_batch in prompt_batches)
 
     def run_one_batch() -> dict:
         params = SamplingParams(max_new_tokens=max_new_tokens, temperature=0.0)
-        states = []
-        for i, p in enumerate(prompts):
-            token_ids = runner.tokenizer.encode(p, add_special_tokens=True)
-            req = Request(request_id=f"r{i}", prompt=p, sampling_params=params)
-            st = RequestState(request=req, prompt_token_ids=token_ids)
-            states.append(st)
+        prefill_total = 0.0
+        decode_total = 0.0
+        generated_tokens_total = 0
+        decode_generated_tokens_total = 0
+        prefill_quant_stats_total = None
+        decode_quant_stats_total = None
+        output_token_ids_total: list[list[int]] = []
+        output_texts_total: list[str] = []
 
-        # 分配 KV 块（必须在 prefill 前调用）
-        for st in states:
-            kv_cache.init_request(st)
+        for batch_idx, prompt_batch in enumerate(prompt_batches):
+            states: list[RequestState] = []
+            try:
+                for prompt_idx, prompt in enumerate(prompt_batch):
+                    token_ids = runner.tokenizer.encode(prompt, add_special_tokens=True)
+                    req = Request(
+                        request_id=f"b{batch_idx}_r{prompt_idx}",
+                        prompt=prompt,
+                        sampling_params=params,
+                    )
+                    st = RequestState(request=req, prompt_token_ids=token_ids)
+                    states.append(st)
 
-        prefill_quant_stats = None
-        decode_quant_stats = None
+                for st in states:
+                    kv_cache.init_request(st)
 
-        if mode == "w8a8":
-            QuantLinear.reset_runtime_stats()
-        _sync_cuda()
-        t_prefill_start = time.perf_counter()
-        runner.prefill(states)
-        _sync_cuda()
-        t_prefill_end = time.perf_counter()
-        if mode == "w8a8":
-            prefill_quant_stats = QuantLinear.get_runtime_stats()
-            QuantLinear.reset_runtime_stats()
+                batch_prefill_quant_stats = None
+                batch_decode_quant_stats = None
 
-        # decode 循环
-        active = [s for s in states if not s.finished]
-        _sync_cuda()
-        t_decode_start = time.perf_counter()
-        for _ in range(max_new_tokens - 1):
-            if not active:
-                break
-            runner.decode_batch(active)
-            active = [s for s in active if not s.finished]
-        _sync_cuda()
-        t_decode_end = time.perf_counter()
-        if mode == "w8a8":
-            decode_quant_stats = QuantLinear.get_runtime_stats()
+                if mode == "w8a8":
+                    QuantLinear.reset_runtime_stats()
+                _sync_cuda()
+                t_prefill_start = time.perf_counter()
+                runner.prefill(states)
+                _sync_cuda()
+                t_prefill_end = time.perf_counter()
+                if mode == "w8a8":
+                    batch_prefill_quant_stats = QuantLinear.get_runtime_stats()
+                    prefill_quant_stats_total = _accumulate_quant_stats(
+                        prefill_quant_stats_total,
+                        batch_prefill_quant_stats,
+                    )
+                    QuantLinear.reset_runtime_stats()
 
-        output_token_ids = [list(st.generated_token_ids) for st in states]
-        output_texts = [
-            runner.tokenizer.decode(token_ids, skip_special_tokens=True)
-            for token_ids in output_token_ids
-        ]
-        total_generated_tokens = sum(len(token_ids) for token_ids in output_token_ids)
-        decode_generated_tokens = sum(max(len(token_ids) - 1, 0) for token_ids in output_token_ids)
+                active = [s for s in states if not s.finished]
+                _sync_cuda()
+                t_decode_start = time.perf_counter()
+                for _ in range(max_new_tokens - 1):
+                    if not active:
+                        break
+                    runner.decode_batch(active)
+                    active = [s for s in active if not s.finished]
+                _sync_cuda()
+                t_decode_end = time.perf_counter()
+                if mode == "w8a8":
+                    batch_decode_quant_stats = QuantLinear.get_runtime_stats()
+                    decode_quant_stats_total = _accumulate_quant_stats(
+                        decode_quant_stats_total,
+                        batch_decode_quant_stats,
+                    )
 
-        # 释放 KV 块
-        for st in states:
-            kv_cache.free_request(st)
+                output_token_ids = [list(st.generated_token_ids) for st in states]
+                output_texts = [
+                    runner.tokenizer.decode(token_ids, skip_special_tokens=True)
+                    for token_ids in output_token_ids
+                ]
+                generated_tokens_total += sum(len(token_ids) for token_ids in output_token_ids)
+                decode_generated_tokens_total += sum(
+                    max(len(token_ids) - 1, 0) for token_ids in output_token_ids
+                )
+                output_token_ids_total.extend(output_token_ids)
+                output_texts_total.extend(output_texts)
+                prefill_total += t_prefill_end - t_prefill_start
+                decode_total += t_decode_end - t_decode_start
+            finally:
+                for st in states:
+                    kv_cache.free_request(st)
 
         return {
-            "texts": output_texts,
-            "token_ids": output_token_ids,
-            "prefill_s": t_prefill_end - t_prefill_start,
-            "decode_s": t_decode_end - t_decode_start,
-            "e2e_s": (t_prefill_end - t_prefill_start) + (t_decode_end - t_decode_start),
-            "generated_tokens": total_generated_tokens,
-            "decode_generated_tokens": decode_generated_tokens,
-            "prefill_quant_stats": prefill_quant_stats,
-            "decode_quant_stats": decode_quant_stats,
+            "texts": output_texts_total,
+            "token_ids": output_token_ids_total,
+            "prefill_s": prefill_total,
+            "decode_s": decode_total,
+            "e2e_s": prefill_total + decode_total,
+            "generated_tokens": generated_tokens_total,
+            "decode_generated_tokens": decode_generated_tokens_total,
+            "prefill_quant_stats": prefill_quant_stats_total,
+            "decode_quant_stats": decode_quant_stats_total,
         }
 
     # warmup
@@ -293,9 +456,12 @@ def run_benchmark(
     result = {
         "mode": mode,
         "batch_size": batch_size,
+        "prompt_count": prompt_count,
+        "num_prompt_batches": len(prompt_batches),
         "max_new_tokens": max_new_tokens,
         "weight_mem_mb": weight_mem_mb,
-        "avg_prefill_ms": 1000.0 * total_prefill_s / bench_iters,
+        "avg_prefill_ms": 1000.0 * total_prefill_s / (bench_iters * len(prompt_batches)),
+        "eval_prefill_ms": 1000.0 * total_prefill_s / bench_iters,
         "decode_tps": decode_throughput,
         "decode_tpot_ms": decode_tpot_ms,
         "e2e_tps": e2e_throughput,
@@ -315,9 +481,11 @@ def print_result(r: dict) -> None:
     print(f"\n{'='*50}")
     print(f"Mode          : {mode}")
     print(f"Batch size    : {r['batch_size']}")
+    print(f"Prompt count  : {r['prompt_count']} ({r['num_prompt_batches']} engine batches)")
     print(f"Max new tokens: {r['max_new_tokens']}")
     print(f"Weight memory : {r['weight_mem_mb']:.1f} MB")
-    print(f"Avg prefill   : {r['avg_prefill_ms']:.2f} ms/batch")
+    print(f"Avg prefill   : {r['avg_prefill_ms']:.2f} ms/engine batch")
+    print(f"Eval prefill  : {r['eval_prefill_ms']:.2f} ms/full prompt set")
     if r["decode_tps"] is not None:
         print(f"Decode TPS    : {r['decode_tps']:.1f} tokens/s")
         print(f"Decode TPOT   : {r['decode_tpot_ms']:.2f} ms/token")
@@ -369,6 +537,44 @@ def print_comparison(fp16: dict, w8a8: dict) -> None:
             print(f"  Decode 量化路径: {_format_quant_stats(w8a8['decode_quant_stats'])}")
 
 
+def print_linear_sweep(result: dict) -> None:
+    """输出单模式 linear sweep 表。"""
+    print("\n" + "=" * 60)
+    print(f"Linear Sweep ({result['mode'].upper()})")
+    print("=" * 60)
+    print(f"Layer         : {result['layer_name']}")
+    print(f"Shape         : {result['in_features']} -> {result['out_features']}")
+    print(f"{'M(rows)':<10} {'Latency(ms)':>14} {'Quant Path':>28}")
+    print("-" * 60)
+    for row in result["rows"]:
+        print(
+            f"{row['rows']:<10} {row['latency_ms']:>14.4f} "
+            f"{format_linear_quant_stats(row['quant_stats']):>28}"
+        )
+
+
+def print_linear_sweep_comparison(fp16: dict, w8a8: dict) -> None:
+    """输出 fp16 vs W8A8 的 linear sweep 对比。"""
+    fp16_rows = {row["rows"]: row for row in fp16["rows"]}
+    w8a8_rows = {row["rows"]: row for row in w8a8["rows"]}
+
+    print("\n" + "=" * 72)
+    print("Linear Sweep Compare")
+    print("=" * 72)
+    print(f"Layer         : {fp16['layer_name']} / {w8a8['layer_name']}")
+    print(f"Shape         : {fp16['in_features']} -> {fp16['out_features']}")
+    print(f"{'M(rows)':<10} {'fp16(ms)':>12} {'W8A8(ms)':>12} {'比值':>10} {'W8A8 Path':>22}")
+    print("-" * 72)
+    for rows in sorted(fp16_rows):
+        fp16_row = fp16_rows[rows]
+        w8a8_row = w8a8_rows[rows]
+        ratio = w8a8_row["latency_ms"] / fp16_row["latency_ms"]
+        print(
+            f"{rows:<10} {fp16_row['latency_ms']:>12.4f} {w8a8_row['latency_ms']:>12.4f} "
+            f"{ratio:>10.3f}× {format_linear_quant_stats(w8a8_row['quant_stats']):>22}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(description="W8A8 量化 benchmark")
     parser.add_argument("--model", required=True, help="本地模型路径")
@@ -376,39 +582,73 @@ def main():
                         help="量化模式（单模式运行时使用）")
     parser.add_argument("--compare", action="store_true",
                         help="同时运行 fp16 和 W8A8 并输出对比表")
-    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--batch-size", type=int, default=4,
+                        help="每次 engine batch 的请求数上限；固定 12 条 prompt 会按该大小拆批")
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--num-gpu-blocks", type=int, default=200)
     parser.add_argument("--warmup-iters", type=int, default=2)
     parser.add_argument("--bench-iters", type=int, default=5)
+    parser.add_argument("--linear-warmup-iters", type=int, default=10)
+    parser.add_argument("--linear-bench-iters", type=int, default=50)
     args = parser.parse_args()
 
     if args.compare:
         print("运行 fp16 基线...")
+        _, fp16_kv, fp16_runner = build_runner(
+            args.model, "fp16", args.batch_size, args.num_gpu_blocks
+        )
         fp16_result = run_benchmark(
-            args.model, "fp16", args.batch_size, args.max_new_tokens,
-            args.num_gpu_blocks, args.warmup_iters, args.bench_iters,
+            fp16_runner, fp16_kv, "fp16", args.batch_size, args.max_new_tokens,
+            args.warmup_iters, args.bench_iters,
         )
         print_result(fp16_result)
+        fp16_linear = run_linear_sweep(
+            fp16_runner,
+            "fp16",
+            warmup_iters=args.linear_warmup_iters,
+            bench_iters=args.linear_bench_iters,
+        )
 
         # 清理 GPU 显存
+        del fp16_runner, fp16_kv
         gc.collect()
+        _sync_cuda()
         torch.cuda.empty_cache()
 
         print("\n运行 W8A8 量化...")
+        _, w8a8_kv, w8a8_runner = build_runner(
+            args.model, "w8a8", args.batch_size, args.num_gpu_blocks
+        )
         w8a8_result = run_benchmark(
-            args.model, "w8a8", args.batch_size, args.max_new_tokens,
-            args.num_gpu_blocks, args.warmup_iters, args.bench_iters,
+            w8a8_runner, w8a8_kv, "w8a8", args.batch_size, args.max_new_tokens,
+            args.warmup_iters, args.bench_iters,
             reference_token_ids=fp16_result["output_token_ids"],
         )
         print_result(w8a8_result)
+        w8a8_linear = run_linear_sweep(
+            w8a8_runner,
+            "w8a8",
+            warmup_iters=args.linear_warmup_iters,
+            bench_iters=args.linear_bench_iters,
+        )
         print_comparison(fp16_result, w8a8_result)
+        print_linear_sweep_comparison(fp16_linear, w8a8_linear)
     else:
+        _, kv_cache, runner = build_runner(
+            args.model, args.mode, args.batch_size, args.num_gpu_blocks
+        )
         result = run_benchmark(
-            args.model, args.mode, args.batch_size, args.max_new_tokens,
-            args.num_gpu_blocks, args.warmup_iters, args.bench_iters,
+            runner, kv_cache, args.mode, args.batch_size, args.max_new_tokens,
+            args.warmup_iters, args.bench_iters,
         )
         print_result(result)
+        linear_result = run_linear_sweep(
+            runner,
+            args.mode,
+            warmup_iters=args.linear_warmup_iters,
+            bench_iters=args.linear_bench_iters,
+        )
+        print_linear_sweep(linear_result)
 
 
 if __name__ == "__main__":

@@ -41,6 +41,15 @@ class TestQuantMode:
         assert QuantMode.W8A8.value == "w8a8"
         assert QuantMode.NONE.value == ""
 
+    def test_contract_summary(self):
+        contract = QuantLinear.get_contract()
+        assert contract["activation_granularity"] == "per_row"
+        assert contract["weight_granularity"] == "per_channel"
+        assert contract["int_mm_min_rows"] == 17
+        assert contract["min_param_size"] == 4096
+        assert contract["in_feat_align"] == 8
+        assert "q_proj" in contract["skip_suffixes"]
+
 
 # --------------------------------------------------------------------------- #
 # QuantLinear 形状验证
@@ -68,6 +77,17 @@ class TestQuantLinearShape:
         ql = self._make_qlinear(64, 128)
         assert ql.in_features == 64
         assert ql.out_features == 128
+
+    def test_quantize_activation_per_row_returns_column_scale(self):
+        x = torch.tensor([[1.0, 2.0], [10.0, 20.0]])
+        x_int8, scale_a = QuantLinear._quantize_activation_per_row(x)
+        assert x_int8.shape == x.shape
+        assert scale_a.shape == (2, 1)
+
+    def test_should_use_int_mm_threshold(self):
+        assert QuantLinear._should_use_int_mm("cuda", 17) is True
+        assert QuantLinear._should_use_int_mm("cuda", 16) is False
+        assert QuantLinear._should_use_int_mm("cpu", 64) is False
 
 
 # --------------------------------------------------------------------------- #
