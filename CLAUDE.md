@@ -21,6 +21,9 @@
 - **Speculative Decoding**（Phase 11，Qwen2.5-0.5B draft + 7B target，modified rejection sampling，acceptance_rate 55.85%）
 - **CUDA Graph**（Phase 12，decode_batch 静态捕获 + graph pool，1.5B bs=1 延迟 −28.9%）
 - **Flash Decoding / Split-K Attention**（Phase 12.5，Triton split-K kernel，1.5B seq=4096 延迟 3.31× vs triton_65，SM 利用率 9% → 103%）
+- **Tensor Parallelism**（Phase 13，真 TP，NCCL all-reduce，column/row parallel，Megatron-LM 风格权重切分）
+- **MLA（Multi-head Latent Attention）**（Phase 14，DeepSeek-V2/V3 架构，latent cache 压缩 56.25% vs GQA，矩阵吸收优化）
+- **PD 解耦（Disaggregated Prefill/Decode）**（Phase 15，同机双进程原型，KV 序列化传输，TTFT 三段分解：prefill 12.3ms / transfer≈14.7ms / decode 519ms）
 
 ## 当前状态
 
