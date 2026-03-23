@@ -43,3 +43,8 @@ include = ["mini_infer*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "strict"
+filterwarnings = [
+    "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
+    "ignore:builtin type SwigPyObject has no __module__ attribute:DeprecationWarning",
+]

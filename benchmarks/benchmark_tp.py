@@ -19,9 +19,9 @@ TP 模式需要通过 torchrun 启动（两种方式均支持）：
 测量口径说明：
   - throughput = total_tokens / wall_clock_seconds
   - peak_vram  = torch.cuda.max_memory_allocated() 在推理结束后测量
-  - all_reduce_ms（TP only）：通过注入计时 hook 测量每 forward step 的 all-reduce 总时间
   - 未测量 TTFT / TPOT（不接入 LLMEngine，不适用）
-  - warmup_runs=2（不计入），measure_runs=5（取平均）
+  - `--warmup` / `--runs` 可配置，默认 warmup=2、runs=5
+  - `--mode tp` 包含 mp.spawn + 模型加载开销，仅适合功能验证；真实 TP 吞吐请用 `--mode torchrun_tp`
 
 依赖：
   torch.distributed / NCCL（TP 模式），PPEngine（PP 模式），transformers
@@ -95,6 +95,9 @@ def _bench_single(
                     **inp,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
+                    temperature=1.0,
+                    top_p=1.0,
+                    top_k=50,
                     pad_token_id=tok.pad_token_id,
                 )
             texts.append(tok.decode(out[0, inp["input_ids"].shape[1]:], skip_special_tokens=True))
@@ -272,6 +275,9 @@ def _get_pp_generate(model_path: str, dtype: str, max_new_tokens: int):
                     **inp,
                     max_new_tokens=max_new_tokens,
                     do_sample=False,
+                    temperature=1.0,
+                    top_p=1.0,
+                    top_k=50,
                     pad_token_id=tok.pad_token_id,
                 )
             results.append(tok.decode(out[0, inp["input_ids"].shape[1]:], skip_special_tokens=True))
@@ -338,7 +344,7 @@ def main() -> None:
         print("  WARNING: timing includes process spawn + model load. Use --mode torchrun_tp for throughput.")
         r = _bench_tp(
             args.model, PROMPTS, args.max_new_tokens,
-            warmup=1, runs=3,  # mp.spawn 启动开销大，减少 runs
+            warmup=args.warmup, runs=args.runs,
             dtype=args.dtype,
         )
         results.append(r)

@@ -95,6 +95,9 @@ def test_paged_attention_matches_hf_greedy() -> None:
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
             do_sample=False,  # greedy
+            temperature=1.0,
+            top_p=1.0,
+            top_k=50,
         )
 
     # 只取新生成的 token（去掉 prompt 部分）

@@ -20,8 +20,12 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **CUDA Graph**：decode_batch 静态捕获 + replay，1.5B 模型 bs=1 延迟 −28.9%
 - **Flash Decoding / Split-K**：Triton split-K attention kernel，1.5B seq=4096 延迟 3.31× vs 标准 Triton kernel，SM 利用率 9% → 103%
 - **Tensor Parallelism**：Megatron-LM 风格，column/row parallel 权重切分 + NCCL all-reduce forward hook，TP=2 greedy 输出与单卡完全一致
+- **MLA（Multi-head Latent Attention）**：DeepSeek-V2/V3 架构，latent cache 压缩 56.25% vs GQA，矩阵吸收优化
+- **PD 解耦（Disaggregated Prefill/Decode）**：同机双进程原型，KV 序列化传输，TTFT 三段分解（prefill/transfer/decode）
+- **量化推理**（Phase 16，规划已完成，待实现）：W8A8 主线；FP8 / Triton INT8 为后续量化扩展
+- **MoE + Expert Parallelism**（Phase 17，规划中）：Top-K 路由 + all-to-all EP
 
-项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。
+项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。当前主线实现已完成到 Phase 15；Phase 16/17 仅保留规划，不计入当前代码实现面。
 
 **权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
 
@@ -70,7 +74,10 @@ async_engine.py     AsyncEngine：后台线程 step loop + asyncio.Queue（Phase
 server.py / serve.py  FastAPI HTTP server + CLI 启动（Phase 8/9）
 spec_engine.py      SpecEngine：draft + target 双模型 speculative decoding（Phase 11）
 replica_engine.py   ReplicaEngine：双卡数据并行
-tp_engine.py        TPEngine：HF Pipeline Parallel（测量用）
+tp_engine.py        TPEngine：真 Tensor Parallel（Phase 13，NCCL all-reduce）
+triton_flash_decode.py  Flash Decoding split-K kernel（Phase 12.5）
+mla_attention.py    MLA 三种实现（Phase 14）
+pd_engine.py / pd_worker.py  PD 解耦入口与 worker（Phase 15）
 ```
 
 详细架构说明、关键步骤和状态机参见 `CLAUDE.md`。
@@ -254,14 +261,21 @@ conda run -n ai-infra python -m pytest tests/test_flash_decode.py -v
 
 # Tensor Parallel（Phase 13）
 ```bash
+# TP benchmark 主要开发模型是 1.5B；不要复用上文 7B 的 MODEL 变量
+export TP_MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+export HF_HUB_OFFLINE=1
+
 # 单卡 baseline
-conda run -n ai-infra python benchmarks/benchmark_tp.py --mode single
+conda run -n ai-infra python benchmarks/benchmark_tp.py --model $TP_MODEL --mode single
 
 # Pipeline Parallel（HF device_map=balanced）
-conda run -n ai-infra python benchmarks/benchmark_tp.py --mode pp
+conda run -n ai-infra python benchmarks/benchmark_tp.py --model $TP_MODEL --mode pp
+
+# TP 功能验证（mp.spawn，计时包含进程启动 + 模型加载，不作为最终吞吐口径）
+conda run -n ai-infra python benchmarks/benchmark_tp.py --model $TP_MODEL --mode tp
 
 # Tensor Parallel TP=2（torchrun，真实 NCCL 通信）
-conda run -n ai-infra torchrun --nproc_per_node 2 benchmarks/benchmark_tp.py --mode torchrun_tp
+conda run -n ai-infra torchrun --nproc_per_node 2 benchmarks/benchmark_tp.py --model $TP_MODEL --mode torchrun_tp
 
 # TP 正确性测试（dry_run，无需 GPU）
 conda run -n ai-infra python -m pytest tests/test_tp_engine.py -v
@@ -297,7 +311,7 @@ TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 conda run -n ai-infra python bench
 conda run -n ai-infra python -m pytest tests/test_pd_disagg.py -v
 ```
 
-### 测试命令（大部分无需 GPU）
+### 测试命令（多数无需 GPU；最后一项需要真实 GPU）
 
 ```bash
 # 基础测试
@@ -344,6 +358,8 @@ mini_infer/              核心推理代码
   tp_engine.py           TPEngine：真 Tensor Parallel 引擎（Phase 13，mp.spawn，重写自旧 PP 别名）
   tp_model_runner.py     TensorParallelModelRunner：权重切分 + all-reduce hook（Phase 13）
   mla_attention.py       MLA 注意力三种实现（Phase 14：MLAAttentionNaive / MLAAttentionLatentCache / MLAAttentionAbsorbed）
+  pd_engine.py           PDEngine：PD 解耦入口（Phase 15）
+  pd_worker.py           PrefillWorker / DecodeWorker + KV 传输辅助（Phase 15）
   triton_attn.py         Triton decode attention kernel（Phase 6.5，实验性）
   triton_flash_decode.py Flash Decoding split-K kernel（Phase 12.5，实验性，dense KV）
   spec_engine.py         SpecEngine：Speculative Decoding 引擎（Phase 11，draft+target 双模型）
@@ -366,7 +382,7 @@ benchmarks/
   benchmark_spec.py      Phase 11 Speculative Decoding benchmark（acceptance_rate / speedup 对比）
   benchmark_cuda_graph.py  Phase 12 CUDA Graph benchmark（eager vs graph，逐 batch_size 延迟对比）
   benchmark_flash_decode.py Phase 12.5 Flash Decoding benchmark（seq_len sweep，split-K vs triton_65 vs flash_attn）
-  benchmark_tp.py        Phase 13 Tensor Parallel benchmark（single/pp/torchrun_tp 吞吐 + VRAM 对比）
+  benchmark_tp.py        Phase 13 Tensor Parallel benchmark（single/pp/tp/torchrun_tp；其中 tp 仅用于功能验证）
   benchmark_mla.py       Phase 14 MLA benchmark（理论 KV cache 对比 / 真实显存 / 三种实现延迟）
   benchmark_pd_disagg.py Phase 15 PD 解耦 benchmark（理论 KV 大小 / 端到端正确性 / TTFT 三段分解）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
@@ -385,6 +401,7 @@ tests/
   test_cuda_graph.py       Phase 12 CUDA Graph 测试（dry_run：graph pool 为空时降级、_find_padded_bs 边界）
   test_flash_decode.py     Phase 12.5 Flash Decoding 正确性测试（21 tests：GQA、empty split、非整除 seq_len）
   test_tp_engine.py        Phase 13 Tensor Parallel 测试（dry_run，13 tests：col/row shard、数学等价、attn 属性、mock all-reduce）
+  test_mla_attention.py    Phase 14 MLA 测试（CPU + GPU，latent cache 大小和数学等价）
   test_pd_disagg.py        Phase 15 PD 解耦测试（dry_run + GPU，7 tests：KVPayload/Queue/extract/rebuild/engine）
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
@@ -417,5 +434,10 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce；1.5B TP=2 正确性验证通过，tp=2 76.5 tok/s vs single 98.0）| ✅ 完成 |
 | Phase 14 | MLA（Multi-head Latent Attention，DeepSeek 架构；latent cache 56.25% vs GQA，10 tests pass）| ✅ 完成 |
 | Phase 15 | PD 解耦（同机双进程原型；greedy 输出一致，TTFT 三段分解：prefill 12.3ms/transfer≈14.7ms/decode 519ms；1.19× overhead vs unified）| ✅ 完成 |
+
+下一阶段：
+
+- Phase 16：量化推理（W8A8 主线规划已完成，待实现）
+- Phase 17：MoE + Expert Parallelism（规划中）
 
 后续阶段验收口径详见 `CLAUDE.md`。
