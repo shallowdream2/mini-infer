@@ -1,4 +1,4 @@
-"""Phase 17-19：2 卡 Expert Parallel 引擎原型。
+"""Phase 17-20：2 卡 Expert Parallel 引擎原型。
 
 这个文件复用 Phase 13 的 `mp.spawn + file:// rendezvous` 约定，
 把 `EPMoELayer` 接成可直接运行的 2 卡功能原型。Phase 18 开始 worker
@@ -6,6 +6,8 @@
 正式 benchmark 配置下 `mp.spawn` 因大体积 tensor 传参触发 `fds_to_keep`
 失败，rank-local shard 会先落到临时文件，再由各 worker 按 rank 读取。
 Phase 19 新增 `comm_mode`，用于在 `padded` 与 `packed` EP 通信路径之间切换。
+Phase 20 继续把 packed 路径的 worker-side control plane 收敛成显式 helper，并在
+benchmark 结果里单独暴露 split-size 控制面成本。
 """
 
 from __future__ import annotations
@@ -19,7 +21,13 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from .moe_layer import EPMoELayer, MoELayer, shard_moe_state_dict, _validate_comm_mode
+from .moe_layer import (
+    EPMoELayer,
+    MoELayer,
+    build_packed_control_plane,
+    shard_moe_state_dict,
+    _validate_comm_mode,
+)
 
 
 _DTYPE_MAP = {
@@ -27,6 +35,29 @@ _DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
+
+
+def _prepare_packed_control_plane(
+    packed_send_counts: torch.Tensor,
+    ep_size: int,
+    rank: int,
+    src_rank: int,
+    device: int | None = None,
+) -> tuple[object, float]:
+    """把 broadcast 后的 send-counts 收敛成 worker 可直接使用的 packed control plane。"""
+    # 先等 source-rank router/dispatch 和 send-count broadcast 完成，再单独计量
+    # GPU -> CPU 的 send-count 读回与 Python split-size helper 本身。
+    if device is not None:
+        torch.cuda.synchronize(device)
+    start_time = time.perf_counter()
+    packed_send_counts_cpu = packed_send_counts.cpu().tolist()
+    control_plane = build_packed_control_plane(
+        send_counts_cpu=packed_send_counts_cpu,
+        world_size=ep_size,
+        rank=rank,
+        src_rank=src_rank,
+    )
+    return control_plane, time.perf_counter() - start_time
 
 
 def _rank_state_dict_path(rank_state_dict_dir: str, rank: int) -> str:
@@ -104,6 +135,7 @@ def _ep_worker(
 
         def _forward_once(return_aux: bool):
             packed_forward_kwargs: dict[str, object] = {}
+            control_plane_elapsed_s = 0.0
             if comm_mode == "packed":
                 packed_send_counts = torch.zeros(ep_size, dtype=torch.int64, device=device)
                 packed_source_context = None
@@ -115,15 +147,25 @@ def _ep_worker(
                         packed_source_context.layout.send_counts.to(device=device, dtype=torch.int64)
                     )
                 dist.broadcast(packed_send_counts, src=src_rank, group=None)
+                packed_control_plane, control_plane_elapsed_s = _prepare_packed_control_plane(
+                    packed_send_counts=packed_send_counts,
+                    ep_size=ep_size,
+                    rank=rank,
+                    src_rank=src_rank,
+                    device=rank,
+                )
                 packed_forward_kwargs = {
-                    "packed_send_counts_cpu": packed_send_counts.cpu().tolist(),
                     "packed_source_context": packed_source_context,
+                    "packed_control_plane": packed_control_plane,
                 }
-            return layer(
-                hidden_states,
-                return_aux=return_aux,
-                num_tokens=num_tokens,
-                **packed_forward_kwargs,
+            return (
+                layer(
+                    hidden_states,
+                    return_aux=return_aux,
+                    num_tokens=num_tokens,
+                    **packed_forward_kwargs,
+                ),
+                control_plane_elapsed_s,
             )
 
         with torch.no_grad():
@@ -137,8 +179,11 @@ def _ep_worker(
                 start_time = time.perf_counter()
 
             result = None
+            control_plane_elapsed_local_s = 0.0
             for _ in range(runs):
-                result = _forward_once(return_aux=True)
+                result, control_plane_elapsed_s = _forward_once(return_aux=True)
+                if measure_steady_state and comm_mode == "packed":
+                    control_plane_elapsed_local_s += control_plane_elapsed_s
 
             dist.barrier()
             elapsed_s = None
@@ -146,6 +191,12 @@ def _ep_worker(
                 torch.cuda.synchronize(rank)
                 assert start_time is not None
                 elapsed_s = time.perf_counter() - start_time
+
+        control_plane_elapsed_s = 0.0
+        if measure_steady_state and comm_mode == "packed":
+            control_plane_elapsed = torch.tensor(control_plane_elapsed_local_s, dtype=torch.float64, device=device)
+            dist.all_reduce(control_plane_elapsed, op=dist.ReduceOp.MAX, group=None)
+            control_plane_elapsed_s = float(control_plane_elapsed.item())
 
         if rank == src_rank:
             assert isinstance(result, tuple)
@@ -158,6 +209,7 @@ def _ep_worker(
                     "expert_loads": aux.routing_stats.expert_loads.cpu(),
                     "expert_score_sums": aux.routing_stats.expert_score_sums.cpu(),
                     "elapsed_s": elapsed_s,
+                    "control_plane_elapsed_s": control_plane_elapsed_s,
                     "warmup": warmup,
                     "runs": runs,
                 },

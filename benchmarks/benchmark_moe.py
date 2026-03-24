@@ -1,4 +1,4 @@
-"""Phase 17-19：synthetic MoE / Expert Parallel benchmark。
+"""Phase 17-20：synthetic MoE / Expert Parallel benchmark。
 
 对比对象：
 - dense `MoELayer`
@@ -20,6 +20,7 @@
   - ideal EP hidden-state bytes（按真实 token 副本数估算）
   - current padded prototype bytes（按当前 `all_to_all_single` fixed chunk 实现估算）
   - Phase 19 packed bytes（按 exact split-size hidden-state payload 估算）
+- Phase 20 继续显式输出 packed control-plane 指标（`control_plane_ms` / `control_plane_share`）
 - `--dry-run` 只验证参数构造、通信量公式和 benchmark 主流程
 """
 
@@ -174,9 +175,13 @@ def build_comm_summary(
             "hidden-state bytes only, expert-id/valid metadata excluded"
         ),
         "ep_packed_impl_note": (
-            "Phase 19 comm_mode=packed uses exact split-size all_to_all_single; "
+            "Phase 20 comm_mode=packed uses exact split-size all_to_all_single; "
             "hidden-state bytes only, expert-id/control-plane metadata excluded; "
-            "split sizes require host-side Python lists"
+            "benchmark additionally reports control_plane_ms/control_plane_share"
+        ),
+        "ep_packed_control_plane_note": (
+            "control_plane_ms/share measure worker-side packed split-size control plane only; "
+            "source-rank router/dispatch GPU work remains included in packed throughput"
         ),
     }
 
@@ -304,6 +309,7 @@ def run_ep_benchmark(
         runs=args.runs,
     )
     elapsed = float(bench["elapsed_s"])
+    control_plane_elapsed_s = float(bench.get("control_plane_elapsed_s", 0.0) or 0.0)
 
     num_tokens = args.batch_size * args.seq_len * args.runs
     throughput = num_tokens / elapsed
@@ -313,6 +319,12 @@ def run_ep_benchmark(
     )
     if selected_comm_mode == "packed":
         note += "; includes source-rank router/dispatch + split-size control plane"
+        control_plane_note = (
+            "per-run packed control plane = GPU send-count sync to host + PackedControlPlane split-size helper; "
+            "source-rank router/dispatch GPU work excluded from this metric"
+        )
+    else:
+        control_plane_note = "comm_mode=padded has no packed split-size control plane"
     result = {
         "mode": f"ep_{selected_comm_mode}",
         "comm_mode": selected_comm_mode,
@@ -323,6 +335,9 @@ def run_ep_benchmark(
         "expert_loads": bench["expert_loads"],
         "expert_score_sums": bench["expert_score_sums"],
         "elapsed_s": elapsed,
+        "control_plane_ms": 1000.0 * control_plane_elapsed_s / args.runs if args.runs > 0 else 0.0,
+        "control_plane_share": control_plane_elapsed_s / elapsed if elapsed > 0 else 0.0,
+        "control_plane_note": control_plane_note,
     }
     return result
 
@@ -394,7 +409,7 @@ def run_dry_run(args: argparse.Namespace) -> dict[str, object]:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Phase 19 non-padded EP communication benchmark")
+    parser = argparse.ArgumentParser(description="Phase 20 EP control-plane benchmark")
     parser.add_argument("--mode", choices=["dense", "ep"], default="dense")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -442,6 +457,7 @@ def main() -> None:
         print(f"shard_ratio={params['shard_ratio']:.4f}")
         print(f"ep_padded_impl_note={comm['ep_padded_impl_note']}")
         print(f"ep_packed_impl_note={comm['ep_packed_impl_note']}")
+        print(f"ep_packed_control_plane_note={comm['ep_packed_control_plane_note']}")
         print("dry_run=ok")
         return
 
@@ -471,6 +487,11 @@ def main() -> None:
         print(f"dense_note={dense['note']}")
         print(f"ep_padded_note={ep_padded['note']}")
         print(f"ep_packed_note={ep_packed['note']}")
+        print(f"ep_padded_control_plane_ms={ep_padded['control_plane_ms']:.4f}")
+        print(f"ep_padded_control_plane_share={ep_padded['control_plane_share']:.6f}")
+        print(f"ep_packed_control_plane_ms={ep_packed['control_plane_ms']:.4f}")
+        print(f"ep_packed_control_plane_share={ep_packed['control_plane_share']:.6f}")
+        print(f"ep_packed_control_plane_note={ep_packed['control_plane_note']}")
         print(f"ep_padded_send_counts={ep_padded['send_counts'].tolist()}")
         print(f"ep_packed_send_counts={ep_packed['send_counts'].tolist()}")
         print(f"dense_expert_loads={dense['expert_loads'].tolist()}")
@@ -491,6 +512,12 @@ def main() -> None:
         print(f"=== MoE / EP benchmark ({result['mode']}) ===")
         print(f"throughput_tok_s={result['throughput_tok_s']:.2f}")
         print(f"note={result['note']}")
+        if "control_plane_ms" in result:
+            print(f"control_plane_ms={result['control_plane_ms']:.4f}")
+        if "control_plane_share" in result:
+            print(f"control_plane_share={result['control_plane_share']:.6f}")
+        if "control_plane_note" in result:
+            print(f"control_plane_note={result['control_plane_note']}")
         if "send_counts" in result:
             print(f"send_counts={result['send_counts'].tolist()}")
         if "expert_loads" in result:
@@ -511,6 +538,7 @@ def main() -> None:
     print(f"shard_ratio={param_summary['shard_ratio']:.4f}")
     print(f"ep_padded_impl_note={comm['ep_padded_impl_note']}")
     print(f"ep_packed_impl_note={comm['ep_packed_impl_note']}")
+    print(f"ep_packed_control_plane_note={comm['ep_packed_control_plane_note']}")
 
 
 if __name__ == "__main__":

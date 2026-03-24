@@ -1,9 +1,10 @@
-"""Phase 17-19 benchmark 口径测试。
+"""Phase 17-20 benchmark 口径测试。
 
 覆盖：
 - TP / EP 通信量公式
 - 参数量与 local shard 统计
 - padded / packed bytes 统计与输出结构
+- packed control-plane 指标与输出结构
 - synthetic hidden state 构造
 - benchmark dry-run 所需的参数构造 helper
 - dense benchmark 计时窗口与 source device 同步口径
@@ -84,6 +85,8 @@ def test_build_comm_summary_contains_formulas() -> None:
     assert summary["ep_packed_bytes_per_layer"] == summary["ep_ideal_bytes_per_layer"]
     assert "comm_mode=padded" in summary["ep_padded_impl_note"]
     assert "comm_mode=packed" in summary["ep_packed_impl_note"]
+    assert "control_plane_ms/control_plane_share" in summary["ep_packed_impl_note"]
+    assert "control_plane_ms/share" in summary["ep_packed_control_plane_note"]
 
 
 def test_build_param_summary_reports_local_shard_ratio() -> None:
@@ -208,6 +211,9 @@ def test_run_compare_benchmark_uses_shared_layer_and_inputs(monkeypatch) -> None
             "comm_mode": comm_mode,
             "throughput_tok_s": 20.0 if comm_mode == "padded" else 18.0,
             "note": f"ep_{comm_mode}",
+            "control_plane_ms": 0.0 if comm_mode == "padded" else 1.5,
+            "control_plane_share": 0.0 if comm_mode == "padded" else 0.1,
+            "control_plane_note": f"{comm_mode}_cp",
             "output": torch.tensor([[1.25]]) if comm_mode == "padded" else torch.tensor([[0.75]]),
             "send_counts": torch.tensor([2, 2]),
             "expert_loads": torch.tensor([1, 2]),
@@ -226,6 +232,39 @@ def test_run_compare_benchmark_uses_shared_layer_and_inputs(monkeypatch) -> None
     assert seen["dense_input_ptr"] == seen["padded_input_ptr"] == seen["packed_input_ptr"]
     assert result["max_abs_diff_padded"] == 0.25
     assert result["max_abs_diff_packed"] == 0.25
+
+
+def test_run_ep_benchmark_reports_control_plane_metrics(monkeypatch) -> None:
+    class _FakeEngine:
+        def benchmark_forward(self, hidden_states, warmup, runs):
+            assert hidden_states.shape == (2, 3, 8)
+            assert warmup == 1
+            assert runs == 2
+            return {
+                "elapsed_s": 0.5,
+                "control_plane_elapsed_s": 0.05,
+                "output": torch.tensor([[1.0]]),
+                "send_counts": torch.tensor([2, 2]),
+                "expert_loads": torch.tensor([2, 2]),
+                "expert_score_sums": torch.tensor([0.4, 0.6]),
+            }
+
+    monkeypatch.setattr(
+        benchmark_moe.EPEngine,
+        "from_moe_layer",
+        lambda *args, **kwargs: _FakeEngine(),
+    )
+
+    args = benchmark_moe.build_argparser().parse_args(
+        ["--batch-size", "2", "--seq-len", "3", "--hidden-size", "8", "--warmup", "1", "--runs", "2"]
+    )
+    result = benchmark_moe.run_ep_benchmark(args, comm_mode="packed")
+
+    assert result["mode"] == "ep_packed"
+    assert result["throughput_tok_s"] == 24.0
+    assert result["control_plane_ms"] == 25.0
+    assert result["control_plane_share"] == 0.1
+    assert "PackedControlPlane" in result["control_plane_note"]
 
 
 def test_run_dense_benchmark_times_only_gpu_work_on_selected_device(monkeypatch) -> None:

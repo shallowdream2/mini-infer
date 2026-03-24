@@ -1,4 +1,4 @@
-"""Phase 17-19 MoE 测试。
+"""Phase 17-20 MoE 测试。
 
 覆盖：
 - TopKRouter 的 top-k 范围和分数归一化
@@ -29,8 +29,10 @@ from mini_infer import EPEngine
 from mini_infer.moe_layer import (
     EPMoELayer,
     MoELayer,
+    PackedControlPlane,
     RouterOutput,
     TopKRouter,
+    build_packed_control_plane,
     build_dispatch_layout,
     shard_moe_state_dict,
     summarize_routing,
@@ -194,6 +196,33 @@ class TestDispatchAndEP:
         assert torch.equal(loaded_rank0["router.gate.weight"], dense.state_dict()["router.gate.weight"])
         assert torch.equal(loaded_rank1["router.gate.weight"], dense.state_dict()["router.gate.weight"])
 
+    def test_prepare_packed_control_plane_synchronizes_before_timing(self, monkeypatch):
+        events: list[tuple[str, float | int | None]] = []
+        perf_values = iter([1.0, 1.5])
+
+        monkeypatch.setattr(
+            ep_engine_mod.torch.cuda,
+            "synchronize",
+            lambda device=None: events.append(("sync", device)),
+        )
+        monkeypatch.setattr(
+            ep_engine_mod.time,
+            "perf_counter",
+            lambda: events.append(("perf", None)) or next(perf_values),
+        )
+
+        control_plane, elapsed = ep_engine_mod._prepare_packed_control_plane(
+            packed_send_counts=torch.tensor([3, 1], dtype=torch.int64),
+            ep_size=2,
+            rank=1,
+            src_rank=0,
+            device=1,
+        )
+
+        assert events == [("sync", 1), ("perf", None), ("perf", None)]
+        assert control_plane.send_counts_cpu == [3, 1]
+        assert elapsed == 0.5
+
     def test_dispatch_layout_groups_entries_by_rank(self):
         route = RouterOutput(
             expert_indices=torch.tensor([[0, 3], [1, 2]]),
@@ -206,6 +235,31 @@ class TestDispatchAndEP:
         assert torch.equal(layout.send_counts.cpu(), torch.tensor([2, 2]))
         assert torch.equal(layout.dest_ranks.cpu(), torch.tensor([0, 0, 1, 1]))
         assert torch.equal(layout.local_expert_ids.cpu(), torch.tensor([0, 1, 0, 1]))
+
+    def test_build_packed_control_plane_matches_rank_local_splits(self):
+        control_plane = build_packed_control_plane(
+            send_counts_cpu=[3, 1],
+            world_size=2,
+            rank=1,
+            src_rank=0,
+        )
+
+        assert isinstance(control_plane, PackedControlPlane)
+        assert control_plane.sender_splits == [0, 0]
+        assert control_plane.receiver_splits == [1, 0]
+        assert control_plane.return_sender_splits == [1, 0]
+        assert control_plane.return_receiver_splits == [0, 0]
+        assert control_plane.recv_count == 1
+        assert control_plane.recv_back_count == 0
+
+    def test_build_packed_control_plane_rejects_invalid_length(self):
+        with pytest.raises(ValueError, match="world_size"):
+            build_packed_control_plane(
+                send_counts_cpu=[1],
+                world_size=2,
+                rank=0,
+                src_rank=0,
+            )
 
     def test_dispatch_and_combine_recover_weighted_tokens(self):
         layer = EPMoELayer(hidden_size=2, intermediate_size=4, num_experts=4, top_k=2, ep_size=2)

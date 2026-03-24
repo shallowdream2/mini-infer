@@ -1,4 +1,4 @@
-"""Phase 17-19：synthetic MoE 层与 Expert Parallel 核心逻辑。
+"""Phase 17-20：synthetic MoE 层与 Expert Parallel 核心逻辑。
 
 这个文件提供两条路径：
 - `MoELayer`：单进程 dense 参考实现，作为数值 oracle
@@ -70,6 +70,19 @@ class PackedSourceContext:
     dispatched_x: torch.Tensor
 
 
+@dataclass
+class PackedControlPlane:
+    """packed EP 在 worker 侧构造的 split-size 控制面。"""
+
+    send_counts_cpu: list[int]
+    sender_splits: list[int]
+    receiver_splits: list[int]
+    return_sender_splits: list[int]
+    return_receiver_splits: list[int]
+    recv_count: int
+    recv_back_count: int
+
+
 def _flatten_tokens(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     """把 [B,S,H] 或 [T,H] 统一展平到 [N,H]。"""
     if x.ndim < 2:
@@ -90,6 +103,43 @@ def _validate_comm_mode(comm_mode: str) -> str:
     if comm_mode not in _COMM_MODES:
         raise ValueError(f"comm_mode 必须是 {_COMM_MODES} 之一，当前 {comm_mode!r}")
     return comm_mode
+
+
+def build_packed_control_plane(
+    send_counts_cpu: list[int],
+    world_size: int,
+    rank: int,
+    src_rank: int,
+) -> PackedControlPlane:
+    """把 packed send-counts 显式收敛成各 rank 所需的 split-size 信息。"""
+    if len(send_counts_cpu) != world_size:
+        raise ValueError(
+            f"send_counts_cpu 长度必须等于 world_size={world_size}，当前 {len(send_counts_cpu)}"
+        )
+    if src_rank < 0 or src_rank >= world_size:
+        raise ValueError(f"src_rank 必须落在 [0, world_size) 内，当前 src_rank={src_rank}, world_size={world_size}")
+    if rank < 0 or rank >= world_size:
+        raise ValueError(f"rank 必须落在 [0, world_size) 内，当前 rank={rank}, world_size={world_size}")
+
+    sender_splits = send_counts_cpu if rank == src_rank else [0] * world_size
+    receiver_splits = [0] * world_size
+    receiver_splits[src_rank] = send_counts_cpu[rank]
+    recv_count = send_counts_cpu[rank]
+
+    return_sender_splits = [0] * world_size
+    return_sender_splits[src_rank] = recv_count
+    return_receiver_splits = send_counts_cpu if rank == src_rank else [0] * world_size
+    recv_back_count = sum(send_counts_cpu) if rank == src_rank else 0
+
+    return PackedControlPlane(
+        send_counts_cpu=list(send_counts_cpu),
+        sender_splits=sender_splits,
+        receiver_splits=receiver_splits,
+        return_sender_splits=return_sender_splits,
+        return_receiver_splits=return_receiver_splits,
+        recv_count=recv_count,
+        recv_back_count=recv_back_count,
+    )
 
 
 def shard_moe_state_dict(
@@ -470,6 +520,7 @@ class EPMoELayer(nn.Module):
         return_aux: bool = False,
         packed_send_counts_cpu: Optional[list[int]] = None,
         packed_source_context: Optional[PackedSourceContext] = None,
+        packed_control_plane: Optional[PackedControlPlane] = None,
     ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
         if self.comm_mode == "packed":
             return self._forward_distributed_packed(
@@ -478,6 +529,7 @@ class EPMoELayer(nn.Module):
                 return_aux=return_aux,
                 packed_send_counts_cpu=packed_send_counts_cpu,
                 packed_source_context=packed_source_context,
+                packed_control_plane=packed_control_plane,
             )
         return self._forward_distributed_padded(x, num_tokens=num_tokens, return_aux=return_aux)
 
@@ -653,6 +705,7 @@ class EPMoELayer(nn.Module):
         return_aux: bool = False,
         packed_send_counts_cpu: Optional[list[int]] = None,
         packed_source_context: Optional[PackedSourceContext] = None,
+        packed_control_plane: Optional[PackedControlPlane] = None,
     ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
         if not dist.is_initialized():
             raise RuntimeError("EPMoELayer 的 distributed 路径要求已初始化 torch.distributed")
@@ -685,33 +738,31 @@ class EPMoELayer(nn.Module):
             send_hidden = packed_source_context.dispatched_x.contiguous()
             send_expert_ids = layout.expert_ids.contiguous()
 
-        if packed_send_counts_cpu is None:
-            raise ValueError("packed distributed 路径要求显式提供 packed_send_counts_cpu")
-        if len(packed_send_counts_cpu) != world_size:
-            raise ValueError(
-                f"packed_send_counts_cpu 长度必须等于 world_size={world_size}，当前 {len(packed_send_counts_cpu)}"
+        if packed_control_plane is None:
+            if packed_send_counts_cpu is None:
+                raise ValueError("packed distributed 路径要求显式提供 packed_send_counts_cpu 或 packed_control_plane")
+            packed_control_plane = build_packed_control_plane(
+                send_counts_cpu=packed_send_counts_cpu,
+                world_size=world_size,
+                rank=rank,
+                src_rank=self.src_rank,
             )
 
-        sender_splits = packed_send_counts_cpu if rank == self.src_rank else [0] * world_size
-        receiver_splits = [0] * world_size
-        receiver_splits[self.src_rank] = packed_send_counts_cpu[rank]
-        recv_count = packed_send_counts_cpu[rank]
-
-        recv_hidden = torch.empty((recv_count, self.hidden_size), dtype=hidden_dtype, device=device)
-        recv_expert_ids = torch.empty((recv_count,), dtype=torch.int64, device=device)
+        recv_hidden = torch.empty((packed_control_plane.recv_count, self.hidden_size), dtype=hidden_dtype, device=device)
+        recv_expert_ids = torch.empty((packed_control_plane.recv_count,), dtype=torch.int64, device=device)
 
         dist.all_to_all_single(
             recv_hidden,
             send_hidden,
-            output_split_sizes=receiver_splits,
-            input_split_sizes=sender_splits,
+            output_split_sizes=packed_control_plane.receiver_splits,
+            input_split_sizes=packed_control_plane.sender_splits,
             group=self.dist_group,
         )
         dist.all_to_all_single(
             recv_expert_ids,
             send_expert_ids,
-            output_split_sizes=receiver_splits,
-            input_split_sizes=sender_splits,
+            output_split_sizes=packed_control_plane.receiver_splits,
+            input_split_sizes=packed_control_plane.sender_splits,
             group=self.dist_group,
         )
 
@@ -721,17 +772,17 @@ class EPMoELayer(nn.Module):
             valid_expert_ids=self.local_expert_ids(rank),
         )
 
-        return_sender_splits = [0] * world_size
-        return_sender_splits[self.src_rank] = recv_count
-        return_receiver_splits = packed_send_counts_cpu if rank == self.src_rank else [0] * world_size
-        recv_back_count = sum(packed_send_counts_cpu) if rank == self.src_rank else 0
-        recv_back_hidden = torch.empty((recv_back_count, self.hidden_size), dtype=hidden_dtype, device=device)
+        recv_back_hidden = torch.empty(
+            (packed_control_plane.recv_back_count, self.hidden_size),
+            dtype=hidden_dtype,
+            device=device,
+        )
 
         dist.all_to_all_single(
             recv_back_hidden,
             local_outputs.contiguous(),
-            output_split_sizes=return_receiver_splits,
-            input_split_sizes=return_sender_splits,
+            output_split_sizes=packed_control_plane.return_receiver_splits,
+            input_split_sizes=packed_control_plane.return_sender_splits,
             group=self.dist_group,
         )
 
@@ -765,6 +816,7 @@ class EPMoELayer(nn.Module):
         num_tokens: Optional[int] = None,
         packed_send_counts_cpu: Optional[list[int]] = None,
         packed_source_context: Optional[PackedSourceContext] = None,
+        packed_control_plane: Optional[PackedControlPlane] = None,
     ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
         if self.dist_group is None and not dist.is_initialized():
             if x is None:
@@ -782,6 +834,7 @@ class EPMoELayer(nn.Module):
             return_aux=return_aux,
             packed_send_counts_cpu=packed_send_counts_cpu,
             packed_source_context=packed_source_context,
+            packed_control_plane=packed_control_plane,
         )
 
 
@@ -791,10 +844,12 @@ __all__ = [
     "EPMoELayer",
     "MoEFFNExpert",
     "MoELayer",
+    "PackedControlPlane",
     "PackedSourceContext",
     "RouterOutput",
     "RoutingStats",
     "TopKRouter",
+    "build_packed_control_plane",
     "build_dispatch_layout",
     "shard_moe_state_dict",
     "summarize_routing",
