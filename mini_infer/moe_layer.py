@@ -1,9 +1,10 @@
-"""Phase 17-18：synthetic MoE 层与 Expert Parallel 核心逻辑。
+"""Phase 17-19：synthetic MoE 层与 Expert Parallel 核心逻辑。
 
 这个文件提供两条路径：
 - `MoELayer`：单进程 dense 参考实现，作为数值 oracle
 - `EPMoELayer`：按 rank 只持有本地 expert shard，并通过 dispatch / gather
-  组织 all-to-all 所需的数据布局
+  组织 all-to-all 所需的数据布局；Phase 19 新增 `padded` / `packed`
+  两种通信模式，用于对比 prototype 与 non-padded expert dispatch
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+_COMM_MODES = {"padded", "packed"}
 
 
 @dataclass
@@ -57,6 +60,16 @@ class EPForwardAux:
     send_counts: torch.Tensor
 
 
+@dataclass
+class PackedSourceContext:
+    """packed EP source rank 的一次性预计算结果。"""
+
+    leading_shape: tuple[int, ...]
+    route: RouterOutput
+    layout: DispatchLayout
+    dispatched_x: torch.Tensor
+
+
 def _flatten_tokens(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     """把 [B,S,H] 或 [T,H] 统一展平到 [N,H]。"""
     if x.ndim < 2:
@@ -71,6 +84,12 @@ def _validate_ep_partition(num_experts: int, ep_size: int) -> int:
     if num_experts % ep_size != 0:
         raise ValueError(f"num_experts={num_experts} 必须能被 ep_size={ep_size} 整除")
     return num_experts // ep_size
+
+
+def _validate_comm_mode(comm_mode: str) -> str:
+    if comm_mode not in _COMM_MODES:
+        raise ValueError(f"comm_mode 必须是 {_COMM_MODES} 之一，当前 {comm_mode!r}")
+    return comm_mode
 
 
 def shard_moe_state_dict(
@@ -292,9 +311,10 @@ class EPMoELayer(nn.Module):
     """Expert Parallel MoE 层。
 
     Phase 18 开始，这里不再让每个 rank 持有完整 expert 列表，而是只实例化本 rank
-    负责的 local expert shard。router 仍完整复制；distributed 路径仍使用 padded
-    `all_to_all_single` + valid mask，避免在 per-layer forward 里引入 host sync。
-    benchmark 会显式区分理想 EP bytes、prototype bytes 与当前的权重分片收益。
+    负责的 local expert shard。Phase 19 在 distributed 路径上同时保留：
+    - `comm_mode="padded"`：fixed chunk `all_to_all_single` + valid mask
+    - `comm_mode="packed"`：exact split-size `all_to_all_single`
+    benchmark 会显式区分理想 EP bytes、padded prototype bytes 与 packed bytes。
     """
 
     def __init__(
@@ -308,6 +328,7 @@ class EPMoELayer(nn.Module):
         bias: bool = False,
         dist_group: Optional[dist.ProcessGroup] = None,
         src_rank: int = 0,
+        comm_mode: str = "padded",
     ) -> None:
         super().__init__()
         if src_rank < 0 or src_rank >= ep_size:
@@ -320,6 +341,7 @@ class EPMoELayer(nn.Module):
         self.rank = rank
         self.dist_group = dist_group
         self.src_rank = src_rank
+        self.comm_mode = _validate_comm_mode(comm_mode)
         self.experts_per_rank = _validate_ep_partition(num_experts, ep_size)
         self.local_expert_offset = self.rank * self.experts_per_rank
 
@@ -442,6 +464,36 @@ class EPMoELayer(nn.Module):
         )
 
     def _forward_distributed(
+        self,
+        x: Optional[torch.Tensor],
+        num_tokens: int,
+        return_aux: bool = False,
+        packed_send_counts_cpu: Optional[list[int]] = None,
+        packed_source_context: Optional[PackedSourceContext] = None,
+    ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
+        if self.comm_mode == "packed":
+            return self._forward_distributed_packed(
+                x,
+                num_tokens=num_tokens,
+                return_aux=return_aux,
+                packed_send_counts_cpu=packed_send_counts_cpu,
+                packed_source_context=packed_source_context,
+            )
+        return self._forward_distributed_padded(x, num_tokens=num_tokens, return_aux=return_aux)
+
+    def prepare_packed_source_context(self, x: torch.Tensor) -> PackedSourceContext:
+        """在 source rank 预计算 packed dispatch 所需的 route / layout / token 重排。"""
+        flat_x, leading_shape = _flatten_tokens(x)
+        route = self.router(flat_x)
+        dispatched_x, layout = self.dispatch_tokens(flat_x, route)
+        return PackedSourceContext(
+            leading_shape=leading_shape,
+            route=route,
+            layout=layout,
+            dispatched_x=dispatched_x,
+        )
+
+    def _forward_distributed_padded(
         self,
         x: Optional[torch.Tensor],
         num_tokens: int,
@@ -594,11 +646,125 @@ class EPMoELayer(nn.Module):
             send_counts=layout.send_counts,
         )
 
+    def _forward_distributed_packed(
+        self,
+        x: Optional[torch.Tensor],
+        num_tokens: int,
+        return_aux: bool = False,
+        packed_send_counts_cpu: Optional[list[int]] = None,
+        packed_source_context: Optional[PackedSourceContext] = None,
+    ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
+        if not dist.is_initialized():
+            raise RuntimeError("EPMoELayer 的 distributed 路径要求已初始化 torch.distributed")
+
+        world_size = dist.get_world_size(self.dist_group)
+        rank = dist.get_rank(self.dist_group)
+        if world_size != self.ep_size:
+            raise RuntimeError(f"dist world_size={world_size} 与 ep_size={self.ep_size} 不一致")
+
+        hidden_dtype = self.experts[0].gate_proj.weight.dtype
+        device = self.experts[0].gate_proj.weight.device
+        route = None
+        layout = None
+        leading_shape: tuple[int, ...] = ()
+
+        send_counts = torch.zeros(world_size, dtype=torch.int64, device=device)
+        send_hidden = torch.empty((0, self.hidden_size), dtype=hidden_dtype, device=device)
+        send_expert_ids = torch.empty((0,), dtype=torch.int64, device=device)
+
+        if rank == self.src_rank:
+            if packed_source_context is None:
+                if x is None:
+                    raise ValueError("source rank 的 EPMoELayer.forward 需要提供输入 x")
+                packed_source_context = self.prepare_packed_source_context(x)
+
+            leading_shape = packed_source_context.leading_shape
+            route = packed_source_context.route
+            layout = packed_source_context.layout
+            send_counts = layout.send_counts.to(device=device, dtype=torch.int64)
+            send_hidden = packed_source_context.dispatched_x.contiguous()
+            send_expert_ids = layout.expert_ids.contiguous()
+
+        if packed_send_counts_cpu is None:
+            raise ValueError("packed distributed 路径要求显式提供 packed_send_counts_cpu")
+        if len(packed_send_counts_cpu) != world_size:
+            raise ValueError(
+                f"packed_send_counts_cpu 长度必须等于 world_size={world_size}，当前 {len(packed_send_counts_cpu)}"
+            )
+
+        sender_splits = packed_send_counts_cpu if rank == self.src_rank else [0] * world_size
+        receiver_splits = [0] * world_size
+        receiver_splits[self.src_rank] = packed_send_counts_cpu[rank]
+        recv_count = packed_send_counts_cpu[rank]
+
+        recv_hidden = torch.empty((recv_count, self.hidden_size), dtype=hidden_dtype, device=device)
+        recv_expert_ids = torch.empty((recv_count,), dtype=torch.int64, device=device)
+
+        dist.all_to_all_single(
+            recv_hidden,
+            send_hidden,
+            output_split_sizes=receiver_splits,
+            input_split_sizes=sender_splits,
+            group=self.dist_group,
+        )
+        dist.all_to_all_single(
+            recv_expert_ids,
+            send_expert_ids,
+            output_split_sizes=receiver_splits,
+            input_split_sizes=sender_splits,
+            group=self.dist_group,
+        )
+
+        local_outputs = self._apply_experts(
+            dispatched_x=recv_hidden,
+            expert_ids=recv_expert_ids,
+            valid_expert_ids=self.local_expert_ids(rank),
+        )
+
+        return_sender_splits = [0] * world_size
+        return_sender_splits[self.src_rank] = recv_count
+        return_receiver_splits = packed_send_counts_cpu if rank == self.src_rank else [0] * world_size
+        recv_back_count = sum(packed_send_counts_cpu) if rank == self.src_rank else 0
+        recv_back_hidden = torch.empty((recv_back_count, self.hidden_size), dtype=hidden_dtype, device=device)
+
+        dist.all_to_all_single(
+            recv_back_hidden,
+            local_outputs.contiguous(),
+            output_split_sizes=return_receiver_splits,
+            input_split_sizes=return_sender_splits,
+            group=self.dist_group,
+        )
+
+        if rank != self.src_rank:
+            if not return_aux:
+                return None
+            return None, None
+
+        assert x is not None
+        assert route is not None and layout is not None
+        combined = self.combine_dispatched(
+            dispatched_outputs=recv_back_hidden,
+            layout=layout,
+            num_tokens=num_tokens,
+            dtype=x.dtype,
+            device=x.device,
+        )
+        output = combined.reshape(*leading_shape, self.hidden_size)
+        if not return_aux:
+            return output
+        return output, EPForwardAux(
+            route=route,
+            routing_stats=summarize_routing(route, self.num_experts),
+            send_counts=layout.send_counts,
+        )
+
     def forward(
         self,
         x: Optional[torch.Tensor],
         return_aux: bool = False,
         num_tokens: Optional[int] = None,
+        packed_send_counts_cpu: Optional[list[int]] = None,
+        packed_source_context: Optional[PackedSourceContext] = None,
     ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
         if self.dist_group is None and not dist.is_initialized():
             if x is None:
@@ -610,7 +776,13 @@ class EPMoELayer(nn.Module):
                 raise ValueError("distributed EPMoELayer.forward 在 x=None 时必须提供 num_tokens")
             flat_x, _ = _flatten_tokens(x)
             num_tokens = flat_x.shape[0]
-        return self._forward_distributed(x, num_tokens=num_tokens, return_aux=return_aux)
+        return self._forward_distributed(
+            x,
+            num_tokens=num_tokens,
+            return_aux=return_aux,
+            packed_send_counts_cpu=packed_send_counts_cpu,
+            packed_source_context=packed_source_context,
+        )
 
 
 __all__ = [
@@ -619,6 +791,7 @@ __all__ = [
     "EPMoELayer",
     "MoEFFNExpert",
     "MoELayer",
+    "PackedSourceContext",
     "RouterOutput",
     "RoutingStats",
     "TopKRouter",

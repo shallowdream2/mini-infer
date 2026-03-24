@@ -1,10 +1,11 @@
-"""Phase 17-18：2 卡 Expert Parallel 引擎原型。
+"""Phase 17-19：2 卡 Expert Parallel 引擎原型。
 
 这个文件复用 Phase 13 的 `mp.spawn + file:// rendezvous` 约定，
 把 `EPMoELayer` 接成可直接运行的 2 卡功能原型。Phase 18 开始 worker
 不再接收完整 expert 权重，而是按 rank 只加载本地 expert shard；为了避免
 正式 benchmark 配置下 `mp.spawn` 因大体积 tensor 传参触发 `fds_to_keep`
 失败，rank-local shard 会先落到临时文件，再由各 worker 按 rank 读取。
+Phase 19 新增 `comm_mode`，用于在 `padded` 与 `packed` EP 通信路径之间切换。
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from .moe_layer import EPMoELayer, MoELayer, shard_moe_state_dict
+from .moe_layer import EPMoELayer, MoELayer, shard_moe_state_dict, _validate_comm_mode
 
 
 _DTYPE_MAP = {
@@ -53,6 +54,7 @@ def _ep_worker(
     hidden_states_cpu: torch.Tensor,
     rank_state_dict_dir: str,
     src_rank: int,
+    comm_mode: str,
     warmup: int,
     runs: int,
     measure_steady_state: bool,
@@ -81,6 +83,7 @@ def _ep_worker(
             bias=bias,
             dist_group=None,
             src_rank=src_rank,
+            comm_mode=comm_mode,
         ).to(device=device, dtype=torch_dtype)
 
         rank_state_dict = torch.load(
@@ -99,9 +102,33 @@ def _ep_worker(
         num_tokens = hidden_states_cpu.reshape(-1, hidden_states_cpu.shape[-1]).shape[0]
         hidden_states = hidden_states_cpu.to(device=device, dtype=torch_dtype) if rank == src_rank else None
 
+        def _forward_once(return_aux: bool):
+            packed_forward_kwargs: dict[str, object] = {}
+            if comm_mode == "packed":
+                packed_send_counts = torch.zeros(ep_size, dtype=torch.int64, device=device)
+                packed_source_context = None
+                if rank == src_rank:
+                    if hidden_states is None:
+                        raise ValueError("packed EP source rank 需要 hidden_states 输入")
+                    packed_source_context = layer.prepare_packed_source_context(hidden_states)
+                    packed_send_counts.copy_(
+                        packed_source_context.layout.send_counts.to(device=device, dtype=torch.int64)
+                    )
+                dist.broadcast(packed_send_counts, src=src_rank, group=None)
+                packed_forward_kwargs = {
+                    "packed_send_counts_cpu": packed_send_counts.cpu().tolist(),
+                    "packed_source_context": packed_source_context,
+                }
+            return layer(
+                hidden_states,
+                return_aux=return_aux,
+                num_tokens=num_tokens,
+                **packed_forward_kwargs,
+            )
+
         with torch.no_grad():
             for _ in range(warmup):
-                _ = layer(hidden_states, return_aux=False, num_tokens=num_tokens)
+                _ = _forward_once(return_aux=False)
 
             dist.barrier()
             start_time = None
@@ -111,7 +138,7 @@ def _ep_worker(
 
             result = None
             for _ in range(runs):
-                result = layer(hidden_states, return_aux=True, num_tokens=num_tokens)
+                result = _forward_once(return_aux=True)
 
             dist.barrier()
             elapsed_s = None
@@ -159,6 +186,7 @@ class EPEngine:
         dtype: str = "float16",
         rank_state_dicts: list[dict[str, torch.Tensor]] | None = None,
         src_rank: int = 0,
+        comm_mode: str = "padded",
     ) -> None:
         if ep_size < 2:
             raise ValueError(f"ep_size 必须 >= 2，当前 {ep_size}")
@@ -183,6 +211,7 @@ class EPEngine:
         self.ep_size = ep_size
         self.dtype = dtype
         self.src_rank = src_rank
+        self.comm_mode = _validate_comm_mode(comm_mode)
         self.rank_state_dicts = None if rank_state_dicts is None else [
             {
                 key: value.detach().cpu()
@@ -198,6 +227,7 @@ class EPEngine:
         ep_size: int = 2,
         dtype: str = "float16",
         src_rank: int = 0,
+        comm_mode: str = "padded",
     ) -> "EPEngine":
         rank_state_dicts = shard_moe_state_dict(
             layer.state_dict(),
@@ -214,6 +244,7 @@ class EPEngine:
             dtype=dtype,
             rank_state_dicts=rank_state_dicts,
             src_rank=src_rank,
+            comm_mode=comm_mode,
         )
 
     def _run(
@@ -252,6 +283,7 @@ class EPEngine:
                     hidden_states.detach().cpu(),
                     rank_state_dict_dir,
                     self.src_rank,
+                    self.comm_mode,
                     warmup,
                     runs,
                     measure_steady_state,

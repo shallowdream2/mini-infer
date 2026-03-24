@@ -1,4 +1,4 @@
-"""Phase 17-18 MoE 测试。
+"""Phase 17-19 MoE 测试。
 
 覆盖：
 - TopKRouter 的 top-k 范围和分数归一化
@@ -8,6 +8,7 @@
 - dispatch / gather 重排与逆置换
 - local expert shard 的 state_dict 切分与所有权
 - rank-local shard 的文件下发辅助逻辑
+- packed / padded 通信模式切换
 - dense MoELayer vs EPMoELayer 数值等价
 - 2 卡 EPEngine 最小功能路径
 - 2 卡 EPEngine 的 zero-send-count 边界
@@ -160,6 +161,18 @@ class TestDispatchAndEP:
         assert len(layer.experts) == 2
         assert list(layer.local_expert_ids()) == [2, 3]
 
+    def test_ep_layer_rejects_invalid_comm_mode(self):
+        with pytest.raises(ValueError, match="comm_mode"):
+            EPMoELayer(
+                hidden_size=8,
+                intermediate_size=16,
+                num_experts=4,
+                top_k=2,
+                ep_size=2,
+                rank=0,
+                comm_mode="invalid",
+            )
+
     def test_rank_state_dicts_can_roundtrip_through_files(self, tmp_path):
         dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2)
         rank_state_dicts = shard_moe_state_dict(dense.state_dict(), num_experts=4, ep_size=2)
@@ -245,11 +258,49 @@ class TestDispatchAndEP:
                 src_rank=0,
             )
 
+    def test_ep_engine_accepts_packed_comm_mode_on_cpu_init(self):
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            pytest.skip("需要至少 2 张 CUDA GPU")
+
+        shard = {"router.gate.weight": torch.zeros(4, 8)}
+        engine = EPEngine(
+            hidden_size=8,
+            intermediate_size=16,
+            num_experts=4,
+            top_k=2,
+            ep_size=2,
+            dtype="float32",
+            rank_state_dicts=[shard, shard],
+            src_rank=0,
+            comm_mode="packed",
+        )
+
+        assert engine.comm_mode == "packed"
+
+    def test_ep_engine_rejects_invalid_comm_mode_on_cpu_init(self):
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            pytest.skip("需要至少 2 张 CUDA GPU")
+
+        shard = {"router.gate.weight": torch.zeros(4, 8)}
+        with pytest.raises(ValueError, match="comm_mode"):
+            EPEngine(
+                hidden_size=8,
+                intermediate_size=16,
+                num_experts=4,
+                top_k=2,
+                ep_size=2,
+                dtype="float32",
+                rank_state_dicts=[shard, shard],
+                src_rank=0,
+                comm_mode="invalid",
+            )
+
+    @pytest.mark.parametrize("comm_mode", ["padded", "packed"])
     @pytest.mark.skipif(
         not torch.cuda.is_available() or torch.cuda.device_count() < 2,
         reason="需要至少 2 张 CUDA GPU",
     )
-    def test_ep_engine_matches_dense_reference_cuda(self):
+    def test_ep_engine_matches_dense_reference_cuda(self, comm_mode: str):
         torch.manual_seed(6)
         dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2).float().eval()
         x = torch.randn(2, 3, 8)
@@ -257,7 +308,13 @@ class TestDispatchAndEP:
         with torch.no_grad():
             ref = dense.cuda()(x.cuda()).cpu()
 
-        engine = EPEngine.from_moe_layer(dense, ep_size=2, dtype="float32", src_rank=1)
+        engine = EPEngine.from_moe_layer(
+            dense,
+            ep_size=2,
+            dtype="float32",
+            src_rank=1,
+            comm_mode=comm_mode,
+        )
         out, aux = engine.forward(x, return_aux=True)
         bench = engine.benchmark_forward(x, warmup=0, runs=1)
 
@@ -266,11 +323,12 @@ class TestDispatchAndEP:
         assert int(aux["expert_loads"].sum().item()) == x.shape[0] * x.shape[1] * dense.top_k
         assert float(bench["elapsed_s"]) > 0.0
 
+    @pytest.mark.parametrize("comm_mode", ["padded", "packed"])
     @pytest.mark.skipif(
         not torch.cuda.is_available() or torch.cuda.device_count() < 2,
         reason="需要至少 2 张 CUDA GPU",
     )
-    def test_ep_engine_handles_zero_send_count_cuda(self):
+    def test_ep_engine_handles_zero_send_count_cuda(self, comm_mode: str):
         dense = MoELayer(
             hidden_size=8,
             intermediate_size=16,
@@ -286,7 +344,13 @@ class TestDispatchAndEP:
         with torch.no_grad():
             ref = dense.to("cuda:1")(x.to("cuda:1")).cpu()
 
-        engine = EPEngine.from_moe_layer(dense, ep_size=2, dtype="float32", src_rank=1)
+        engine = EPEngine.from_moe_layer(
+            dense,
+            ep_size=2,
+            dtype="float32",
+            src_rank=1,
+            comm_mode=comm_mode,
+        )
         out, aux = engine.forward(x, return_aux=True)
         bench = engine.benchmark_forward(x, warmup=0, runs=1)
 
