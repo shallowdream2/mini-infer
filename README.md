@@ -25,8 +25,9 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **量化推理**（Phase 16）：int8 权重存储 + W8A8 / mixed fallback，1.5B 权重显存 −32.4%，greedy token match 71.8%，decode 全量 fallback
 - **MoE + Expert Parallelism**（Phase 17）：synthetic MoE + 2-GPU EP，dense oracle 对齐，正式 benchmark `EP / dense = 1.891x`
 - **True Expert Sharding**（Phase 18）：2 卡 `per-rank local expert shard`，正式 benchmark `shard_ratio = 0.5002`，`EP / dense = 1.916x`
+- **Non-Padded Expert Dispatch / EP 通信闭环**（Phase 19）：`ep_packed_bytes_per_layer = ep_ideal_bytes_per_layer`，正式 benchmark `EP packed / dense = 2.323x`，`EP packed / EP padded = 1.217x`
 
-项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-18 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 18；下一步待进入 Phase 19 的 infer-plan。
+项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-19 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 19；下一步待进入 Phase 20 的 infer-plan。
 
 **权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
 
@@ -335,9 +336,9 @@ conda run -n ai-infra python -m pytest \
     tests/test_engine.py -q
 ```
 
-# MoE + Expert Parallelism / True Expert Sharding（Phase 17-18）
+# MoE + Expert Parallelism / True Expert Sharding / Non-Padded Communication（Phase 17-19）
 ```bash
-# 正式对照 benchmark（synthetic MoE，2-GPU true-sharded EP vs 1-GPU dense）
+# 正式对照 benchmark（synthetic MoE，1-GPU dense vs 2-GPU ep_padded / ep_packed）
 conda run -n ai-infra python benchmarks/benchmark_moe.py \
     --compare \
     --batch-size 4 \
@@ -358,6 +359,7 @@ conda run -n ai-infra python benchmarks/benchmark_moe.py --mode ep --dry-run --s
 
 Phase 17 正式结果：dense `22622.14 tok/s`，EP `42778.41 tok/s`，`EP / dense = 1.891x`。  
 Phase 18 正式结果：dense `22462.79 tok/s`，EP `43036.02 tok/s`，`EP / dense = 1.916x`，`shard_ratio = 0.5002`，`max_abs_diff = 0.000000`。
+Phase 19 正式结果：dense `22552.86 tok/s`，`ep_padded` `43046.93 tok/s`，`ep_packed` `52400.26 tok/s`，`EP packed / dense = 2.323x`，`EP packed / EP padded = 1.217x`，`ep_packed_bytes_per_layer = ep_ideal_bytes_per_layer = 262144`。
 
 ### 测试命令（多数无需 GPU；最后一项需要真实 GPU）
 
@@ -444,7 +446,7 @@ benchmarks/
   benchmark_mla.py       Phase 14 MLA benchmark（理论 KV cache 对比 / 真实显存 / 三种实现延迟）
   benchmark_pd_disagg.py Phase 15 PD 解耦 benchmark（理论 KV 大小 / 端到端正确性 / TTFT 三段分解）
   benchmark_quant.py     Phase 16 量化 benchmark（prefill / decode / e2e，对照 fp16，含 `_int_mm` / fallback 统计）
-  benchmark_moe.py       Phase 17-18 synthetic MoE / EP benchmark（dense vs EP，对照吞吐、send_counts、通信公式、shard_ratio）
+  benchmark_moe.py       Phase 17-19 synthetic MoE / EP benchmark（dense vs ep_padded vs ep_packed，对照吞吐、通信公式、shard_ratio）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
 
 tests/
@@ -467,7 +469,7 @@ tests/
   test_benchmark_quant.py  Phase 16 benchmark 口径与输出结构测试
   test_model_runner_quant.py Phase 16 ModelRunner 量化接入顺序测试
   test_moe.py             Phase 17-18 MoE / EP / true-sharding 数学路径与 2-GPU 边界测试
-  test_benchmark_moe.py   Phase 17-18 benchmark 口径、compare 路径、参数统计与计时窗口测试
+  test_benchmark_moe.py   Phase 17-19 benchmark 口径、compare 路径、参数统计与计时窗口测试
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
@@ -502,9 +504,10 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 16 | 量化推理（int8 权重存储 + W8A8 / mixed fallback；1.5B 权重显存 −32.4%，greedy token match 71.8%，decode 100% fallback）| ✅ 完成 |
 | Phase 17 | MoE + Expert Parallelism（synthetic MoE + 2-GPU EP；dense 22622.14 tok/s，EP 42778.41 tok/s，`EP / dense = 1.891x`，`max_abs_diff = 0.000000`）| ✅ 完成 |
 | Phase 18 | True Expert Sharding（2 卡 `per-rank local expert shard`；dense 22462.79 tok/s，EP 43036.02 tok/s，`EP / dense = 1.916x`，`shard_ratio = 0.5002`）| ✅ 完成 |
+| Phase 19 | Non-Padded Expert Dispatch / EP 通信闭环（`ep_packed_bytes_per_layer = ep_ideal_bytes_per_layer = 262144`；dense 22552.86 tok/s，`ep_padded` 43046.93 tok/s，`ep_packed` 52400.26 tok/s）| ✅ 完成 |
 
 下一阶段：
 
-- Phase 19：待 infer-plan
+- Phase 20：待 infer-plan
 
 后续阶段验收口径详见 `CLAUDE.md`。
