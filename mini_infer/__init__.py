@@ -15,6 +15,7 @@ _LAZY_IMPORTS = {
     "SpecEngine": (".spec_engine", "SpecEngine"),
     "TPEngine": (".tp_engine", "TPEngine"),
     "PDEngine": (".pd_engine", "PDEngine"),
+    "EPEngine": (".ep_engine", "EPEngine"),
 }
 
 __all__ = [
@@ -26,6 +27,7 @@ __all__ = [
     "SpecEngine",        # Phase 11：Speculative Decoding
     "TPEngine",          # Phase 13：Tensor Parallelism（真 TP，NCCL all-reduce）
     "PDEngine",          # Phase 15：Disaggregated Prefill/Decode
+    "EPEngine",          # Phase 17：Expert Parallelism（2 卡 all-to-all 原型）
     "Request",
     "RequestState",
     "SamplingParams",

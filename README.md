@@ -22,10 +22,10 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **Tensor Parallelism**：Megatron-LM 风格，column/row parallel 权重切分 + NCCL all-reduce forward hook，TP=2 greedy 输出与单卡完全一致
 - **MLA（Multi-head Latent Attention）**：DeepSeek-V2/V3 架构，latent cache 压缩 56.25% vs GQA，矩阵吸收优化
 - **PD 解耦（Disaggregated Prefill/Decode）**：同机双进程原型，KV 序列化传输，TTFT 三段分解（prefill/transfer/decode）
-- **量化推理**（Phase 16，开发中，尚未验收）：W8A8 主线，当前先闭环正确性 / 显存 / decode& e2e benchmark 口径；FP8 / Triton INT8 为后续量化扩展
+- **量化推理**（Phase 16）：int8 权重存储 + W8A8 / mixed fallback，1.5B 权重显存 −32.4%，greedy token match 71.8%，decode 全量 fallback
 - **MoE + Expert Parallelism**（Phase 17，规划中）：Top-K 路由 + all-to-all EP
 
-项目面向单机 2 × RTX 4090 环境，模型为 Qwen2.5-7B-Instruct（float16）。当前主线实现已完成到 Phase 15；Phase 16 已开始实现但尚未完成 benchmark / review / 验收，Phase 17 仍为规划。
+项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主。当前主线实现已完成到 Phase 16；Phase 17 仍为规划。
 
 **权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
 
@@ -69,6 +69,7 @@ engine.py           LLMEngine：continuous batching 主循环（Phase 8 HTTP 接
   ├── kv_cache.py       KVCacheManager：Paged KV Cache（BlockTable + FreeBlockPool + swap_out/in + Prefix Cache）
   ├── attention.py      PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
   └── model_runner.py   ModelRunner：prefill + batch decode 执行（Phase 12 graph capture/replay）
+quantization.py     QuantLinear + quantize_model（Phase 16，int8 权重存储 + W8A8 / mixed fallback）
 
 async_engine.py     AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
 server.py / serve.py  FastAPI HTTP server + CLI 启动（Phase 8/9）
@@ -311,6 +312,25 @@ TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 conda run -n ai-infra python bench
 conda run -n ai-infra python -m pytest tests/test_pd_disagg.py -v
 ```
 
+# 量化推理（Phase 16）
+```bash
+# 正式对照 benchmark（Qwen2.5-1.5B）
+export QUANT_MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+export HF_HUB_OFFLINE=1
+
+TOKENIZERS_PARALLELISM=false conda run -n ai-infra python benchmarks/benchmark_quant.py \
+    --model $QUANT_MODEL --compare --batch-size 4 --max-new-tokens 50 \
+    --warmup-iters 2 --bench-iters 3 --linear-warmup-iters 5 --linear-bench-iters 20
+
+# 量化主线相关测试
+conda run -n ai-infra python -m pytest \
+    tests/test_quantization.py \
+    tests/test_benchmark_quant.py \
+    tests/test_model_runner_quant.py \
+    tests/test_smoke.py \
+    tests/test_engine.py -q
+```
+
 ### 测试命令（多数无需 GPU；最后一项需要真实 GPU）
 
 ```bash
@@ -335,6 +355,9 @@ conda run -n ai-infra python -m pytest tests/test_spec_engine.py -v
 # Phase 12 CUDA Graph 测试（dry_run，无需 GPU）
 conda run -n ai-infra python -m pytest tests/test_cuda_graph.py -v
 
+# Phase 16 量化测试（CPU + GPU 混合；部分真实路径需要 GPU）
+conda run -n ai-infra python -m pytest tests/test_quantization.py tests/test_benchmark_quant.py tests/test_model_runner_quant.py -v
+
 # Phase 6 GPU 测试（需要真实 GPU）
 conda run -n ai-infra python -m pytest tests/test_paged_attention.py -v
 ```
@@ -349,6 +372,7 @@ mini_infer/              核心推理代码
   kv_cache.py            Paged KV Cache（BlockTable + FreeBlockPool + swap_out/in）
   attention.py           PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
   model_runner.py        ModelRunner（prefill + batch decode，含 profiler 标签）
+  quantization.py        QuantLinear / quantize_model（Phase 16，int8 权重存储 + W8A8 / mixed fallback）
   engine.py              LLMEngine：continuous batching 主循环（Phase 8 HTTP 接口，Phase 9 chunked prefill）
   async_engine.py        AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
   openai_schema.py       OpenAI Chat Completions API Pydantic 模型（Phase 8）
@@ -385,6 +409,7 @@ benchmarks/
   benchmark_tp.py        Phase 13 Tensor Parallel benchmark（single/pp/tp/torchrun_tp；其中 tp 仅用于功能验证）
   benchmark_mla.py       Phase 14 MLA benchmark（理论 KV cache 对比 / 真实显存 / 三种实现延迟）
   benchmark_pd_disagg.py Phase 15 PD 解耦 benchmark（理论 KV 大小 / 端到端正确性 / TTFT 三段分解）
+  benchmark_quant.py     Phase 16 量化 benchmark（prefill / decode / e2e，对照 fp16，含 `_int_mm` / fallback 统计）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
 
 tests/
@@ -403,6 +428,9 @@ tests/
   test_tp_engine.py        Phase 13 Tensor Parallel 测试（dry_run，13 tests：col/row shard、数学等价、attn 属性、mock all-reduce）
   test_mla_attention.py    Phase 14 MLA 测试（CPU + GPU，latent cache 大小和数学等价）
   test_pd_disagg.py        Phase 15 PD 解耦测试（dry_run + GPU，7 tests：KVPayload/Queue/extract/rebuild/engine）
+  test_quantization.py     Phase 16 量化 contract / 数值路径测试
+  test_benchmark_quant.py  Phase 16 benchmark 口径与输出结构测试
+  test_model_runner_quant.py Phase 16 ModelRunner 量化接入顺序测试
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
@@ -434,10 +462,10 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce；1.5B TP=2 正确性验证通过，tp=2 76.5 tok/s vs single 98.0）| ✅ 完成 |
 | Phase 14 | MLA（Multi-head Latent Attention，DeepSeek 架构；latent cache 56.25% vs GQA，10 tests pass）| ✅ 完成 |
 | Phase 15 | PD 解耦（同机双进程原型；greedy 输出一致，TTFT 三段分解：prefill 12.3ms/transfer≈14.7ms/decode 519ms；1.19× overhead vs unified）| ✅ 完成 |
+| Phase 16 | 量化推理（int8 权重存储 + W8A8 / mixed fallback；1.5B 权重显存 −32.4%，greedy token match 71.8%，decode 100% fallback）| ✅ 完成 |
 
 下一阶段：
 
-- Phase 16：量化推理（W8A8 主线规划已完成，待实现）
 - Phase 17：MoE + Expert Parallelism（规划中）
 
 后续阶段验收口径详见 `CLAUDE.md`。
