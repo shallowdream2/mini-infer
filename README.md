@@ -24,8 +24,9 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **PD 解耦（Disaggregated Prefill/Decode）**：同机双进程原型，KV 序列化传输，TTFT 三段分解（prefill/transfer/decode）
 - **量化推理**（Phase 16）：int8 权重存储 + W8A8 / mixed fallback，1.5B 权重显存 −32.4%，greedy token match 71.8%，decode 全量 fallback
 - **MoE + Expert Parallelism**（Phase 17）：synthetic MoE + 2-GPU EP，dense oracle 对齐，正式 benchmark `EP / dense = 1.891x`
+- **True Expert Sharding**（Phase 18）：2 卡 `per-rank local expert shard`，正式 benchmark `shard_ratio = 0.5002`，`EP / dense = 1.916x`
 
-项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17 EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 17；下一步待进入新一轮 infer-plan。
+项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-18 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 18；下一步待进入 Phase 19 的 infer-plan。
 
 **权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
 
@@ -70,9 +71,9 @@ engine.py           LLMEngine：continuous batching 主循环（Phase 8 HTTP 接
   ├── attention.py      PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
   └── model_runner.py   ModelRunner：prefill + batch decode 执行（Phase 12 graph capture/replay）
 quantization.py     QuantLinear + quantize_model（Phase 16，int8 权重存储 + W8A8 / mixed fallback）
-moe_layer.py        TopKRouter / MoELayer / EPMoELayer（Phase 17，synthetic MoE + dispatch/gather）
-moe_model.py        SyntheticMoEConfig / SyntheticMoEModel（Phase 17）
-ep_engine.py        2-GPU EPEngine（Phase 17，mp.spawn + NCCL all-to-all）
+moe_layer.py        TopKRouter / MoELayer / EPMoELayer（Phase 17-18，synthetic MoE + dispatch/gather + true expert shard）
+moe_model.py        SyntheticMoEConfig / SyntheticMoEModel（Phase 17-18）
+ep_engine.py        2-GPU EPEngine（Phase 17-18，mp.spawn + NCCL all-to-all + rank-local shard handoff）
 
 async_engine.py     AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
 server.py / serve.py  FastAPI HTTP server + CLI 启动（Phase 8/9）
@@ -334,9 +335,9 @@ conda run -n ai-infra python -m pytest \
     tests/test_engine.py -q
 ```
 
-# MoE + Expert Parallelism（Phase 17）
+# MoE + Expert Parallelism / True Expert Sharding（Phase 17-18）
 ```bash
-# 正式对照 benchmark（synthetic MoE，2-GPU EP vs 1-GPU dense）
+# 正式对照 benchmark（synthetic MoE，2-GPU true-sharded EP vs 1-GPU dense）
 conda run -n ai-infra python benchmarks/benchmark_moe.py \
     --compare \
     --batch-size 4 \
@@ -350,10 +351,13 @@ conda run -n ai-infra python benchmarks/benchmark_moe.py \
     --runs 5 \
     --src-rank 1
 
-# dry_run：验证 benchmark 主流程和通信公式，不依赖 GPU
+# dry_run：验证 benchmark 主流程、参数量统计和通信公式
 conda run -n ai-infra python benchmarks/benchmark_moe.py --mode dense --dry-run
 conda run -n ai-infra python benchmarks/benchmark_moe.py --mode ep --dry-run --src-rank 1
 ```
+
+Phase 17 正式结果：dense `22622.14 tok/s`，EP `42778.41 tok/s`，`EP / dense = 1.891x`。  
+Phase 18 正式结果：dense `22462.79 tok/s`，EP `43036.02 tok/s`，`EP / dense = 1.916x`，`shard_ratio = 0.5002`，`max_abs_diff = 0.000000`。
 
 ### 测试命令（多数无需 GPU；最后一项需要真实 GPU）
 
@@ -382,7 +386,7 @@ conda run -n ai-infra python -m pytest tests/test_cuda_graph.py -v
 # Phase 16 量化测试（CPU + GPU 混合；部分真实路径需要 GPU）
 conda run -n ai-infra python -m pytest tests/test_quantization.py tests/test_benchmark_quant.py tests/test_model_runner_quant.py -v
 
-# Phase 17 MoE / EP 测试（含 2-GPU 路径）
+# Phase 17-18 MoE / EP / true-sharding 测试（含 2-GPU 路径）
 conda run -n ai-infra python -m pytest tests/test_benchmark_moe.py tests/test_moe.py tests/test_tp_engine.py -q
 
 # Phase 6 GPU 测试（需要真实 GPU）
@@ -400,9 +404,9 @@ mini_infer/              核心推理代码
   attention.py           PagedDecodeContext + patch_model_for_paged_decode（Phase 6）
   model_runner.py        ModelRunner（prefill + batch decode，含 profiler 标签）
   quantization.py        QuantLinear / quantize_model（Phase 16，int8 权重存储 + W8A8 / mixed fallback）
-  moe_layer.py           Phase 17 synthetic MoE 层（TopKRouter / MoELayer / EPMoELayer）
-  moe_model.py           Phase 17 synthetic MoE 模型与配置
-  ep_engine.py           Phase 17 2-GPU EPEngine（mp.spawn + NCCL all-to-all）
+  moe_layer.py           Phase 17-18 synthetic MoE 层（TopKRouter / MoELayer / EPMoELayer + true expert shard）
+  moe_model.py           Phase 17-18 synthetic MoE 模型与配置
+  ep_engine.py           Phase 17-18 2-GPU EPEngine（mp.spawn + NCCL all-to-all + rank-local shard handoff）
   engine.py              LLMEngine：continuous batching 主循环（Phase 8 HTTP 接口，Phase 9 chunked prefill）
   async_engine.py        AsyncEngine：后台线程 step loop + asyncio.Queue（Phase 8）
   openai_schema.py       OpenAI Chat Completions API Pydantic 模型（Phase 8）
@@ -440,7 +444,7 @@ benchmarks/
   benchmark_mla.py       Phase 14 MLA benchmark（理论 KV cache 对比 / 真实显存 / 三种实现延迟）
   benchmark_pd_disagg.py Phase 15 PD 解耦 benchmark（理论 KV 大小 / 端到端正确性 / TTFT 三段分解）
   benchmark_quant.py     Phase 16 量化 benchmark（prefill / decode / e2e，对照 fp16，含 `_int_mm` / fallback 统计）
-  benchmark_moe.py       Phase 17 synthetic MoE / EP benchmark（dense vs EP，对照吞吐、send_counts、通信公式）
+  benchmark_moe.py       Phase 17-18 synthetic MoE / EP benchmark（dense vs EP，对照吞吐、send_counts、通信公式、shard_ratio）
   profile_decode.py      decode_batch 内部 profiling（Phase 6）
 
 tests/
@@ -462,8 +466,8 @@ tests/
   test_quantization.py     Phase 16 量化 contract / 数值路径测试
   test_benchmark_quant.py  Phase 16 benchmark 口径与输出结构测试
   test_model_runner_quant.py Phase 16 ModelRunner 量化接入顺序测试
-  test_moe.py             Phase 17 MoE / EP 数学路径与 2-GPU 边界测试
-  test_benchmark_moe.py   Phase 17 benchmark 口径、compare 路径与计时窗口测试
+  test_moe.py             Phase 17-18 MoE / EP / true-sharding 数学路径与 2-GPU 边界测试
+  test_benchmark_moe.py   Phase 17-18 benchmark 口径、compare 路径、参数统计与计时窗口测试
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
@@ -497,9 +501,10 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 15 | PD 解耦（同机双进程原型；greedy 输出一致，TTFT 三段分解：prefill 12.3ms/transfer≈14.7ms/decode 519ms；1.19× overhead vs unified）| ✅ 完成 |
 | Phase 16 | 量化推理（int8 权重存储 + W8A8 / mixed fallback；1.5B 权重显存 −32.4%，greedy token match 71.8%，decode 100% fallback）| ✅ 完成 |
 | Phase 17 | MoE + Expert Parallelism（synthetic MoE + 2-GPU EP；dense 22622.14 tok/s，EP 42778.41 tok/s，`EP / dense = 1.891x`，`max_abs_diff = 0.000000`）| ✅ 完成 |
+| Phase 18 | True Expert Sharding（2 卡 `per-rank local expert shard`；dense 22462.79 tok/s，EP 43036.02 tok/s，`EP / dense = 1.916x`，`shard_ratio = 0.5002`）| ✅ 完成 |
 
 下一阶段：
 
-- Phase 18：待 infer-plan（候选：expert weight 真分片 / 去掉 padded all-to-all / 接入更完整生成链路）
+- Phase 19：待 infer-plan
 
 后续阶段验收口径详见 `CLAUDE.md`。

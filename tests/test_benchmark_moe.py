@@ -130,6 +130,14 @@ def test_resolve_dense_device_uses_src_rank_in_compare() -> None:
     assert dense_device == 1
 
 
+def test_resolve_dense_device_rejects_invalid_src_rank_in_compare() -> None:
+    parser = benchmark_moe.build_argparser()
+    args = parser.parse_args(["--compare", "--ep-size", "2", "--src-rank", "2"])
+
+    with pytest.raises(ValueError, match="src_rank"):
+        benchmark_moe.resolve_dense_device(args)
+
+
 def test_run_dry_run_does_not_instantiate_ep_engine(monkeypatch) -> None:
     class _FailingEngine:
         def __init__(self, *args, **kwargs):

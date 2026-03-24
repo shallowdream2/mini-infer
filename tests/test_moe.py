@@ -7,6 +7,7 @@
 - dense MoELayer 的路由统计
 - dispatch / gather 重排与逆置换
 - local expert shard 的 state_dict 切分与所有权
+- rank-local shard 的文件下发辅助逻辑
 - dense MoELayer vs EPMoELayer 数值等价
 - 2 卡 EPEngine 最小功能路径
 - 2 卡 EPEngine 的 zero-send-count 边界
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import mini_infer.ep_engine as ep_engine_mod
 import pytest
 import torch
 import torch.nn as nn
@@ -157,6 +159,27 @@ class TestDispatchAndEP:
 
         assert len(layer.experts) == 2
         assert list(layer.local_expert_ids()) == [2, 3]
+
+    def test_rank_state_dicts_can_roundtrip_through_files(self, tmp_path):
+        dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2)
+        rank_state_dicts = shard_moe_state_dict(dense.state_dict(), num_experts=4, ep_size=2)
+        rank_state_dict_dir = tmp_path / "rank_state_dicts"
+
+        ep_engine_mod._dump_rank_state_dicts(rank_state_dicts, str(rank_state_dict_dir))
+
+        loaded_rank0 = torch.load(ep_engine_mod._rank_state_dict_path(str(rank_state_dict_dir), 0), map_location="cpu")
+        loaded_rank1 = torch.load(ep_engine_mod._rank_state_dict_path(str(rank_state_dict_dir), 1), map_location="cpu")
+
+        assert any(key.startswith("experts.0.") for key in loaded_rank0)
+        assert any(key.startswith("experts.1.") for key in loaded_rank0)
+        assert any(key.startswith("experts.0.") for key in loaded_rank1)
+        assert any(key.startswith("experts.1.") for key in loaded_rank1)
+        assert not any(key.startswith("experts.2.") for key in loaded_rank0)
+        assert not any(key.startswith("experts.2.") for key in loaded_rank1)
+        assert torch.equal(loaded_rank0["experts.0.gate_proj.weight"], dense.state_dict()["experts.0.gate_proj.weight"])
+        assert torch.equal(loaded_rank1["experts.0.gate_proj.weight"], dense.state_dict()["experts.2.gate_proj.weight"])
+        assert torch.equal(loaded_rank0["router.gate.weight"], dense.state_dict()["router.gate.weight"])
+        assert torch.equal(loaded_rank1["router.gate.weight"], dense.state_dict()["router.gate.weight"])
 
     def test_dispatch_layout_groups_entries_by_rank(self):
         route = RouterOutput(

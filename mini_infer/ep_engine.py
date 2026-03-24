@@ -2,12 +2,15 @@
 
 这个文件复用 Phase 13 的 `mp.spawn + file:// rendezvous` 约定，
 把 `EPMoELayer` 接成可直接运行的 2 卡功能原型。Phase 18 开始 worker
-不再接收完整 expert 权重，而是按 rank 只加载本地 expert shard。
+不再接收完整 expert 权重，而是按 rank 只加载本地 expert shard；为了避免
+正式 benchmark 配置下 `mp.spawn` 因大体积 tensor 传参触发 `fds_to_keep`
+失败，rank-local shard 会先落到临时文件，再由各 worker 按 rank 读取。
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
 import time
 
@@ -25,6 +28,19 @@ _DTYPE_MAP = {
 }
 
 
+def _rank_state_dict_path(rank_state_dict_dir: str, rank: int) -> str:
+    return os.path.join(rank_state_dict_dir, f"rank_{rank}.pt")
+
+
+def _dump_rank_state_dicts(
+    rank_state_dicts: list[dict[str, torch.Tensor]],
+    rank_state_dict_dir: str,
+) -> None:
+    os.makedirs(rank_state_dict_dir, exist_ok=True)
+    for rank, rank_state_dict in enumerate(rank_state_dicts):
+        torch.save(rank_state_dict, _rank_state_dict_path(rank_state_dict_dir, rank))
+
+
 def _ep_worker(
     rank: int,
     ep_size: int,
@@ -35,7 +51,7 @@ def _ep_worker(
     bias: bool,
     dtype: str,
     hidden_states_cpu: torch.Tensor,
-    rank_state_dicts: list[dict[str, torch.Tensor]],
+    rank_state_dict_dir: str,
     src_rank: int,
     warmup: int,
     runs: int,
@@ -67,7 +83,10 @@ def _ep_worker(
             src_rank=src_rank,
         ).to(device=device, dtype=torch_dtype)
 
-        rank_state_dict = rank_state_dicts[rank]
+        rank_state_dict = torch.load(
+            _rank_state_dict_path(rank_state_dict_dir, rank),
+            map_location="cpu",
+        )
         state_dict = {
             key: value.to(dtype=torch_dtype)
             if torch.is_floating_point(value)
@@ -213,10 +232,13 @@ class EPEngine:
                 "EPEngine.forward 需要 rank_state_dicts；请使用 from_moe_layer() 或显式传入"
             )
 
-        result_file = tempfile.mktemp(suffix=".pt")
-        rendezvous_file = tempfile.mktemp()
+        temp_dir = tempfile.mkdtemp(prefix="mini_infer_ep_")
+        result_file = os.path.join(temp_dir, "result.pt")
+        rendezvous_file = os.path.join(temp_dir, "rendezvous")
+        rank_state_dict_dir = os.path.join(temp_dir, "rank_state_dicts")
 
         try:
+            _dump_rank_state_dicts(self.rank_state_dicts, rank_state_dict_dir)
             mp.spawn(
                 _ep_worker,
                 args=(
@@ -228,7 +250,7 @@ class EPEngine:
                     self.bias,
                     self.dtype,
                     hidden_states.detach().cpu(),
-                    self.rank_state_dicts,
+                    rank_state_dict_dir,
                     self.src_rank,
                     warmup,
                     runs,
@@ -241,12 +263,7 @@ class EPEngine:
             )
             return torch.load(result_file, map_location="cpu")
         finally:
-            for path in [result_file, rendezvous_file]:
-                if os.path.exists(path):
-                    try:
-                        os.unlink(path)
-                    except OSError:
-                        pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
     def get_rank_state_dict(self, rank: int) -> dict[str, torch.Tensor]:
         """返回某个 rank 的 local expert shard state_dict。"""
