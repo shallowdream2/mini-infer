@@ -43,9 +43,11 @@ class TestQuantMode:
 
     def test_contract_summary(self):
         contract = QuantLinear.get_contract()
-        assert contract["activation_granularity"] == "per_row"
-        assert contract["weight_granularity"] == "per_channel"
+        assert contract["weight_storage"] == "int8_per_channel"
+        assert contract["int_mm_activation_granularity"] == "per_row"
+        assert contract["fallback_activation_granularity"] == "fp32"
         assert contract["int_mm_min_rows"] == 17
+        assert contract["fallback_compute"] == "float_activation_x_dequant_weight"
         assert contract["min_param_size"] == 4096
         assert contract["in_feat_align"] == 8
         assert "q_proj" in contract["skip_suffixes"]
@@ -125,6 +127,19 @@ class TestQuantLinearForwardCPU:
         rel_err = ((out_q - out_ref).abs() / (out_ref.abs() + 1e-6)).mean()
         # per-channel W8A8 随机权重典型相对误差 < 10%（真实模型权重更集中，误差更小）
         assert rel_err < 0.10, f"相对误差过大: {rel_err:.4f}"
+
+    def test_cpu_fallback_uses_float_activation_with_dequantized_weight(self):
+        torch.manual_seed(7)
+        weight = torch.randn(32, 16)
+        bias = torch.randn(32)
+        ql = QuantLinear(weight, bias)
+        x = torch.randn(4, 16)
+
+        out = ql(x)
+        expected = x.float() @ ql._dequantize_weight()
+        expected = expected + bias.float()
+
+        assert torch.allclose(out.float(), expected, atol=1e-5, rtol=1e-5)
 
     def test_forward_with_bias(self):
         in_f, out_f = 32, 64
@@ -206,6 +221,26 @@ class TestQuantLinearForwardCUDA:
         rel_err = ((out_q - out_ref).abs() / (out_ref.abs() + 1e-6)).mean()
         # per-channel W8A8 随机权重典型相对误差 < 10%
         assert rel_err < 0.10, f"CUDA 相对误差过大: {rel_err:.4f}"
+
+    def test_cuda_small_m_fallback_uses_float_activation_with_dequantized_weight(self):
+        torch.manual_seed(123)
+        QuantLinear.reset_runtime_stats()
+        in_f, out_f = 32, 64
+        weight = torch.randn(out_f, in_f, device="cuda", dtype=torch.float16)
+        bias = torch.randn(out_f, device="cuda", dtype=torch.float16)
+        ql = QuantLinear(weight, bias).cuda()
+        x = torch.randn(8, in_f, device="cuda", dtype=torch.float16)  # rows < 17，必须走 fallback
+
+        out = ql(x)
+        expected = x.float() @ ql._dequantize_weight()
+        expected = expected + bias.float()
+        expected = expected.to(x.dtype)
+
+        assert torch.allclose(out, expected, atol=1e-3, rtol=1e-3)
+        stats = QuantLinear.get_runtime_stats()
+        assert stats["fallback_calls"] == 1
+        assert stats["fallback_rows"] == 8
+        assert stats["int_mm_calls"] == 0
 
 
 # --------------------------------------------------------------------------- #

@@ -1,4 +1,4 @@
-"""Phase 16：W8A8 量化 benchmark。
+"""Phase 16：W8A8 / mixed-fallback 量化 benchmark。
 
 对比 fp16 vs W8A8 的：
 - 权重显存占用（MB）
@@ -12,6 +12,8 @@
 - 固定使用 12 条 prompt 做正确性对比
 - `batch_size` 表示引擎每次处理的 engine batch 大小，而不是评估 prompt 总数
 - 模型结构参数从 HuggingFace config 推导，不再把 benchmark 限死在 1.5B
+- `mode=w8a8` 表示启用 int8 权重存储路径；若 workload 中 fallback 占主导，
+  benchmark 结果代表 mixed compute path，而不是纯 A8 matmul
 
 用法示例：
   # 单模式运行
@@ -142,6 +144,38 @@ def _format_quant_stats(stats: Optional[dict[str, int]]) -> str:
 def format_linear_quant_stats(stats: Optional[dict[str, int]]) -> str:
     """格式化 linear sweep 中单个 M 的量化路径统计。"""
     return _format_quant_stats(stats)
+
+
+def _fallback_rows_ratio(stats: Optional[dict[str, int]]) -> Optional[float]:
+    if not stats:
+        return None
+    total_rows = stats["int_mm_rows"] + stats["fallback_rows"]
+    if total_rows <= 0:
+        return 0.0
+    return stats["fallback_rows"] / total_rows
+
+
+def build_quant_compute_note(
+    contract: Optional[dict[str, object]],
+    decode_quant_stats: Optional[dict[str, int]],
+) -> Optional[str]:
+    """生成当前 quant compute 路径说明，避免把 mixed fallback 误写成纯 W8A8。"""
+    if not contract:
+        return None
+
+    note = (
+        f"weight_storage={contract['weight_storage']}; "
+        f"int_mm_activation={contract['int_mm_activation_granularity']} (M>={contract['int_mm_min_rows']}); "
+        f"fallback_activation={contract['fallback_activation_granularity']}; "
+        f"fallback_compute={contract['fallback_compute']}"
+    )
+
+    fallback_ratio = _fallback_rows_ratio(decode_quant_stats)
+    if fallback_ratio is not None and fallback_ratio > 0.0:
+        note += "; fallback dequantizes weight per forward"
+        if fallback_ratio >= 0.999:
+            note += "; current decode result is mixed fallback compute, not pure A8 matmul"
+    return note
 
 
 def build_prompt_batches(
@@ -470,6 +504,11 @@ def run_benchmark(
         "match_metrics": match_metrics,
         "prefill_quant_stats": prefill_quant_stats_total,
         "decode_quant_stats": decode_quant_stats_total,
+        "quant_contract": QuantLinear.get_contract() if mode == "w8a8" else None,
+        "quant_compute_note": build_quant_compute_note(
+            QuantLinear.get_contract() if mode == "w8a8" else None,
+            decode_quant_stats_total,
+        ),
         "outputs": outputs,
         "output_token_ids": output_token_ids,
     }
@@ -501,6 +540,8 @@ def print_result(r: dict) -> None:
         print(f"Prefill quant : {_format_quant_stats(r['prefill_quant_stats'])}")
     if r["decode_quant_stats"] is not None:
         print(f"Decode quant  : {_format_quant_stats(r['decode_quant_stats'])}")
+    if r.get("quant_compute_note") is not None:
+        print(f"Quant note    : {r['quant_compute_note']}")
     print(f"{'='*50}")
 
 
@@ -535,6 +576,8 @@ def print_comparison(fp16: dict, w8a8: dict) -> None:
         print(f"  Stretch: decode 吞吐 ≥ 1.10×: {'✓' if thr_ratio >= 1.10 else '✗'} ({thr_ratio:.3f}×)")
         if thr_ratio < 1.10 and w8a8["decode_quant_stats"] is not None:
             print(f"  Decode 量化路径: {_format_quant_stats(w8a8['decode_quant_stats'])}")
+    if w8a8.get("quant_compute_note") is not None:
+        print(f"  Quant compute note: {w8a8['quant_compute_note']}")
 
 
 def print_linear_sweep(result: dict) -> None:

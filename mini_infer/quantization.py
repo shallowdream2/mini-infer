@@ -1,12 +1,17 @@
-"""Phase 16：W8A8 量化推理核心路径。
+"""Phase 16：W8A8 / mixed-fallback 量化推理核心路径。
 
 提供三个公共接口：
 - QuantMode：量化模式枚举（""  / "w8a8"）
 - QuantLinear：替换 nn.Linear 的 W8A8 量化线性层
 - quantize_model()：递归替换模型中的 nn.Linear → QuantLinear
 
-当前范围：W8A8（activation per-row + weight per-channel）对称量化
-（PyTorch 原生 _int_mm）。
+当前范围：
+- CUDA 大 M（rows >= 17）：真正的 W8A8（activation per-row + weight per-channel）+ PyTorch 原生 _int_mm
+- CUDA 小 M / CPU：保留 int8 权重存储，但 compute 走高保真 fallback
+  （float activation x dequantized weight）
+
+因此当前 Phase 16 的 engine benchmark 在 fallback 主导时，衡量的是
+int8 权重存储 + mixed compute path，而不是纯 A8 matmul。
 FP8 与 Triton INT8 GEMM 作为后续扩展，不计入本阶段。
 """
 
@@ -36,10 +41,10 @@ class QuantLinear(nn.Module):
     """W8A8 量化线性层，替换 nn.Linear。
 
     权重量化：按输出通道一次性完成，scale_w[i] = max(|W[i]|) / 127。
-    激活量化：按输入行动态计算，scale_a[m] = max(|x[m]|) / 127。
     计算路径：
-        GPU: torch._int_mm(x_int8 [M,K], weight_int8 [K,N]) -> int32 -> fp32 dequant -> 原始 dtype
-        CPU: float fallback (供单元测试使用，数值等价)
+        GPU 大 M: activation per-row -> torch._int_mm(x_int8 [M,K], weight_int8 [K,N])
+                  -> int32 -> fp32 dequant -> 原始 dtype
+        GPU 小 M / CPU: x_fp32 @ dequant(weight_int8, scale_w)（高保真 fallback）
     """
 
     _runtime_stats: ClassVar[dict[str, int]] = {
@@ -49,9 +54,11 @@ class QuantLinear(nn.Module):
         "fallback_rows": 0,
     }
     _contract: ClassVar[dict[str, object]] = {
-        "activation_granularity": "per_row",
-        "weight_granularity": "per_channel",
+        "weight_storage": "int8_per_channel",
+        "int_mm_activation_granularity": "per_row",
+        "fallback_activation_granularity": "fp32",
         "int_mm_min_rows": 17,
+        "fallback_compute": "float_activation_x_dequant_weight",
         "skip_suffixes": ("lm_head", "embed_tokens", "q_proj", "k_proj", "v_proj", "o_proj"),
         "min_param_size": 4096,
         "in_feat_align": 8,
@@ -92,26 +99,26 @@ class QuantLinear(nn.Module):
         x_2d = x.reshape(-1, orig_shape[-1])
         x_fp = x_2d.float()
 
-        # 激活量化（per-row）：比整 batch 共用一个 scale 更稳，尤其适合小 batch decode
-        x_int8, scale_a = self._quantize_activation_per_row(x_fp)
-
         # 矩阵乘：CPU fallback 或 CUDA _int_mm
-        M = x_int8.shape[0]
+        M = x_fp.shape[0]
         if not self._should_use_int_mm(x.device.type, M):
-            # CPU 不支持 _int_mm；CUDA 要求 M > 16（decode 时 batch 小于 16 走此路径）
-            # 仍能享受权重显存降低，compute 路径退化为 fp32 matmul
+            # CPU 不支持 _int_mm；CUDA 小 M（如 decode）也走此路径。
+            # 这里不再量化激活，而是直接用 fp32 激活乘反量化后的权重：
+            #   1. 当前 engine workload 中 prefill/decode 基本都是 fallback，优先保证正确性
+            #   2. 仍保留 int8 权重存储，因此显存收益不变
             self.__class__._runtime_stats["fallback_calls"] += 1
             self.__class__._runtime_stats["fallback_rows"] += int(M)
-            out = x_int8.float() @ self.weight_int8.float()  # [M, N] float32
+            out = x_fp @ self._dequantize_weight().float()  # [M, N] float32
         else:
             # CUDA 路径：_int_mm INT8 GEMM，适合 prefill / 大 batch decode
+            x_int8, scale_a = self._quantize_activation_per_row(x_fp)
             self.__class__._runtime_stats["int_mm_calls"] += 1
             self.__class__._runtime_stats["int_mm_rows"] += int(M)
             out = torch._int_mm(x_int8.contiguous(), self.weight_int8)  # [M, N] int32
 
-        # 反量化：先在 fp32 中乘 scale，避免 int32 累加结果直接 cast 到 fp16/bf16 溢出
-        dequant_scale = scale_a.float() * self.scale_w.float()
-        out = out.float() * dequant_scale.float()
+            # 反量化：先在 fp32 中乘 scale，避免 int32 累加结果直接 cast 到 fp16/bf16 溢出
+            dequant_scale = scale_a.float() * self.scale_w.float()
+            out = out.float() * dequant_scale.float()
 
         if self.bias is not None:
             out = out + self.bias.float()
@@ -156,6 +163,10 @@ class QuantLinear(nn.Module):
             weight_fp / scale_w.unsqueeze(1)
         ).round().clamp(-128, 127).to(torch.int8)
         return weight_int8.T.contiguous(), scale_w
+
+    def _dequantize_weight(self) -> torch.Tensor:
+        """把 [K, N] int8 权重恢复成 float32，供高保真 fallback 使用。"""
+        return self.weight_int8.float() * self.scale_w.float().unsqueeze(0)
 
     @classmethod
     def _quantize_activation_per_row(

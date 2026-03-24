@@ -4,6 +4,7 @@
 - token match / sequence exact 指标定义
 - 固定 12 条 prompt 的分批执行口径
 - 模型几何参数自动推导与 build_runner 接线
+- mixed fallback compute note
 - linear sweep 的层选择与统计窗口
 - linear sweep 的 dtype 对齐
 - run_benchmark 的异常安全清理
@@ -83,6 +84,29 @@ def test_find_benchmark_linear_prefers_quantized_gate_proj_for_w8a8() -> None:
 def test_build_linear_sweep_rows() -> None:
     rows = benchmark_quant.build_linear_sweep_rows(max_rows=20)
     assert rows == [1, 2, 4, 8, 16]
+
+
+def test_build_quant_compute_note_marks_mixed_fallback() -> None:
+    note = benchmark_quant.build_quant_compute_note(
+        {
+            "weight_storage": "int8_per_channel",
+            "int_mm_activation_granularity": "per_row",
+            "fallback_activation_granularity": "fp32",
+            "int_mm_min_rows": 17,
+            "fallback_compute": "float_activation_x_dequant_weight",
+        },
+        {
+            "int_mm_calls": 0,
+            "fallback_calls": 5,
+            "int_mm_rows": 0,
+            "fallback_rows": 20,
+        },
+    )
+
+    assert note is not None
+    assert "weight_storage=int8_per_channel" in note
+    assert "fallback_compute=float_activation_x_dequant_weight" in note
+    assert "mixed fallback compute" in note
 
 
 def test_infer_model_geometry_reads_hf_config(monkeypatch) -> None:
@@ -247,6 +271,8 @@ def test_run_benchmark_uses_all_prompts_across_batches() -> None:
     assert result["prompt_count"] == len(benchmark_quant.PROMPTS)
     assert result["num_prompt_batches"] == 3
     assert len(result["output_token_ids"]) == len(benchmark_quant.PROMPTS)
+    assert result["quant_contract"] is None
+    assert result["quant_compute_note"] is None
 
 
 class _TrackingKVCache(_FakeKVCache):
