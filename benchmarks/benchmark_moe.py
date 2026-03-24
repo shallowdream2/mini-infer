@@ -177,17 +177,20 @@ def run_dense_benchmark(
     with torch.no_grad():
         for _ in range(args.warmup):
             layer(hidden_states)
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device=dense_device)
         t0 = time.perf_counter()
+        output = None
+        stats = None
         for _ in range(args.runs):
             output, _, stats = layer(hidden_states, return_router_stats=True)
+        torch.cuda.synchronize(device=dense_device)
+        elapsed = time.perf_counter() - t0
+        if output is not None and stats is not None:
             aux = {
                 "expert_loads": stats.expert_loads.cpu(),
                 "expert_score_sums": stats.expert_score_sums.cpu(),
             }
             output_cpu = output.cpu()
-        torch.cuda.synchronize()
-        elapsed = time.perf_counter() - t0
 
     num_tokens = args.batch_size * args.seq_len * args.runs
     throughput = num_tokens / elapsed

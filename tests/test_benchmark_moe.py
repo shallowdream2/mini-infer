@@ -4,12 +4,14 @@
 - TP / EP 通信量公式
 - synthetic hidden state 构造
 - benchmark dry-run 所需的参数构造 helper
+- dense benchmark 计时窗口与 source device 同步口径
 """
 
 from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -158,3 +160,65 @@ def test_run_compare_benchmark_uses_shared_layer_and_inputs(monkeypatch) -> None
     assert seen["dense_weight_ptr"] == seen["ep_weight_ptr"]
     assert seen["dense_input_ptr"] == seen["ep_input_ptr"]
     assert result["max_abs_diff"] == 0.25
+
+
+def test_run_dense_benchmark_times_only_gpu_work_on_selected_device(monkeypatch) -> None:
+    events: list[tuple[str, object]] = []
+
+    class _FakeHiddenStates:
+        def to(self, device=None, dtype=None):
+            events.append(("hidden_to", device))
+            return self
+
+    class _FakeCPUCopy:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def cpu(self):
+            events.append(("cpu", self.name))
+            return self.name
+
+    class _FakeLayer:
+        def __call__(self, hidden_states, return_router_stats=False):
+            phase = "timed" if return_router_stats else "warmup"
+            events.append(("forward", phase))
+            if not return_router_stats:
+                return None
+            return (
+                _FakeCPUCopy("output"),
+                None,
+                SimpleNamespace(
+                    expert_loads=_FakeCPUCopy("expert_loads"),
+                    expert_score_sums=_FakeCPUCopy("expert_score_sums"),
+                ),
+            )
+
+    perf_times = iter([100.0, 101.0])
+    monkeypatch.setattr(benchmark_moe, "build_dense_layer", lambda *args, **kwargs: _FakeLayer())
+    monkeypatch.setattr(benchmark_moe, "build_shared_hidden_states", lambda *args, **kwargs: _FakeHiddenStates())
+    monkeypatch.setattr(benchmark_moe.time, "perf_counter", lambda: next(perf_times))
+    monkeypatch.setattr(
+        benchmark_moe.torch.cuda,
+        "synchronize",
+        lambda device=None: events.append(("sync", device)),
+    )
+
+    args = benchmark_moe.build_argparser().parse_args(
+        ["--batch-size", "2", "--seq-len", "3", "--dtype", "float32", "--warmup", "1", "--runs", "1"]
+    )
+    result = benchmark_moe.run_dense_benchmark(args, device=1)
+
+    assert result["throughput_tok_s"] == 6.0
+    assert result["output"] == "output"
+    assert result["expert_loads"] == "expert_loads"
+    assert result["expert_score_sums"] == "expert_score_sums"
+    assert events == [
+        ("hidden_to", "cuda:1"),
+        ("forward", "warmup"),
+        ("sync", 1),
+        ("forward", "timed"),
+        ("sync", 1),
+        ("cpu", "expert_loads"),
+        ("cpu", "expert_score_sums"),
+        ("cpu", "output"),
+    ]

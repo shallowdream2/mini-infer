@@ -8,6 +8,7 @@
 - dispatch / gather 重排与逆置换
 - dense MoELayer vs EPMoELayer 数值等价
 - 2 卡 EPEngine 最小功能路径
+- 2 卡 EPEngine 的 zero-send-count 边界
 - SyntheticMoEConfig 参数校验
 - SyntheticMoEModel 的前向形状、逐层 router 辅助输出和最小 CUDA fp16 路径
 """
@@ -202,6 +203,35 @@ class TestDispatchAndEP:
         assert torch.allclose(ref, out, atol=1e-4, rtol=1e-4)
         assert int(aux["send_counts"].sum().item()) == x.shape[0] * x.shape[1] * dense.top_k
         assert int(aux["expert_loads"].sum().item()) == x.shape[0] * x.shape[1] * dense.top_k
+        assert float(bench["elapsed_s"]) > 0.0
+
+    @pytest.mark.skipif(
+        not torch.cuda.is_available() or torch.cuda.device_count() < 2,
+        reason="需要至少 2 张 CUDA GPU",
+    )
+    def test_ep_engine_handles_zero_send_count_cuda(self):
+        dense = MoELayer(
+            hidden_size=8,
+            intermediate_size=16,
+            num_experts=4,
+            top_k=2,
+            bias=True,
+        ).float().eval()
+        with torch.no_grad():
+            dense.router.gate.weight.zero_()
+            dense.router.gate.bias.copy_(torch.tensor([10.0, 9.0, -10.0, -11.0]))
+
+        x = torch.randn(2, 3, 8)
+        with torch.no_grad():
+            ref = dense.to("cuda:1")(x.to("cuda:1")).cpu()
+
+        engine = EPEngine.from_moe_layer(dense, ep_size=2, dtype="float32", src_rank=1)
+        out, aux = engine.forward(x, return_aux=True)
+        bench = engine.benchmark_forward(x, warmup=0, runs=1)
+
+        assert torch.allclose(ref, out, atol=1e-4, rtol=1e-4)
+        assert torch.equal(aux["send_counts"].cpu(), torch.tensor([x.shape[0] * x.shape[1] * dense.top_k, 0]))
+        assert torch.equal(bench["send_counts"].cpu(), aux["send_counts"].cpu())
         assert float(bench["elapsed_s"]) > 0.0
 
 
