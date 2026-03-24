@@ -1,4 +1,4 @@
-"""Phase 17 MoE 测试。
+"""Phase 17-18 MoE 测试。
 
 覆盖：
 - TopKRouter 的 top-k 范围和分数归一化
@@ -6,6 +6,7 @@
 - dense MoELayer 的 weighted combine 数值正确性
 - dense MoELayer 的路由统计
 - dispatch / gather 重排与逆置换
+- local expert shard 的 state_dict 切分与所有权
 - dense MoELayer vs EPMoELayer 数值等价
 - 2 卡 EPEngine 最小功能路径
 - 2 卡 EPEngine 的 zero-send-count 边界
@@ -28,6 +29,7 @@ from mini_infer.moe_layer import (
     RouterOutput,
     TopKRouter,
     build_dispatch_layout,
+    shard_moe_state_dict,
     summarize_routing,
 )
 from mini_infer.moe_model import SyntheticMoEConfig, SyntheticMoEModel
@@ -137,6 +139,25 @@ class TestDenseMoE:
 
 
 class TestDispatchAndEP:
+    def test_shard_moe_state_dict_keeps_only_local_experts(self):
+        dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2)
+
+        rank_state_dicts = shard_moe_state_dict(dense.state_dict(), num_experts=4, ep_size=2)
+
+        assert len(rank_state_dicts) == 2
+        assert "router.gate.weight" in rank_state_dicts[0]
+        assert "router.gate.weight" in rank_state_dicts[1]
+        assert any(key.startswith("experts.0.") for key in rank_state_dicts[0])
+        assert any(key.startswith("experts.1.") for key in rank_state_dicts[0])
+        assert not any(key.startswith("experts.2.") for key in rank_state_dicts[0])
+        assert not any(key.startswith("experts.3.") for key in rank_state_dicts[0])
+
+    def test_ep_layer_owns_only_local_expert_shard(self):
+        layer = EPMoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2, ep_size=2, rank=1)
+
+        assert len(layer.experts) == 2
+        assert list(layer.local_expert_ids()) == [2, 3]
+
     def test_dispatch_layout_groups_entries_by_rank(self):
         route = RouterOutput(
             expert_indices=torch.tensor([[0, 3], [1, 2]]),
@@ -174,7 +195,7 @@ class TestDispatchAndEP:
     def test_ep_layer_matches_dense_reference_cpu(self):
         torch.manual_seed(5)
         dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2)
-        ep = EPMoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2, ep_size=2)
+        ep = EPMoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2, ep_size=1)
         ep.load_state_dict(dense.state_dict(), strict=True)
 
         x = torch.randn(2, 3, 8)
@@ -183,6 +204,23 @@ class TestDispatchAndEP:
 
         assert torch.allclose(out_dense, out_ep, atol=1e-6, rtol=1e-6)
         assert int(aux.send_counts.sum().item()) == x.shape[0] * x.shape[1] * dense.top_k
+
+    def test_ep_engine_rejects_rank_state_dict_length_mismatch(self):
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            pytest.skip("需要至少 2 张 CUDA GPU")
+
+        shard = {"router.gate.weight": torch.zeros(4, 8)}
+        with pytest.raises(ValueError, match="rank_state_dicts"):
+            EPEngine(
+                hidden_size=8,
+                intermediate_size=16,
+                num_experts=4,
+                top_k=2,
+                ep_size=2,
+                dtype="float32",
+                rank_state_dicts=[shard],
+                src_rank=0,
+            )
 
     @pytest.mark.skipif(
         not torch.cuda.is_available() or torch.cuda.device_count() < 2,

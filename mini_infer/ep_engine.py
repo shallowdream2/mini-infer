@@ -1,8 +1,8 @@
-"""Phase 17：2 卡 Expert Parallel 引擎原型。
+"""Phase 17-18：2 卡 Expert Parallel 引擎原型。
 
 这个文件复用 Phase 13 的 `mp.spawn + file:// rendezvous` 约定，
-把 `EPMoELayer` 接成可直接运行的 2 卡功能原型。
-当前目标是验证 all-to-all forward 和结果回收，而不是提供生产级常驻服务。
+把 `EPMoELayer` 接成可直接运行的 2 卡功能原型。Phase 18 开始 worker
+不再接收完整 expert 权重，而是按 rank 只加载本地 expert shard。
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from .moe_layer import EPMoELayer, MoELayer
+from .moe_layer import EPMoELayer, MoELayer, shard_moe_state_dict
 
 
 _DTYPE_MAP = {
@@ -35,7 +35,7 @@ def _ep_worker(
     bias: bool,
     dtype: str,
     hidden_states_cpu: torch.Tensor,
-    layer_state_dict: dict[str, torch.Tensor],
+    rank_state_dicts: list[dict[str, torch.Tensor]],
     src_rank: int,
     warmup: int,
     runs: int,
@@ -67,11 +67,12 @@ def _ep_worker(
             src_rank=src_rank,
         ).to(device=device, dtype=torch_dtype)
 
+        rank_state_dict = rank_state_dicts[rank]
         state_dict = {
             key: value.to(dtype=torch_dtype)
             if torch.is_floating_point(value)
             else value
-            for key, value in layer_state_dict.items()
+            for key, value in rank_state_dict.items()
         }
         layer.load_state_dict(state_dict, strict=True)
         layer.eval()
@@ -137,7 +138,7 @@ class EPEngine:
         bias: bool = False,
         ep_size: int = 2,
         dtype: str = "float16",
-        layer_state_dict: dict[str, torch.Tensor] | None = None,
+        rank_state_dicts: list[dict[str, torch.Tensor]] | None = None,
         src_rank: int = 0,
     ) -> None:
         if ep_size < 2:
@@ -150,6 +151,10 @@ class EPEngine:
             raise ValueError(f"不支持的 dtype: {dtype!r}")
         if src_rank < 0 or src_rank >= ep_size:
             raise ValueError(f"src_rank 必须落在 [0, ep_size) 内，当前 src_rank={src_rank}, ep_size={ep_size}")
+        if rank_state_dicts is not None and len(rank_state_dicts) != ep_size:
+            raise ValueError(
+                f"rank_state_dicts 长度必须等于 ep_size={ep_size}，当前 {len(rank_state_dicts)}"
+            )
 
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
@@ -159,10 +164,13 @@ class EPEngine:
         self.ep_size = ep_size
         self.dtype = dtype
         self.src_rank = src_rank
-        self.layer_state_dict = None if layer_state_dict is None else {
-            key: value.detach().cpu()
-            for key, value in layer_state_dict.items()
-        }
+        self.rank_state_dicts = None if rank_state_dicts is None else [
+            {
+                key: value.detach().cpu()
+                for key, value in rank_state_dict.items()
+            }
+            for rank_state_dict in rank_state_dicts
+        ]
 
     @classmethod
     def from_moe_layer(
@@ -172,6 +180,11 @@ class EPEngine:
         dtype: str = "float16",
         src_rank: int = 0,
     ) -> "EPEngine":
+        rank_state_dicts = shard_moe_state_dict(
+            layer.state_dict(),
+            num_experts=layer.num_experts,
+            ep_size=ep_size,
+        )
         return cls(
             hidden_size=layer.hidden_size,
             intermediate_size=layer.intermediate_size,
@@ -180,7 +193,7 @@ class EPEngine:
             bias=layer.router.gate.bias is not None,
             ep_size=ep_size,
             dtype=dtype,
-            layer_state_dict=layer.state_dict(),
+            rank_state_dicts=rank_state_dicts,
             src_rank=src_rank,
         )
 
@@ -195,8 +208,10 @@ class EPEngine:
             raise ValueError(f"warmup 必须 >= 0，当前 {warmup}")
         if runs <= 0:
             raise ValueError(f"runs 必须 > 0，当前 {runs}")
-        if self.layer_state_dict is None:
-            raise RuntimeError("EPEngine.forward 需要 layer_state_dict；请使用 from_moe_layer() 或显式传入")
+        if self.rank_state_dicts is None:
+            raise RuntimeError(
+                "EPEngine.forward 需要 rank_state_dicts；请使用 from_moe_layer() 或显式传入"
+            )
 
         result_file = tempfile.mktemp(suffix=".pt")
         rendezvous_file = tempfile.mktemp()
@@ -213,7 +228,7 @@ class EPEngine:
                     self.bias,
                     self.dtype,
                     hidden_states.detach().cpu(),
-                    self.layer_state_dict,
+                    self.rank_state_dicts,
                     self.src_rank,
                     warmup,
                     runs,
@@ -232,6 +247,14 @@ class EPEngine:
                         os.unlink(path)
                     except OSError:
                         pass
+
+    def get_rank_state_dict(self, rank: int) -> dict[str, torch.Tensor]:
+        """返回某个 rank 的 local expert shard state_dict。"""
+        if self.rank_state_dicts is None:
+            raise RuntimeError("当前 EPEngine 没有 rank_state_dicts")
+        if rank < 0 or rank >= self.ep_size:
+            raise ValueError(f"rank 必须落在 [0, ep_size) 内，当前 rank={rank}, ep_size={self.ep_size}")
+        return self.rank_state_dicts[rank]
 
     def forward(
         self,

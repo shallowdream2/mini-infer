@@ -1,8 +1,8 @@
-"""Phase 17：synthetic MoE 层与 Expert Parallel 核心逻辑。
+"""Phase 17-18：synthetic MoE 层与 Expert Parallel 核心逻辑。
 
 这个文件提供两条路径：
 - `MoELayer`：单进程 dense 参考实现，作为数值 oracle
-- `EPMoELayer`：按 rank 对 expert 分片，并通过 dispatch / gather
+- `EPMoELayer`：按 rank 只持有本地 expert shard，并通过 dispatch / gather
   组织 all-to-all 所需的数据布局
 """
 
@@ -71,6 +71,31 @@ def _validate_ep_partition(num_experts: int, ep_size: int) -> int:
     if num_experts % ep_size != 0:
         raise ValueError(f"num_experts={num_experts} 必须能被 ep_size={ep_size} 整除")
     return num_experts // ep_size
+
+
+def shard_moe_state_dict(
+    layer_state_dict: dict[str, torch.Tensor],
+    num_experts: int,
+    ep_size: int,
+) -> list[dict[str, torch.Tensor]]:
+    """把 dense MoE 的 state_dict 切成每个 rank 的 local expert shard。"""
+    experts_per_rank = _validate_ep_partition(num_experts, ep_size)
+    rank_state_dicts = [{} for _ in range(ep_size)]
+
+    for key, value in layer_state_dict.items():
+        if key.startswith("experts."):
+            parts = key.split(".")
+            expert_id = int(parts[1])
+            owner_rank = expert_id // experts_per_rank
+            local_expert_id = expert_id % experts_per_rank
+            shard_key = ".".join(["experts", str(local_expert_id), *parts[2:]])
+            rank_state_dicts[owner_rank][shard_key] = value
+            continue
+
+        for rank_state_dict in rank_state_dicts:
+            rank_state_dict[key] = value
+
+    return rank_state_dicts
 
 
 def summarize_routing(route: RouterOutput, num_experts: int) -> RoutingStats:
@@ -266,12 +291,10 @@ class MoELayer(nn.Module):
 class EPMoELayer(nn.Module):
     """Expert Parallel MoE 层。
 
-    当前实现优先保证 dispatch / gather 数学路径和 2 卡 all-to-all 生命周期正确。
-    为了降低实现复杂度，每个 rank 当前仍持有完整 expert 权重，但只执行本 rank
-    负责的 expert 子集；后续若需要，再继续把权重物理分片收紧到真正的内存节省版本。
-    distributed 路径当前使用 padded `all_to_all_single` + valid mask，避免在 per-layer
-    forward 里把 CUDA count tensor 同步回 CPU。benchmark 会显式区分理想 EP bytes 和
-    当前 prototype padded bytes，防止把两者混为一谈。
+    Phase 18 开始，这里不再让每个 rank 持有完整 expert 列表，而是只实例化本 rank
+    负责的 local expert shard。router 仍完整复制；distributed 路径仍使用 padded
+    `all_to_all_single` + valid mask，避免在 per-layer forward 里引入 host sync。
+    benchmark 会显式区分理想 EP bytes、prototype bytes 与当前的权重分片收益。
     """
 
     def __init__(
@@ -298,6 +321,7 @@ class EPMoELayer(nn.Module):
         self.dist_group = dist_group
         self.src_rank = src_rank
         self.experts_per_rank = _validate_ep_partition(num_experts, ep_size)
+        self.local_expert_offset = self.rank * self.experts_per_rank
 
         self.router = TopKRouter(
             hidden_size=hidden_size,
@@ -312,7 +336,7 @@ class EPMoELayer(nn.Module):
                     intermediate_size=intermediate_size,
                     bias=bias,
                 )
-                for _ in range(num_experts)
+                for _ in range(self.experts_per_rank)
             ]
         )
 
@@ -370,13 +394,20 @@ class EPMoELayer(nn.Module):
         if dispatched_x.numel() == 0:
             return outputs
 
-        expert_id_iter = range(self.num_experts) if valid_expert_ids is None else valid_expert_ids
-        for expert_id in expert_id_iter:
+        if valid_expert_ids is None:
+            expert_pairs = [(expert_id, expert_id) for expert_id in range(len(self.experts))]
+        else:
+            expert_pairs = [
+                (expert_id, expert_id - self.local_expert_offset)
+                for expert_id in valid_expert_ids
+            ]
+
+        for expert_id, local_expert_id in expert_pairs:
             expert_mask = torch.where(expert_ids == expert_id)[0]
             if expert_mask.numel() == 0:
                 continue
             expert_in = dispatched_x.index_select(0, expert_mask)
-            expert_out = self.experts[expert_id](expert_in)
+            expert_out = self.experts[local_expert_id](expert_in)
             outputs.index_copy_(0, expert_mask, expert_out)
         return outputs
 
@@ -385,6 +416,11 @@ class EPMoELayer(nn.Module):
         x: torch.Tensor,
         return_aux: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, EPForwardAux]:
+        if self.ep_size != 1:
+            raise RuntimeError(
+                "Phase 18 起 local EPMoELayer.forward 只支持 ep_size=1；"
+                "ep_size>1 请使用 distributed 路径或 EPEngine"
+            )
         flat_x, leading_shape = _flatten_tokens(x)
         route = self.router(flat_x)
         dispatched_x, layout = self.dispatch_tokens(flat_x, route)
@@ -587,5 +623,6 @@ __all__ = [
     "RoutingStats",
     "TopKRouter",
     "build_dispatch_layout",
+    "shard_moe_state_dict",
     "summarize_routing",
 ]

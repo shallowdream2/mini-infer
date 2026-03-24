@@ -1,7 +1,8 @@
-"""Phase 17 benchmark 口径测试。
+"""Phase 17-18 benchmark 口径测试。
 
 覆盖：
 - TP / EP 通信量公式
+- 参数量与 local shard 统计
 - synthetic hidden state 构造
 - benchmark dry-run 所需的参数构造 helper
 - dense benchmark 计时窗口与 source device 同步口径
@@ -13,6 +14,7 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -70,6 +72,29 @@ def test_build_comm_summary_contains_formulas() -> None:
     assert "padded all_to_all_single" in summary["ep_impl_note"]
 
 
+def test_build_param_summary_reports_local_shard_ratio() -> None:
+    args = benchmark_moe.build_argparser().parse_args(
+        ["--num-experts", "4", "--ep-size", "2", "--src-rank", "1"]
+    )
+    layer = benchmark_moe.build_shared_layer(args)
+
+    summary = benchmark_moe.build_param_summary(layer, ep_size=2, src_rank=1)
+
+    assert summary["dense_param_bytes"] > summary["ep_rank_param_bytes"] > 0
+    assert summary["expert_param_bytes"] > 0
+    assert 0.5 < summary["shard_ratio"] < 1.0
+
+
+def test_build_param_summary_rejects_invalid_src_rank() -> None:
+    args = benchmark_moe.build_argparser().parse_args(
+        ["--num-experts", "4", "--ep-size", "2", "--src-rank", "2"]
+    )
+    layer = benchmark_moe.build_shared_layer(args)
+
+    with pytest.raises(ValueError, match="src_rank"):
+        benchmark_moe.build_param_summary(layer, ep_size=args.ep_size, src_rank=args.src_rank)
+
+
 def test_build_hidden_states_shape_and_dtype() -> None:
     hidden_states = benchmark_moe.build_hidden_states(
         batch_size=2,
@@ -117,6 +142,17 @@ def test_run_dry_run_does_not_instantiate_ep_engine(monkeypatch) -> None:
 
     assert result["mode"] == "ep"
     assert result["comm"]["ep_prototype_bytes_per_layer"] > 0
+    assert result["params"]["dense_param_bytes"] > result["params"]["ep_rank_param_bytes"]
+    assert result["params"]["expert_param_bytes"] > 0
+
+
+def test_run_dry_run_rejects_invalid_src_rank() -> None:
+    args = benchmark_moe.build_argparser().parse_args(
+        ["--mode", "dense", "--dry-run", "--ep-size", "2", "--src-rank", "2"]
+    )
+
+    with pytest.raises(ValueError, match="src_rank"):
+        benchmark_moe.run_dry_run(args)
 
 
 def test_run_compare_benchmark_uses_shared_layer_and_inputs(monkeypatch) -> None:

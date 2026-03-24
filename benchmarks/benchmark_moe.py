@@ -1,4 +1,4 @@
-"""Phase 17：synthetic MoE / Expert Parallel benchmark。
+"""Phase 17-18：synthetic MoE / Expert Parallel benchmark。
 
 对比对象：
 - dense `MoELayer`
@@ -13,6 +13,9 @@
 - 输入是 synthetic hidden states，不接真实 HuggingFace 权重
 - `--mode ep` 的正式计时在 worker 内部完成，默认排除 `mp.spawn` 与进程组初始化开销
 - `--compare` 使用同一组权重和同一组 hidden states 对比 dense / EP
+- 参数量结果同时区分：
+  - dense 全量参数
+  - EP 单 rank local shard 参数
 - 通信结果同时区分：
   - ideal EP hidden-state bytes（按真实 token 副本数估算）
   - current padded prototype bytes（按当前 `all_to_all_single` fixed chunk 实现估算）
@@ -27,7 +30,7 @@ import time
 import torch
 
 from mini_infer.ep_engine import EPEngine
-from mini_infer.moe_layer import MoELayer
+from mini_infer.moe_layer import MoELayer, shard_moe_state_dict
 from mini_infer.moe_model import SyntheticMoEConfig
 
 
@@ -36,6 +39,14 @@ _DTYPE_MAP = {
     "bfloat16": torch.bfloat16,
     "float32": torch.float32,
 }
+
+
+def validate_src_rank(src_rank: int, ep_size: int) -> None:
+    """统一校验 benchmark 入口的 source rank。"""
+    if src_rank < 0 or src_rank >= ep_size:
+        raise ValueError(
+            f"src_rank 必须落在 [0, ep_size) 内，当前 src_rank={src_rank}, ep_size={ep_size}"
+        )
 
 
 def build_hidden_states(
@@ -77,7 +88,10 @@ def build_shared_hidden_states(args: argparse.Namespace) -> torch.Tensor:
 
 def resolve_dense_device(args: argparse.Namespace) -> int:
     """compare 模式下 dense 与 EP 共享同一 source device 口径。"""
-    return args.src_rank if args.compare else args.device
+    if args.compare:
+        validate_src_rank(args.src_rank, args.ep_size)
+        return args.src_rank
+    return args.device
 
 
 def compute_tp_bytes_per_layer(
@@ -140,6 +154,44 @@ def build_comm_summary(
             "current EPMoELayer uses padded all_to_all_single chunks to avoid per-layer "
             "host sync; hidden-state bytes only, expert-id/valid metadata excluded"
         ),
+    }
+
+
+def compute_state_dict_bytes(
+    state_dict: dict[str, torch.Tensor],
+    prefix: str | None = None,
+) -> int:
+    """统计 state_dict 中张量占用的总字节数。"""
+    total = 0
+    for key, value in state_dict.items():
+        if prefix is not None and not key.startswith(prefix):
+            continue
+        total += value.numel() * value.element_size()
+    return total
+
+
+def build_param_summary(
+    layer: MoELayer,
+    ep_size: int,
+    src_rank: int,
+) -> dict[str, object]:
+    """统计 dense 参数量与单 rank local shard 参数量。"""
+    validate_src_rank(src_rank, ep_size)
+    dense_state_dict = layer.state_dict()
+    rank_state_dicts = shard_moe_state_dict(
+        dense_state_dict,
+        num_experts=layer.num_experts,
+        ep_size=ep_size,
+    )
+    dense_param_bytes = compute_state_dict_bytes(dense_state_dict)
+    expert_param_bytes = compute_state_dict_bytes(dense_state_dict, prefix="experts.")
+    ep_rank_param_bytes = compute_state_dict_bytes(rank_state_dicts[src_rank])
+    shard_ratio = ep_rank_param_bytes / dense_param_bytes
+    return {
+        "dense_param_bytes": dense_param_bytes,
+        "ep_rank_param_bytes": ep_rank_param_bytes,
+        "expert_param_bytes": expert_param_bytes,
+        "shard_ratio": shard_ratio,
     }
 
 
@@ -276,7 +328,7 @@ def run_dry_run(args: argparse.Namespace) -> dict[str, object]:
         num_experts=args.num_experts,
         top_k=args.top_k,
     )
-    _ = build_shared_layer(args)
+    shared_layer = build_shared_layer(args)
     _ = build_shared_hidden_states(args)
     comm = build_comm_summary(
         num_tokens=args.batch_size * args.seq_len,
@@ -285,14 +337,16 @@ def run_dry_run(args: argparse.Namespace) -> dict[str, object]:
         dtype=args.dtype,
         ep_size=args.ep_size,
     )
+    params = build_param_summary(shared_layer, ep_size=args.ep_size, src_rank=args.src_rank)
     return {
         "mode": "compare" if args.compare else args.mode,
         "comm": comm,
+        "params": params,
     }
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Phase 17 synthetic MoE / EP benchmark")
+    parser = argparse.ArgumentParser(description="Phase 18 true expert sharding benchmark")
     parser.add_argument("--mode", choices=["dense", "ep"], default="dense")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -318,7 +372,8 @@ def main() -> None:
     if args.dry_run:
         dry_run = run_dry_run(args)
         comm = dry_run["comm"]
-        print("=== Phase 17 benchmark dry-run ===")
+        params = dry_run["params"]
+        print("=== MoE / EP benchmark dry-run ===")
         print(f"mode={dry_run['mode']}")
         print(
             f"batch_size={args.batch_size}, seq_len={args.seq_len}, hidden={args.hidden_size}, "
@@ -330,10 +385,19 @@ def main() -> None:
         print(f"tp_bytes_per_layer={comm['tp_bytes_per_layer']}")
         print(f"ep_ideal_bytes_per_layer={comm['ep_ideal_bytes_per_layer']}")
         print(f"ep_prototype_bytes_per_layer={comm['ep_prototype_bytes_per_layer']}")
+        print(f"dense_param_bytes={params['dense_param_bytes']}")
+        print(f"ep_rank_param_bytes={params['ep_rank_param_bytes']}")
+        print(f"expert_param_bytes={params['expert_param_bytes']}")
+        print(f"shard_ratio={params['shard_ratio']:.4f}")
         print(f"ep_impl_note={comm['ep_impl_note']}")
         print("dry_run=ok")
         return
 
+    param_summary = build_param_summary(
+        build_shared_layer(args),
+        ep_size=args.ep_size,
+        src_rank=args.src_rank,
+    )
     comm = build_comm_summary(
         num_tokens=args.batch_size * args.seq_len,
         hidden_size=args.hidden_size,
@@ -345,7 +409,7 @@ def main() -> None:
         result = run_compare_benchmark(args)
         dense = result["dense"]
         ep = result["ep"]
-        print("=== Phase 17 benchmark (compare) ===")
+        print("=== MoE / EP benchmark (compare) ===")
         print(f"dense_throughput_tok_s={dense['throughput_tok_s']:.2f}")
         print(f"ep_throughput_tok_s={ep['throughput_tok_s']:.2f}")
         print(f"max_abs_diff={result['max_abs_diff']:.6f}")
@@ -363,7 +427,7 @@ def main() -> None:
         else:
             result = run_ep_benchmark(args)
 
-        print(f"=== Phase 17 benchmark ({result['mode']}) ===")
+        print(f"=== MoE / EP benchmark ({result['mode']}) ===")
         print(f"throughput_tok_s={result['throughput_tok_s']:.2f}")
         print(f"note={result['note']}")
         if "send_counts" in result:
@@ -378,6 +442,10 @@ def main() -> None:
     print(f"tp_bytes_per_layer={comm['tp_bytes_per_layer']}")
     print(f"ep_ideal_bytes_per_layer={comm['ep_ideal_bytes_per_layer']}")
     print(f"ep_prototype_bytes_per_layer={comm['ep_prototype_bytes_per_layer']}")
+    print(f"dense_param_bytes={param_summary['dense_param_bytes']}")
+    print(f"ep_rank_param_bytes={param_summary['ep_rank_param_bytes']}")
+    print(f"expert_param_bytes={param_summary['expert_param_bytes']}")
+    print(f"shard_ratio={param_summary['shard_ratio']:.4f}")
     print(f"ep_impl_note={comm['ep_impl_note']}")
 
 
