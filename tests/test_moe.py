@@ -387,8 +387,9 @@ class TestDispatchAndEP:
         assert int(aux.send_counts.sum().item()) == x.shape[0] * x.shape[1] * dense.top_k
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA 不可用")
-    def test_ep_layer_grouped_local_cuda_keeps_api_working(self):
+    def test_ep_layer_grouped_local_cuda_matches_dense_without_naive_fallback(self, monkeypatch):
         torch.manual_seed(11)
+        dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2).float().eval()
         layer = EPMoELayer(
             hidden_size=8,
             intermediate_size=16,
@@ -397,14 +398,46 @@ class TestDispatchAndEP:
             ep_size=1,
             expert_exec_mode="grouped",
         ).cuda().float().eval()
+        layer.load_state_dict(dense.state_dict(), strict=True)
         x = torch.randn(2, 3, 8, device="cuda")
 
+        def _fail_naive(*args, **kwargs):
+            raise AssertionError("local grouped CUDA path 不应回退到 naive")
+
+        monkeypatch.setattr(layer, "_apply_experts_naive", _fail_naive)
+
         with torch.no_grad():
+            ref = dense.cuda()(x)
             out, aux = layer(x, return_aux=True)
 
-        assert out.shape == x.shape
+        assert torch.allclose(ref, out, atol=1e-4, rtol=1e-4)
         assert out.dtype == x.dtype
         assert int(aux.send_counts.sum().item()) == x.shape[0] * x.shape[1] * layer.top_k
+
+    def test_grouped_resident_batched_params_invalidate_on_apply_and_load_state_dict(self):
+        torch.manual_seed(17)
+        dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2).float().eval()
+        layer = EPMoELayer(
+            hidden_size=8,
+            intermediate_size=16,
+            num_experts=4,
+            top_k=2,
+            ep_size=1,
+            expert_exec_mode="grouped",
+        ).float().eval()
+        layer.load_state_dict(dense.state_dict(), strict=True)
+        _ = layer._get_grouped_batched_params(
+            list(range(layer.experts_per_rank)),
+            compute_dtype=torch.float32,
+        )
+
+        assert layer.grouped_resident_gateup_cache_bytes() > 0
+
+        layer = layer.to(dtype=torch.float64)
+        assert layer.grouped_resident_gateup_cache_bytes() == 0
+
+        layer.load_state_dict(layer.state_dict(), strict=True)
+        assert layer.grouped_resident_gateup_cache_bytes() == 0
 
     def test_ep_engine_rejects_rank_state_dict_length_mismatch(self):
         if not torch.cuda.is_available() or torch.cuda.device_count() < 2:

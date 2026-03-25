@@ -17,6 +17,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
 
 _COMM_MODES = {"padded", "packed"}
 _EXPERT_EXEC_MODES = {"naive", "grouped"}
@@ -101,6 +102,16 @@ class GroupedExpertMetadata:
 
     runs: list[GroupedExpertRun]
     total_tokens: int
+
+
+@dataclass
+class _GroupedBatchedExpertParams:
+    """grouped batched MLP 所需的按 local expert 堆叠权重。"""
+
+    gate_weight_t: torch.Tensor
+    up_weight_t: torch.Tensor
+    gate_bias: Optional[torch.Tensor]
+    up_bias: Optional[torch.Tensor]
 
 
 def build_grouped_expert_metadata_from_local_counts(
@@ -523,6 +534,20 @@ class EPMoELayer(nn.Module):
                 for _ in range(self.experts_per_rank)
             ]
         )
+        self._grouped_resident_batched_params: Optional[_GroupedBatchedExpertParams] = None
+        self._grouped_resident_batched_params_dtype: Optional[torch.dtype] = None
+
+    def _invalidate_grouped_resident_batched_params(self) -> None:
+        self._grouped_resident_batched_params = None
+        self._grouped_resident_batched_params_dtype = None
+
+    def _apply(self, fn):
+        self._invalidate_grouped_resident_batched_params()
+        return super()._apply(fn)
+
+    def load_state_dict(self, state_dict, strict: bool = True, assign: bool = False):
+        self._invalidate_grouped_resident_batched_params()
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def local_expert_ids(self, rank: Optional[int] = None) -> range:
         owner_rank = self.rank if rank is None else rank
@@ -595,6 +620,146 @@ class EPMoELayer(nn.Module):
             outputs.index_copy_(0, expert_mask, expert_out)
         return outputs
 
+    def _pack_grouped_batched_params(
+        self,
+        local_expert_ids: list[int],
+        *,
+        compute_dtype: torch.dtype,
+    ) -> _GroupedBatchedExpertParams:
+        if not local_expert_ids:
+            raise ValueError("grouped batched params 至少需要一个 local_expert_id")
+        experts = [self.experts[local_expert_id] for local_expert_id in local_expert_ids]
+        gate_weight_t = torch.stack(
+            [expert.gate_proj.weight.to(dtype=compute_dtype).transpose(0, 1) for expert in experts],
+            dim=0,
+        ).contiguous()
+        up_weight_t = torch.stack(
+            [expert.up_proj.weight.to(dtype=compute_dtype).transpose(0, 1) for expert in experts],
+            dim=0,
+        ).contiguous()
+
+        if experts[0].gate_proj.bias is None:
+            gate_bias = None
+            up_bias = None
+        else:
+            gate_bias = torch.stack(
+                [expert.gate_proj.bias.to(dtype=compute_dtype) for expert in experts],
+                dim=0,
+            ).contiguous()
+            up_bias = torch.stack(
+                [expert.up_proj.bias.to(dtype=compute_dtype) for expert in experts],
+                dim=0,
+            ).contiguous()
+
+        return _GroupedBatchedExpertParams(
+            gate_weight_t=gate_weight_t,
+            up_weight_t=up_weight_t,
+            gate_bias=gate_bias,
+            up_bias=up_bias,
+        )
+
+    def _build_grouped_resident_batched_params(
+        self,
+        *,
+        compute_dtype: torch.dtype,
+    ) -> _GroupedBatchedExpertParams:
+        return self._pack_grouped_batched_params(
+            list(range(self.experts_per_rank)),
+            compute_dtype=compute_dtype,
+        )
+
+    def _get_grouped_batched_params(
+        self,
+        local_expert_ids: list[int],
+        *,
+        compute_dtype: torch.dtype,
+    ) -> _GroupedBatchedExpertParams:
+        if not local_expert_ids:
+            raise ValueError("grouped batched params 至少需要一个 local_expert_id")
+
+        resident = self._grouped_resident_batched_params
+        if resident is None or self._grouped_resident_batched_params_dtype != compute_dtype:
+            resident = self._build_grouped_resident_batched_params(compute_dtype=compute_dtype)
+            self._grouped_resident_batched_params = resident
+            self._grouped_resident_batched_params_dtype = compute_dtype
+
+        if local_expert_ids == list(range(self.experts_per_rank)):
+            return resident
+
+        index = torch.tensor(
+            local_expert_ids,
+            dtype=torch.int64,
+            device=resident.gate_weight_t.device,
+        )
+        gate_bias = None if resident.gate_bias is None else resident.gate_bias.index_select(0, index)
+        up_bias = None if resident.up_bias is None else resident.up_bias.index_select(0, index)
+        return _GroupedBatchedExpertParams(
+            gate_weight_t=resident.gate_weight_t.index_select(0, index),
+            up_weight_t=resident.up_weight_t.index_select(0, index),
+            gate_bias=gate_bias,
+            up_bias=up_bias,
+        )
+
+    def grouped_resident_gateup_cache_bytes(self) -> int:
+        resident = self._grouped_resident_batched_params
+        if resident is None:
+            return 0
+        total = resident.gate_weight_t.numel() * resident.gate_weight_t.element_size()
+        total += resident.up_weight_t.numel() * resident.up_weight_t.element_size()
+        if resident.gate_bias is not None:
+            total += resident.gate_bias.numel() * resident.gate_bias.element_size()
+        if resident.up_bias is not None:
+            total += resident.up_bias.numel() * resident.up_bias.element_size()
+        return total
+
+    def _apply_experts_grouped_batched(
+        self,
+        dispatched_x: torch.Tensor,
+        metadata: GroupedExpertMetadata,
+    ) -> torch.Tensor:
+        if metadata.total_tokens != dispatched_x.shape[0]:
+            raise ValueError(
+                f"grouped metadata.total_tokens={metadata.total_tokens} 必须等于 dispatched_x tokens={dispatched_x.shape[0]}"
+            )
+        if not metadata.runs:
+            return dispatched_x.new_empty((0, self.hidden_size))
+
+        lengths = [run.end - run.start for run in metadata.runs]
+        if any(length <= 0 for length in lengths):
+            raise ValueError("grouped metadata 中每个 run 的长度都必须 > 0")
+
+        if len(metadata.runs) == 1:
+            run = metadata.runs[0]
+            return self.experts[run.local_expert_id](dispatched_x[run.start : run.end])
+
+        input_chunks = list(dispatched_x.split(lengths, dim=0))
+        compute_dtype = dispatched_x.dtype
+        padded_inputs = pad_sequence(input_chunks, batch_first=True)
+        experts = [self.experts[run.local_expert_id] for run in metadata.runs]
+        params = self._get_grouped_batched_params(
+            [run.local_expert_id for run in metadata.runs],
+            compute_dtype=compute_dtype,
+        )
+
+        gate = torch.bmm(padded_inputs, params.gate_weight_t)
+        up = torch.bmm(padded_inputs, params.up_weight_t)
+        if params.gate_bias is not None:
+            gate = gate + params.gate_bias.unsqueeze(1)
+            up = up + params.up_bias.unsqueeze(1)
+
+        hidden = F.silu(gate) * up
+        # `nn.Linear` per run introduces extra Python/module overhead here; use the
+        # underlying weight/bias directly so grouped execution stays exact while
+        # reusing the resident gate/up cache built for grouped execution.
+        output_chunks = []
+        for i, (expert, length) in enumerate(zip(experts, lengths)):
+            expert_hidden = hidden[i, :length]
+            expert_out = torch.mm(expert_hidden, expert.down_proj.weight.transpose(0, 1))
+            if expert.down_proj.bias is not None:
+                expert_out = expert_out + expert.down_proj.bias
+            output_chunks.append(expert_out)
+        return torch.cat(output_chunks, dim=0)
+
     def _apply_experts_grouped(
         self,
         dispatched_x: torch.Tensor,
@@ -636,6 +801,16 @@ class EPMoELayer(nn.Module):
                 num_local_experts=num_local_experts,
             )
 
+        if metadata.total_tokens != dispatched_x.shape[0]:
+            raise ValueError(
+                f"grouped metadata.total_tokens={metadata.total_tokens} 必须等于 dispatched_x tokens={dispatched_x.shape[0]}"
+            )
+        if not metadata.runs:
+            return outputs
+
+        if dispatched_x.is_cuda:
+            return self._apply_experts_grouped_batched(dispatched_x, metadata)
+
         for run in metadata.runs:
             expert_in = dispatched_x[run.start : run.end]
             expert_out = self.experts[run.local_expert_id](expert_in)
@@ -662,6 +837,23 @@ class EPMoELayer(nn.Module):
             valid_expert_ids=valid_expert_ids,
         )
 
+    def _build_local_grouped_metadata(
+        self,
+        layout: DispatchLayout,
+    ) -> GroupedExpertMetadata:
+        # 这里只服务 local ep_size=1 的 API 正确性路径，不参与官方 2-GPU benchmark。
+        # grouped metadata 仍需 Python run 列表，因此本地 CUDA 路径允许在这里做一次
+        # 计数读回；distributed packed/grouped 正式路径会在 worker 控制流里预先构造。
+        local_counts = build_grouped_local_expert_counts(
+            layout,
+            ep_size=1,
+            num_local_experts=self.experts_per_rank,
+        )[0].cpu().tolist()
+        return build_grouped_expert_metadata_from_local_counts(
+            local_counts,
+            local_expert_offset=self.local_expert_offset,
+        )
+
     def _forward_local(
         self,
         x: torch.Tensor,
@@ -675,7 +867,14 @@ class EPMoELayer(nn.Module):
         flat_x, leading_shape = _flatten_tokens(x)
         route = self.router(flat_x)
         dispatched_x, layout = self.dispatch_tokens(flat_x, route)
-        dispatched_out = self._apply_experts(dispatched_x, layout.expert_ids)
+        grouped_metadata = None
+        if self.expert_exec_mode == "grouped":
+            grouped_metadata = self._build_local_grouped_metadata(layout)
+        dispatched_out = self._apply_experts(
+            dispatched_x,
+            layout.expert_ids,
+            grouped_metadata=grouped_metadata,
+        )
         combined = self.combine_dispatched(
             dispatched_outputs=dispatched_out,
             layout=layout,

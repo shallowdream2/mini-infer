@@ -201,7 +201,9 @@ def build_comm_summary(
         "ep_grouped_impl_note": (
             "Phase 21 expert_exec_mode=grouped keeps packed exact split-size all_to_all_single; "
             "local expert execution switches from per-expert where/index_select/index_copy_ "
-            "to grouped contiguous slices; hidden-state bytes remain identical to packed/ideal"
+            "to grouped contiguous slices + batched gate/up projections while down_proj remains per-expert; "
+            "hidden-state bytes remain identical to packed/ideal; grouped mode keeps a resident local gate/up "
+            "packed-weight cache and benchmark reports the extra runtime resident bytes separately"
         ),
         "ep_packed_control_plane_note": (
             "control_plane_ms/share measure worker-side packed split-size control plane only; "
@@ -223,10 +225,23 @@ def compute_state_dict_bytes(
     return total
 
 
+def compute_state_dict_numel(
+    state_dict: dict[str, torch.Tensor],
+    prefix: str | None = None,
+) -> int:
+    total = 0
+    for key, value in state_dict.items():
+        if prefix is not None and not key.startswith(prefix):
+            continue
+        total += value.numel()
+    return total
+
+
 def build_param_summary(
     layer: MoELayer,
     ep_size: int,
     src_rank: int,
+    runtime_dtype: str | None = None,
 ) -> dict[str, object]:
     """统计 dense 参数量与单 rank local shard 参数量。"""
     validate_src_rank(src_rank, ep_size)
@@ -240,12 +255,38 @@ def build_param_summary(
     expert_param_bytes = compute_state_dict_bytes(dense_state_dict, prefix="experts.")
     ep_rank_param_bytes = compute_state_dict_bytes(rank_state_dicts[src_rank])
     shard_ratio = ep_rank_param_bytes / dense_param_bytes
-    return {
+    summary = {
         "dense_param_bytes": dense_param_bytes,
         "ep_rank_param_bytes": ep_rank_param_bytes,
         "expert_param_bytes": expert_param_bytes,
         "shard_ratio": shard_ratio,
     }
+    if runtime_dtype is not None:
+        runtime_dtype_bytes = torch.empty((), dtype=_DTYPE_MAP[runtime_dtype]).element_size()
+        dense_param_numel = compute_state_dict_numel(dense_state_dict)
+        ep_rank_param_numel = compute_state_dict_numel(rank_state_dicts[src_rank])
+        local_experts = layer.num_experts // ep_size
+        grouped_gateup_cache_numel = 2 * local_experts * layer.hidden_size * layer.intermediate_size
+        if layer.experts[0].gate_proj.bias is not None:
+            grouped_gateup_cache_numel += 2 * local_experts * layer.intermediate_size
+        dense_runtime_param_bytes = dense_param_numel * runtime_dtype_bytes
+        ep_rank_runtime_param_bytes = ep_rank_param_numel * runtime_dtype_bytes
+        ep_grouped_runtime_gateup_cache_bytes = grouped_gateup_cache_numel * runtime_dtype_bytes
+        ep_grouped_runtime_resident_bytes = ep_rank_runtime_param_bytes + ep_grouped_runtime_gateup_cache_bytes
+        summary.update(
+            {
+                "dense_runtime_param_bytes": dense_runtime_param_bytes,
+                "ep_rank_runtime_param_bytes": ep_rank_runtime_param_bytes,
+                "ep_grouped_runtime_gateup_cache_bytes": ep_grouped_runtime_gateup_cache_bytes,
+                "ep_grouped_runtime_resident_bytes": ep_grouped_runtime_resident_bytes,
+                "ep_grouped_runtime_resident_ratio": ep_grouped_runtime_resident_bytes / dense_runtime_param_bytes,
+                "ep_grouped_runtime_resident_note": (
+                    "grouped mode keeps a resident local gate/up packed-weight cache; "
+                    "runtime resident bytes include this cache in addition to the rank-local shard"
+                ),
+            }
+        )
+    return summary
 
 
 def build_dense_layer(
@@ -351,7 +392,7 @@ def run_ep_benchmark(
     if selected_comm_mode == "packed":
         note += "; includes source-rank router/dispatch + split-size control plane"
     if selected_expert_exec_mode == "grouped":
-        note += "; local expert execution uses grouped contiguous slices"
+        note += "; local expert execution uses grouped contiguous slices + batched gate/up projections while down_proj remains per-expert; grouped mode keeps a resident local gate/up packed-weight cache"
     if selected_comm_mode == "packed":
         if selected_expert_exec_mode == "grouped":
             control_plane_note = (
@@ -454,7 +495,12 @@ def run_dry_run(args: argparse.Namespace) -> dict[str, object]:
         dtype=args.dtype,
         ep_size=args.ep_size,
     )
-    params = build_param_summary(shared_layer, ep_size=args.ep_size, src_rank=args.src_rank)
+    params = build_param_summary(
+        shared_layer,
+        ep_size=args.ep_size,
+        src_rank=args.src_rank,
+        runtime_dtype=args.dtype,
+    )
     return {
         "mode": "compare" if args.compare else args.mode,
         "comm": comm,
@@ -512,6 +558,12 @@ def main() -> None:
         print(f"ep_rank_param_bytes={params['ep_rank_param_bytes']}")
         print(f"expert_param_bytes={params['expert_param_bytes']}")
         print(f"shard_ratio={params['shard_ratio']:.4f}")
+        print(f"dense_runtime_param_bytes={params['dense_runtime_param_bytes']}")
+        print(f"ep_rank_runtime_param_bytes={params['ep_rank_runtime_param_bytes']}")
+        print(f"ep_grouped_runtime_gateup_cache_bytes={params['ep_grouped_runtime_gateup_cache_bytes']}")
+        print(f"ep_grouped_runtime_resident_bytes={params['ep_grouped_runtime_resident_bytes']}")
+        print(f"ep_grouped_runtime_resident_ratio={params['ep_grouped_runtime_resident_ratio']:.4f}")
+        print(f"ep_grouped_runtime_resident_note={params['ep_grouped_runtime_resident_note']}")
         print(f"ep_padded_impl_note={comm['ep_padded_impl_note']}")
         print(f"ep_packed_impl_note={comm['ep_packed_impl_note']}")
         print(f"ep_grouped_impl_note={comm['ep_grouped_impl_note']}")
@@ -523,6 +575,7 @@ def main() -> None:
         build_shared_layer(args),
         ep_size=args.ep_size,
         src_rank=args.src_rank,
+        runtime_dtype=args.dtype,
     )
     comm = build_comm_summary(
         num_tokens=args.batch_size * args.seq_len,
@@ -612,6 +665,12 @@ def main() -> None:
     print(f"ep_rank_param_bytes={param_summary['ep_rank_param_bytes']}")
     print(f"expert_param_bytes={param_summary['expert_param_bytes']}")
     print(f"shard_ratio={param_summary['shard_ratio']:.4f}")
+    print(f"dense_runtime_param_bytes={param_summary['dense_runtime_param_bytes']}")
+    print(f"ep_rank_runtime_param_bytes={param_summary['ep_rank_runtime_param_bytes']}")
+    print(f"ep_grouped_runtime_gateup_cache_bytes={param_summary['ep_grouped_runtime_gateup_cache_bytes']}")
+    print(f"ep_grouped_runtime_resident_bytes={param_summary['ep_grouped_runtime_resident_bytes']}")
+    print(f"ep_grouped_runtime_resident_ratio={param_summary['ep_grouped_runtime_resident_ratio']:.4f}")
+    print(f"ep_grouped_runtime_resident_note={param_summary['ep_grouped_runtime_resident_note']}")
     print(f"ep_padded_impl_note={comm['ep_padded_impl_note']}")
     print(f"ep_packed_impl_note={comm['ep_packed_impl_note']}")
     print(f"ep_grouped_impl_note={comm['ep_grouped_impl_note']}")

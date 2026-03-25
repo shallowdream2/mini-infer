@@ -100,6 +100,9 @@ def test_build_comm_summary_contains_formulas() -> None:
     assert "comm_mode=packed" in summary["ep_packed_impl_note"]
     assert "control_plane_ms/control_plane_share" in summary["ep_packed_impl_note"]
     assert "expert_exec_mode=grouped" in summary["ep_grouped_impl_note"]
+    assert "down_proj remains per-expert" in summary["ep_grouped_impl_note"]
+    assert "resident local gate/up" in summary["ep_grouped_impl_note"]
+    assert "runtime resident bytes separately" in summary["ep_grouped_impl_note"]
     assert "control_plane_ms/share" in summary["ep_packed_control_plane_note"]
 
 
@@ -109,11 +112,20 @@ def test_build_param_summary_reports_local_shard_ratio() -> None:
     )
     layer = benchmark_moe.build_shared_layer(args)
 
-    summary = benchmark_moe.build_param_summary(layer, ep_size=2, src_rank=1)
+    summary = benchmark_moe.build_param_summary(
+        layer,
+        ep_size=2,
+        src_rank=1,
+        runtime_dtype="float16",
+    )
 
     assert summary["dense_param_bytes"] > summary["ep_rank_param_bytes"] > 0
     assert summary["expert_param_bytes"] > 0
     assert 0.5 < summary["shard_ratio"] < 1.0
+    assert summary["dense_runtime_param_bytes"] > summary["ep_rank_runtime_param_bytes"] > 0
+    assert summary["ep_grouped_runtime_gateup_cache_bytes"] > 0
+    assert summary["ep_grouped_runtime_resident_bytes"] > summary["ep_rank_runtime_param_bytes"]
+    assert summary["ep_grouped_runtime_resident_ratio"] > summary["shard_ratio"]
 
 
 def test_build_param_summary_rejects_invalid_src_rank() -> None:
@@ -188,6 +200,7 @@ def test_run_dry_run_does_not_instantiate_ep_engine(monkeypatch) -> None:
     assert "expert_exec_mode=grouped" in result["comm"]["ep_grouped_impl_note"]
     assert result["params"]["dense_param_bytes"] > result["params"]["ep_rank_param_bytes"]
     assert result["params"]["expert_param_bytes"] > 0
+    assert result["params"]["ep_grouped_runtime_gateup_cache_bytes"] > 0
 
 
 def test_run_dry_run_rejects_invalid_src_rank() -> None:
@@ -329,7 +342,9 @@ def test_run_ep_benchmark_reports_control_plane_metrics(monkeypatch) -> None:
     assert "PackedControlPlane" in result["control_plane_note"]
     assert "grouped local-expert count sync/helper" in result["control_plane_note"]
     assert result["expert_exec_mode"] == "grouped"
-    assert "grouped contiguous slices" in result["note"]
+    assert "batched gate/up projections" in result["note"]
+    assert "down_proj remains per-expert" in result["note"]
+    assert "resident local gate/up packed-weight cache" in result["note"]
 
 
 def test_run_dense_benchmark_times_only_gpu_work_on_selected_device(monkeypatch) -> None:
