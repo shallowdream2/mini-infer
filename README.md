@@ -1,10 +1,21 @@
 # Mini-Infer
 
-这个文件说明 mini-infer 项目的目标、实现状态、性能数据和快速上手方式。
+> **面向 AI Infra 推理方向的系统级工程项目**：从零复现 LLM 推理引擎核心机制，覆盖 runtime 调度、attention kernel、分布式扩展、量化推理和 MoE Expert Parallelism，共 21 个阶段，每阶段均有完整的 benchmark 数据和技术总结。
 
-## 项目概述
+## 项目背景与定位
 
-mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项目，从零实现了以下核心机制：
+**为什么做这个项目**：大多数"LLM 推理入门"项目停留在 API 调用层，无法解释 vLLM、TRT-LLM、Megatron-LM 等系统的核心设计选择。本项目目标是**从 PyTorch 原语出发**，亲手实现关键机制，弄清楚每个优化在什么情况下有效、代价是什么、和工业系统的差距在哪里。
+
+**三条核心主线（由浅到深）**：
+1. **Runtime 主链路**（Phase 1-10）：PagedAttention + Continuous Batching + Chunked Prefill + Prefix Caching，最终 batch=8 对齐 HF Transformers baseline（100%）
+2. **分布式与 Kernel 优化**（Phase 11-15）：Triton 自定义 kernel、Tensor Parallelism（NCCL all-reduce）、MLA（DeepSeek-V2/V3 架构）、PD 解耦
+3. **量化与 MoE/EP 主线**（Phase 16-21）：W8A8 量化（权重显存 −32.4%）、synthetic MoE + Expert Parallelism（all-to-all dispatch、True Expert Sharding、Non-Padded Communication、Grouped Local Expert Execution，`EP grouped / dense = 2.500×`）
+
+**与工业系统的定位差异**：本项目是学习闭环，不是生产 serving 系统。Phase 17-21 的 MoE/EP benchmark 基于 synthetic layer-level workload（单层 MoE forward），不包含完整 serving 链路；Phase 16 量化是 W8A8 第一版原型，不是 AWQ/SmoothQuant 级别的精度优化。每个阶段的 prototype 边界在对应总结文档中均有明确说明。
+
+## 功能清单
+
+mini-infer 从零实现了以下核心机制（按阶段顺序）：
 
 - **Paged KV Cache**：BlockTable + 空闲块池，消除连续 KV 缓存的显存碎片
 - **Prefill / Decode 分离**：Prefill 单独 forward，Decode 步合并成 batch
@@ -22,13 +33,14 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **Tensor Parallelism**：Megatron-LM 风格，column/row parallel 权重切分 + NCCL all-reduce forward hook，TP=2 greedy 输出与单卡完全一致
 - **MLA（Multi-head Latent Attention）**：DeepSeek-V2/V3 架构，latent cache 压缩 56.25% vs GQA，矩阵吸收优化
 - **PD 解耦（Disaggregated Prefill/Decode）**：同机双进程原型，KV 序列化传输，TTFT 三段分解（prefill/transfer/decode）
-- **量化推理**（Phase 16）：int8 权重存储 + W8A8 / mixed fallback，1.5B 权重显存 −32.4%，greedy token match 71.8%，decode 全量 fallback
+- **量化推理**（Phase 16）：per-channel int8 权重存储 + W8A8（大 M prefill）/ mixed-fallback（小 M decode）；跳过 attention 投影层（q/k/v/o_proj）保证正确性；1.5B 权重显存 −32.4%，greedy token match 71.8%，decode 路径以 int8 权重 + float activation 的高保真 fallback 为主
 - **MoE + Expert Parallelism**（Phase 17）：synthetic MoE + 2-GPU EP，dense oracle 对齐，正式 benchmark `EP / dense = 1.891x`
 - **True Expert Sharding**（Phase 18）：2 卡 `per-rank local expert shard`，正式 benchmark `shard_ratio = 0.5002`，`EP / dense = 1.916x`
 - **Non-Padded Expert Dispatch / EP 通信闭环**（Phase 19）：`ep_packed_bytes_per_layer = ep_ideal_bytes_per_layer`，正式 benchmark `EP packed / dense = 2.323x`，`EP packed / EP padded = 1.217x`
 - **EP Control Plane 收敛**（Phase 20）：packed control-plane 显式量化，正式 benchmark `EP packed / dense = 2.310x`，`EP packed / EP padded = 1.204x`，`control_plane_share ≈ 1.94%`
+- **Grouped Expert Execution / Dispatch Overlap 原型**（Phase 21）：正式 benchmark `EP grouped / dense = 2.500x`，`EP grouped / EP packed = 1.070x`，`max_abs_diff_grouped = 0.000000`，并显式暴露 `ep_grouped_runtime_resident_ratio = 0.8334`
 
-项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-20 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 20；Phase 21 的 `infer-plan` 已完成，当前下一步是 `infer-implement`（grouped local expert execution / dispatch-overlap-ready 原型）。项目重构 / 求职包装 workflow 已进入严格规则准备态，但当前仍未激活，需待 Phase 21 `infer-archive` 完成后再进入 `refactor-audit`。
+项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-21 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 21；如继续技术主线，下一步应进入 Phase 22 的 `infer-plan`；如切换到项目重构 / 求职包装，现在已经可以进入 `refactor-audit`。
 
 **权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
 
@@ -337,9 +349,9 @@ conda run -n ai-infra python -m pytest \
     tests/test_engine.py -q
 ```
 
-# MoE + Expert Parallelism / True Expert Sharding / Non-Padded Communication / Control Plane（Phase 17-20）
+# MoE + Expert Parallelism / True Expert Sharding / Non-Padded Communication / Control Plane / Grouped Execution（Phase 17-21）
 ```bash
-# 正式对照 benchmark（synthetic MoE，1-GPU dense vs 2-GPU ep_padded / ep_packed，输出 control_plane_ms/share）
+# 正式对照 benchmark（synthetic MoE，1-GPU dense vs 2-GPU ep_padded / ep_packed / ep_grouped，输出 control_plane_ms/share 与 grouped runtime resident accounting）
 conda run -n ai-infra python benchmarks/benchmark_moe.py \
     --compare \
     --batch-size 4 \
@@ -362,6 +374,7 @@ Phase 17 正式结果：dense `22622.14 tok/s`，EP `42778.41 tok/s`，`EP / den
 Phase 18 正式结果：dense `22462.79 tok/s`，EP `43036.02 tok/s`，`EP / dense = 1.916x`，`shard_ratio = 0.5002`，`max_abs_diff = 0.000000`。
 Phase 19 正式结果：dense `22552.86 tok/s`，`ep_padded` `43046.93 tok/s`，`ep_packed` `52400.26 tok/s`，`EP packed / dense = 2.323x`，`EP packed / EP padded = 1.217x`，`ep_packed_bytes_per_layer = ep_ideal_bytes_per_layer = 262144`。
 Phase 20 正式结果：dense `22610.50 tok/s`，`ep_padded` `43392.45 tok/s`，`ep_packed` `52229.29 tok/s`，`EP packed / dense = 2.310x`，`EP packed / EP padded = 1.204x`，`ep_packed_control_plane_share ≈ 1.94%`。
+Phase 21 正式结果：dense `21878.76 tok/s`，`ep_padded` `42765.91 tok/s`，`ep_packed` `51121.99 tok/s`，`ep_grouped` `54696.73 tok/s`，`EP grouped / dense = 2.500x`，`EP grouped / EP packed = 1.070x`，`max_abs_diff_grouped = 0.000000`，`ep_grouped_runtime_resident_ratio = 0.8334`。
 
 ### 测试命令（多数无需 GPU；最后一项需要真实 GPU）
 
@@ -508,9 +521,10 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 18 | True Expert Sharding（2 卡 `per-rank local expert shard`；dense 22462.79 tok/s，EP 43036.02 tok/s，`EP / dense = 1.916x`，`shard_ratio = 0.5002`）| ✅ 完成 |
 | Phase 19 | Non-Padded Expert Dispatch / EP 通信闭环（`ep_packed_bytes_per_layer = ep_ideal_bytes_per_layer = 262144`；dense 22552.86 tok/s，`ep_padded` 43046.93 tok/s，`ep_packed` 52400.26 tok/s）| ✅ 完成 |
 | Phase 20 | EP Control Plane 收敛（packed control-plane 显式量化；dense 22610.50 tok/s，`ep_padded` 43392.45 tok/s，`ep_packed` 52229.29 tok/s，`control_plane_share ≈ 1.94%`）| ✅ 完成 |
+| Phase 21 | Grouped Expert Execution / Dispatch Overlap 原型（dense 21878.76 tok/s，`ep_packed` 51121.99 tok/s，`ep_grouped` 54696.73 tok/s，`EP grouped / EP packed = 1.070x`，runtime resident trade-off 已显式量化）| ✅ 完成 |
 
 下一阶段：
 
-- Phase 21：待 infer-plan（优先考虑 grouped GEMM / dispatch overlap）
+- Phase 22：待 infer-plan（优先考虑更完整的 grouped GEMM / kernel 级 local expert compute，或把当前 grouped EP 路径接进更完整的生成 / serving 链路）
 
 后续阶段验收口径详见 `CLAUDE.md`。

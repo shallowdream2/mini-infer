@@ -139,10 +139,17 @@ class ModelRunner:
             )
             self.model.eval()
 
-            # Phase 16：W8A8 量化（quant_mode="w8a8" 时原地替换线性层）
+            # Phase 16：W8A8 量化（quant_mode="w8a8" 时原地替换 MLP 线性层）
             if config.quant_mode == "w8a8":
-                from .quantization import quantize_model
+                from .quantization import QuantLinear, quantize_model
+                import torch.nn as _nn
+                _n_before = sum(1 for _, m in self.model.named_modules() if isinstance(m, _nn.Linear))
                 quantize_model(self.model)
+                _n_after = sum(1 for _, m in self.model.named_modules() if isinstance(m, QuantLinear))
+                print(
+                    f"[W8A8] quantize_model: {_n_after}/{_n_before} linear layers quantized "
+                    f"(skipped {_n_before - _n_after} attention/lm_head/small layers)"
+                )
 
             # Phase 6：永久 patch attention 层，decode 时走 paged attention 路径
             from .attention import patch_model_for_paged_decode

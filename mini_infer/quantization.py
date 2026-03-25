@@ -215,12 +215,16 @@ def _should_skip(name: str, module: nn.Linear) -> bool:
 
 
 def quantize_model(model: nn.Module) -> nn.Module:
-    """原地替换模型中的 nn.Linear → QuantLinear（W8A8）。
+    """原地替换模型中的 nn.Linear → QuantLinear（W8A8 MLP-only）。
 
-    跳过规则：
-    - 名称后缀为 lm_head / embed_tokens
-    - in_features × out_features < min_param_size（当前 4096）
-    - in_features % in_feat_align != 0（当前 8）
+    跳过规则（来自 QuantLinear._contract["skip_suffixes"]）：
+    - 名称后缀为 lm_head / embed_tokens（输入/输出层保持 fp16）
+    - 名称后缀为 q_proj / k_proj / v_proj / o_proj（attention 投影层对
+      per-channel W8A8 更敏感，保守保留 fp16）
+    - in_features × out_features < min_param_size（当前 4096，太小的层无收益）
+    - in_features % in_feat_align != 0（当前 8，INT8 GEMM 对齐要求）
+
+    实际被量化的层：MLP 主线 gate_proj / up_proj / down_proj（以及其他非跳过的大型线性层）
 
     Args:
         model: 已加载到目标 device 的 fp16/fp32 模型（原地修改）
