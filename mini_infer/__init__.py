@@ -16,6 +16,9 @@ _LAZY_IMPORTS = {
     "TPEngine": (".tp_engine", "TPEngine"),
     "PDEngine": (".pd_engine", "PDEngine"),
     "EPEngine": (".ep_engine", "EPEngine"),
+    "QuantLinear": (".quantization", "QuantLinear"),
+    "quantize_model": (".quantization", "quantize_model"),
+    "QuantMode": (".quantization", "QuantMode"),
 }
 
 __all__ = [
@@ -28,12 +31,15 @@ __all__ = [
     "TPEngine",          # Phase 13：Tensor Parallelism（真 TP，NCCL all-reduce）
     "PDEngine",          # Phase 15：Disaggregated Prefill/Decode
     "EPEngine",          # Phase 17：Expert Parallelism（2 卡 all-to-all 原型）
+    "QuantLinear",       # Phase 16：W8A8 量化线性层
+    "quantize_model",    # Phase 16：模型量化入口
+    "QuantMode",         # Phase 16：量化模式枚举
     "Request",
     "RequestState",
     "SamplingParams",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.21.0"
 
 
 def __getattr__(name: str):
