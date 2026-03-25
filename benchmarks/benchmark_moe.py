@@ -1,4 +1,4 @@
-"""Phase 17-20：synthetic MoE / Expert Parallel benchmark。
+"""Phase 17-21：synthetic MoE / Expert Parallel benchmark。
 
 对比对象：
 - dense `MoELayer`
@@ -12,7 +12,7 @@
 当前口径：
 - 输入是 synthetic hidden states，不接真实 HuggingFace 权重
 - `--mode ep` 的正式计时在 worker 内部完成，默认排除 `mp.spawn` 与进程组初始化开销
-- `--compare` 使用同一组权重和同一组 hidden states 对比 dense / `ep_padded` / `ep_packed`
+- `--compare` 使用同一组权重和同一组 hidden states 对比 dense / `ep_padded` / `ep_packed` / `ep_grouped`
 - 参数量结果同时区分：
   - dense 全量参数
   - EP 单 rank local shard 参数
@@ -21,6 +21,7 @@
   - current padded prototype bytes（按当前 `all_to_all_single` fixed chunk 实现估算）
   - Phase 19 packed bytes（按 exact split-size hidden-state payload 估算）
 - Phase 20 继续显式输出 packed control-plane 指标（`control_plane_ms` / `control_plane_share`）
+- Phase 21 继续增加 grouped local expert execution 对照（`expert_exec_mode=grouped`）
 - `--dry-run` 只验证参数构造、通信量公式和 benchmark 主流程
 """
 
@@ -136,6 +137,16 @@ def compute_ep_packed_bytes_per_layer(
     return 2 * num_tokens * top_k * hidden_size * dtype_bytes
 
 
+def compute_ep_grouped_bytes_per_layer(
+    num_tokens: int,
+    hidden_size: int,
+    top_k: int,
+    dtype_bytes: int,
+) -> int:
+    """Phase 21 grouped local expert execution 沿用 packed exact payload bytes。"""
+    return 2 * num_tokens * top_k * hidden_size * dtype_bytes
+
+
 def build_comm_summary(
     num_tokens: int,
     hidden_size: int,
@@ -159,6 +170,12 @@ def build_comm_summary(
         top_k=top_k,
         dtype_bytes=dtype_bytes,
     )
+    ep_grouped_bytes = compute_ep_grouped_bytes_per_layer(
+        num_tokens=num_tokens,
+        hidden_size=hidden_size,
+        top_k=top_k,
+        dtype_bytes=dtype_bytes,
+    )
     return {
         "dtype": dtype,
         "dtype_bytes": dtype_bytes,
@@ -166,10 +183,12 @@ def build_comm_summary(
         "ep_ideal_bytes_per_layer": ep_ideal_bytes,
         "ep_padded_bytes_per_layer": ep_padded_bytes,
         "ep_packed_bytes_per_layer": ep_packed_bytes,
+        "ep_grouped_bytes_per_layer": ep_grouped_bytes,
         "tp_formula": "2 * num_tokens * hidden_size * dtype_bytes",
         "ep_ideal_formula": "2 * num_tokens * top_k * hidden_size * dtype_bytes",
         "ep_padded_formula": "2 * ep_size * num_tokens * top_k * hidden_size * dtype_bytes",
         "ep_packed_formula": "2 * num_tokens * top_k * hidden_size * dtype_bytes",
+        "ep_grouped_formula": "2 * num_tokens * top_k * hidden_size * dtype_bytes",
         "ep_padded_impl_note": (
             "current EPMoELayer comm_mode=padded uses fixed-size all_to_all_single chunks; "
             "hidden-state bytes only, expert-id/valid metadata excluded"
@@ -178,6 +197,11 @@ def build_comm_summary(
             "Phase 20 comm_mode=packed uses exact split-size all_to_all_single; "
             "hidden-state bytes only, expert-id/control-plane metadata excluded; "
             "benchmark additionally reports control_plane_ms/control_plane_share"
+        ),
+        "ep_grouped_impl_note": (
+            "Phase 21 expert_exec_mode=grouped keeps packed exact split-size all_to_all_single; "
+            "local expert execution switches from per-expert where/index_select/index_copy_ "
+            "to grouped contiguous slices; hidden-state bytes remain identical to packed/ideal"
         ),
         "ep_packed_control_plane_note": (
             "control_plane_ms/share measure worker-side packed split-size control plane only; "
@@ -291,15 +315,18 @@ def run_ep_benchmark(
     shared_layer: MoELayer | None = None,
     shared_hidden_states: torch.Tensor | None = None,
     comm_mode: str | None = None,
+    expert_exec_mode: str | None = None,
 ) -> dict[str, object]:
     dense_layer = shared_layer if shared_layer is not None else build_shared_layer(args)
     selected_comm_mode = args.comm_mode if comm_mode is None else comm_mode
+    selected_expert_exec_mode = args.expert_exec_mode if expert_exec_mode is None else expert_exec_mode
     engine = EPEngine.from_moe_layer(
         dense_layer,
         ep_size=args.ep_size,
         dtype=args.dtype,
         src_rank=args.src_rank,
         comm_mode=selected_comm_mode,
+        expert_exec_mode=selected_expert_exec_mode,
     )
     hidden_states = shared_hidden_states if shared_hidden_states is not None else build_shared_hidden_states(args)
 
@@ -313,12 +340,19 @@ def run_ep_benchmark(
 
     num_tokens = args.batch_size * args.seq_len * args.runs
     throughput = num_tokens / elapsed
+    if selected_expert_exec_mode == "grouped":
+        mode = "ep_grouped"
+    else:
+        mode = f"ep_{selected_comm_mode}"
     note = (
         "2-GPU EPEngine steady-state worker timing; spawn/init excluded; "
-        f"comm_mode={selected_comm_mode}"
+        f"comm_mode={selected_comm_mode}; expert_exec_mode={selected_expert_exec_mode}"
     )
     if selected_comm_mode == "packed":
         note += "; includes source-rank router/dispatch + split-size control plane"
+    if selected_expert_exec_mode == "grouped":
+        note += "; local expert execution uses grouped contiguous slices"
+    if selected_comm_mode == "packed":
         control_plane_note = (
             "per-run packed control plane = GPU send-count sync to host + PackedControlPlane split-size helper; "
             "source-rank router/dispatch GPU work excluded from this metric"
@@ -326,8 +360,9 @@ def run_ep_benchmark(
     else:
         control_plane_note = "comm_mode=padded has no packed split-size control plane"
     result = {
-        "mode": f"ep_{selected_comm_mode}",
+        "mode": mode,
         "comm_mode": selected_comm_mode,
+        "expert_exec_mode": selected_expert_exec_mode,
         "throughput_tok_s": throughput,
         "note": note,
         "output": bench["output"],
@@ -343,7 +378,7 @@ def run_ep_benchmark(
 
 
 def run_compare_benchmark(args: argparse.Namespace) -> dict[str, object]:
-    """用同一组权重和 hidden states 对比 dense vs padded/packed EP。"""
+    """用同一组权重和 hidden states 对比 dense / ep_padded / ep_packed / ep_grouped。"""
     shared_layer = build_shared_layer(args)
     shared_hidden_states = build_shared_hidden_states(args)
     dense_device = resolve_dense_device(args)
@@ -365,21 +400,34 @@ def run_compare_benchmark(args: argparse.Namespace) -> dict[str, object]:
         shared_hidden_states=shared_hidden_states,
         comm_mode="packed",
     )
+    ep_grouped_result = run_ep_benchmark(
+        args,
+        shared_layer=shared_layer,
+        shared_hidden_states=shared_hidden_states,
+        comm_mode="packed",
+        expert_exec_mode="grouped",
+    )
     assert dense_result["output"] is not None
     assert ep_padded_result["output"] is not None
     assert ep_packed_result["output"] is not None
+    assert ep_grouped_result["output"] is not None
     max_abs_diff_padded = (
         dense_result["output"].float() - ep_padded_result["output"].float()
     ).abs().max().item()
     max_abs_diff_packed = (
         dense_result["output"].float() - ep_packed_result["output"].float()
     ).abs().max().item()
+    max_abs_diff_grouped = (
+        dense_result["output"].float() - ep_grouped_result["output"].float()
+    ).abs().max().item()
     return {
         "dense": dense_result,
         "ep_padded": ep_padded_result,
         "ep_packed": ep_packed_result,
+        "ep_grouped": ep_grouped_result,
         "max_abs_diff_padded": float(max_abs_diff_padded),
         "max_abs_diff_packed": float(max_abs_diff_packed),
+        "max_abs_diff_grouped": float(max_abs_diff_grouped),
     }
 
 
@@ -409,7 +457,7 @@ def run_dry_run(args: argparse.Namespace) -> dict[str, object]:
 
 
 def build_argparser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Phase 20 EP control-plane benchmark")
+    parser = argparse.ArgumentParser(description="Phase 21 grouped expert execution benchmark")
     parser.add_argument("--mode", choices=["dense", "ep"], default="dense")
     parser.add_argument("--compare", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
@@ -427,6 +475,7 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--src-rank", type=int, default=0)
     parser.add_argument("--comm-mode", choices=["padded", "packed"], default="padded")
+    parser.add_argument("--expert-exec-mode", choices=["naive", "grouped"], default="naive")
     parser.add_argument("--bias", action="store_true")
     return parser
 
@@ -447,16 +496,19 @@ def main() -> None:
         print(f"ep_ideal_formula={comm['ep_ideal_formula']}")
         print(f"ep_padded_formula={comm['ep_padded_formula']}")
         print(f"ep_packed_formula={comm['ep_packed_formula']}")
+        print(f"ep_grouped_formula={comm['ep_grouped_formula']}")
         print(f"tp_bytes_per_layer={comm['tp_bytes_per_layer']}")
         print(f"ep_ideal_bytes_per_layer={comm['ep_ideal_bytes_per_layer']}")
         print(f"ep_padded_bytes_per_layer={comm['ep_padded_bytes_per_layer']}")
         print(f"ep_packed_bytes_per_layer={comm['ep_packed_bytes_per_layer']}")
+        print(f"ep_grouped_bytes_per_layer={comm['ep_grouped_bytes_per_layer']}")
         print(f"dense_param_bytes={params['dense_param_bytes']}")
         print(f"ep_rank_param_bytes={params['ep_rank_param_bytes']}")
         print(f"expert_param_bytes={params['expert_param_bytes']}")
         print(f"shard_ratio={params['shard_ratio']:.4f}")
         print(f"ep_padded_impl_note={comm['ep_padded_impl_note']}")
         print(f"ep_packed_impl_note={comm['ep_packed_impl_note']}")
+        print(f"ep_grouped_impl_note={comm['ep_grouped_impl_note']}")
         print(f"ep_packed_control_plane_note={comm['ep_packed_control_plane_note']}")
         print("dry_run=ok")
         return
@@ -478,36 +530,52 @@ def main() -> None:
         dense = result["dense"]
         ep_padded = result["ep_padded"]
         ep_packed = result["ep_packed"]
+        ep_grouped = result["ep_grouped"]
         print("=== MoE / EP benchmark (compare) ===")
         print(f"dense_throughput_tok_s={dense['throughput_tok_s']:.2f}")
         print(f"ep_padded_throughput_tok_s={ep_padded['throughput_tok_s']:.2f}")
         print(f"ep_packed_throughput_tok_s={ep_packed['throughput_tok_s']:.2f}")
+        print(f"ep_grouped_throughput_tok_s={ep_grouped['throughput_tok_s']:.2f}")
         print(f"max_abs_diff_padded={result['max_abs_diff_padded']:.6f}")
         print(f"max_abs_diff_packed={result['max_abs_diff_packed']:.6f}")
+        print(f"max_abs_diff_grouped={result['max_abs_diff_grouped']:.6f}")
         print(f"dense_note={dense['note']}")
         print(f"ep_padded_note={ep_padded['note']}")
         print(f"ep_packed_note={ep_packed['note']}")
+        print(f"ep_grouped_note={ep_grouped['note']}")
         print(f"ep_padded_control_plane_ms={ep_padded['control_plane_ms']:.4f}")
         print(f"ep_padded_control_plane_share={ep_padded['control_plane_share']:.6f}")
         print(f"ep_packed_control_plane_ms={ep_packed['control_plane_ms']:.4f}")
         print(f"ep_packed_control_plane_share={ep_packed['control_plane_share']:.6f}")
+        print(f"ep_grouped_control_plane_ms={ep_grouped['control_plane_ms']:.4f}")
+        print(f"ep_grouped_control_plane_share={ep_grouped['control_plane_share']:.6f}")
         print(f"ep_packed_control_plane_note={ep_packed['control_plane_note']}")
+        print(f"ep_grouped_control_plane_note={ep_grouped['control_plane_note']}")
         print(f"ep_padded_send_counts={ep_padded['send_counts'].tolist()}")
         print(f"ep_packed_send_counts={ep_packed['send_counts'].tolist()}")
+        print(f"ep_grouped_send_counts={ep_grouped['send_counts'].tolist()}")
         print(f"dense_expert_loads={dense['expert_loads'].tolist()}")
         print(f"ep_padded_expert_loads={ep_padded['expert_loads'].tolist()}")
         print(f"ep_packed_expert_loads={ep_packed['expert_loads'].tolist()}")
+        print(f"ep_grouped_expert_loads={ep_grouped['expert_loads'].tolist()}")
         print(
             f"ep_padded_expert_score_sums={[round(float(v), 4) for v in ep_padded['expert_score_sums']]}"
         )
         print(
             f"ep_packed_expert_score_sums={[round(float(v), 4) for v in ep_packed['expert_score_sums']]}"
         )
+        print(
+            f"ep_grouped_expert_score_sums={[round(float(v), 4) for v in ep_grouped['expert_score_sums']]}"
+        )
     else:
         if args.mode == "dense":
             result = run_dense_benchmark(args)
         else:
-            result = run_ep_benchmark(args, comm_mode=args.comm_mode)
+            result = run_ep_benchmark(
+                args,
+                comm_mode=args.comm_mode,
+                expert_exec_mode=args.expert_exec_mode,
+            )
 
         print(f"=== MoE / EP benchmark ({result['mode']}) ===")
         print(f"throughput_tok_s={result['throughput_tok_s']:.2f}")
@@ -528,16 +596,19 @@ def main() -> None:
     print(f"ep_ideal_formula={comm['ep_ideal_formula']}")
     print(f"ep_padded_formula={comm['ep_padded_formula']}")
     print(f"ep_packed_formula={comm['ep_packed_formula']}")
+    print(f"ep_grouped_formula={comm['ep_grouped_formula']}")
     print(f"tp_bytes_per_layer={comm['tp_bytes_per_layer']}")
     print(f"ep_ideal_bytes_per_layer={comm['ep_ideal_bytes_per_layer']}")
     print(f"ep_padded_bytes_per_layer={comm['ep_padded_bytes_per_layer']}")
     print(f"ep_packed_bytes_per_layer={comm['ep_packed_bytes_per_layer']}")
+    print(f"ep_grouped_bytes_per_layer={comm['ep_grouped_bytes_per_layer']}")
     print(f"dense_param_bytes={param_summary['dense_param_bytes']}")
     print(f"ep_rank_param_bytes={param_summary['ep_rank_param_bytes']}")
     print(f"expert_param_bytes={param_summary['expert_param_bytes']}")
     print(f"shard_ratio={param_summary['shard_ratio']:.4f}")
     print(f"ep_padded_impl_note={comm['ep_padded_impl_note']}")
     print(f"ep_packed_impl_note={comm['ep_packed_impl_note']}")
+    print(f"ep_grouped_impl_note={comm['ep_grouped_impl_note']}")
     print(f"ep_packed_control_plane_note={comm['ep_packed_control_plane_note']}")
 
 

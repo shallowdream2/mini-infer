@@ -1,10 +1,11 @@
-"""Phase 17-20：synthetic MoE 层与 Expert Parallel 核心逻辑。
+"""Phase 17-21：synthetic MoE 层与 Expert Parallel 核心逻辑。
 
 这个文件提供两条路径：
 - `MoELayer`：单进程 dense 参考实现，作为数值 oracle
 - `EPMoELayer`：按 rank 只持有本地 expert shard，并通过 dispatch / gather
   组织 all-to-all 所需的数据布局；Phase 19 新增 `padded` / `packed`
-  两种通信模式，用于对比 prototype 与 non-padded expert dispatch
+  两种通信模式，用于对比 prototype 与 non-padded expert dispatch；
+  Phase 21 继续为 local expert execution 增加 `naive` / `grouped` 两条执行路径。
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 _COMM_MODES = {"padded", "packed"}
+_EXPERT_EXEC_MODES = {"naive", "grouped"}
 
 
 @dataclass
@@ -83,6 +85,24 @@ class PackedControlPlane:
     recv_back_count: int
 
 
+@dataclass
+class GroupedExpertRun:
+    """grouped local expert execution 的单段连续切片。"""
+
+    expert_id: int
+    local_expert_id: int
+    start: int
+    end: int
+
+
+@dataclass
+class GroupedExpertMetadata:
+    """按 local expert 连续切片后的 grouped metadata。"""
+
+    runs: list[GroupedExpertRun]
+    total_tokens: int
+
+
 def _flatten_tokens(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     """把 [B,S,H] 或 [T,H] 统一展平到 [N,H]。"""
     if x.ndim < 2:
@@ -103,6 +123,52 @@ def _validate_comm_mode(comm_mode: str) -> str:
     if comm_mode not in _COMM_MODES:
         raise ValueError(f"comm_mode 必须是 {_COMM_MODES} 之一，当前 {comm_mode!r}")
     return comm_mode
+
+
+def _validate_expert_exec_mode(expert_exec_mode: str) -> str:
+    if expert_exec_mode not in _EXPERT_EXEC_MODES:
+        raise ValueError(
+            f"expert_exec_mode 必须是 {_EXPERT_EXEC_MODES} 之一，当前 {expert_exec_mode!r}"
+        )
+    return expert_exec_mode
+
+
+def build_grouped_expert_metadata(
+    expert_ids: torch.Tensor,
+    *,
+    local_expert_offset: int,
+    num_local_experts: int,
+) -> GroupedExpertMetadata:
+    """把已按 expert 排序的 token 副本收敛成 grouped contiguous slices。"""
+    if expert_ids.ndim != 1:
+        raise ValueError(f"expert_ids 必须是 1D 张量，当前 shape={tuple(expert_ids.shape)}")
+    if num_local_experts <= 0:
+        raise ValueError(f"num_local_experts 必须 > 0，当前 {num_local_experts}")
+    if expert_ids.numel() == 0:
+        return GroupedExpertMetadata(runs=[], total_tokens=0)
+
+    local_expert_ids = expert_ids.long() - local_expert_offset
+    if torch.any(local_expert_ids < 0) or torch.any(local_expert_ids >= num_local_experts):
+        raise ValueError("expert_ids 中存在不属于当前 local expert shard 的 id")
+
+    # 只把每个 local expert 的计数同步到 CPU，避免按 token 复制整条 expert_id 向量。
+    counts_cpu = torch.bincount(local_expert_ids, minlength=num_local_experts).cpu()
+    runs: list[GroupedExpertRun] = []
+    start = 0
+    for local_expert_id, count in enumerate(counts_cpu.tolist()):
+        if count == 0:
+            continue
+        end = start + count
+        runs.append(
+            GroupedExpertRun(
+                expert_id=local_expert_offset + local_expert_id,
+                local_expert_id=local_expert_id,
+                start=start,
+                end=end,
+            )
+        )
+        start = end
+    return GroupedExpertMetadata(runs=runs, total_tokens=start)
 
 
 def build_packed_control_plane(
@@ -379,6 +445,7 @@ class EPMoELayer(nn.Module):
         dist_group: Optional[dist.ProcessGroup] = None,
         src_rank: int = 0,
         comm_mode: str = "padded",
+        expert_exec_mode: str = "naive",
     ) -> None:
         super().__init__()
         if src_rank < 0 or src_rank >= ep_size:
@@ -392,6 +459,7 @@ class EPMoELayer(nn.Module):
         self.dist_group = dist_group
         self.src_rank = src_rank
         self.comm_mode = _validate_comm_mode(comm_mode)
+        self.expert_exec_mode = _validate_expert_exec_mode(expert_exec_mode)
         self.experts_per_rank = _validate_ep_partition(num_experts, ep_size)
         self.local_expert_offset = self.rank * self.experts_per_rank
 
@@ -452,7 +520,7 @@ class EPMoELayer(nn.Module):
         combined.index_add_(0, layout.token_indices, dispatched_outputs * weights)
         return combined
 
-    def _apply_experts(
+    def _apply_experts_naive(
         self,
         dispatched_x: torch.Tensor,
         expert_ids: torch.Tensor,
@@ -482,6 +550,60 @@ class EPMoELayer(nn.Module):
             expert_out = self.experts[local_expert_id](expert_in)
             outputs.index_copy_(0, expert_mask, expert_out)
         return outputs
+
+    def _apply_experts_grouped(
+        self,
+        dispatched_x: torch.Tensor,
+        expert_ids: torch.Tensor,
+        valid_expert_ids: Optional[range] = None,
+    ) -> torch.Tensor:
+        outputs = torch.zeros(
+            (dispatched_x.shape[0], self.hidden_size),
+            device=dispatched_x.device,
+            dtype=dispatched_x.dtype,
+        )
+        if dispatched_x.numel() == 0:
+            return outputs
+
+        if valid_expert_ids is None:
+            local_expert_offset = 0
+            num_local_experts = len(self.experts)
+        else:
+            valid_ids = list(valid_expert_ids)
+            if not valid_ids:
+                return outputs
+            local_expert_offset = valid_ids[0]
+            num_local_experts = len(valid_ids)
+
+        metadata = build_grouped_expert_metadata(
+            expert_ids,
+            local_expert_offset=local_expert_offset,
+            num_local_experts=num_local_experts,
+        )
+
+        for run in metadata.runs:
+            expert_in = dispatched_x[run.start : run.end]
+            expert_out = self.experts[run.local_expert_id](expert_in)
+            outputs[run.start : run.end] = expert_out
+        return outputs
+
+    def _apply_experts(
+        self,
+        dispatched_x: torch.Tensor,
+        expert_ids: torch.Tensor,
+        valid_expert_ids: Optional[range] = None,
+    ) -> torch.Tensor:
+        if self.expert_exec_mode == "grouped":
+            return self._apply_experts_grouped(
+                dispatched_x=dispatched_x,
+                expert_ids=expert_ids,
+                valid_expert_ids=valid_expert_ids,
+            )
+        return self._apply_experts_naive(
+            dispatched_x=dispatched_x,
+            expert_ids=expert_ids,
+            valid_expert_ids=valid_expert_ids,
+        )
 
     def _forward_local(
         self,
@@ -842,6 +964,8 @@ __all__ = [
     "DispatchLayout",
     "EPForwardAux",
     "EPMoELayer",
+    "GroupedExpertMetadata",
+    "GroupedExpertRun",
     "MoEFFNExpert",
     "MoELayer",
     "PackedControlPlane",
@@ -849,6 +973,7 @@ __all__ = [
     "RouterOutput",
     "RoutingStats",
     "TopKRouter",
+    "build_grouped_expert_metadata",
     "build_packed_control_plane",
     "build_dispatch_layout",
     "shard_moe_state_dict",

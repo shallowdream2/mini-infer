@@ -1,4 +1,4 @@
-"""Phase 17-20 MoE 测试。
+"""Phase 17-21 MoE 测试。
 
 覆盖：
 - TopKRouter 的 top-k 范围和分数归一化
@@ -9,6 +9,7 @@
 - local expert shard 的 state_dict 切分与所有权
 - rank-local shard 的文件下发辅助逻辑
 - packed / padded 通信模式切换
+- grouped local expert execution metadata 与执行模式切换
 - dense MoELayer vs EPMoELayer 数值等价
 - 2 卡 EPEngine 最小功能路径
 - 2 卡 EPEngine 的 zero-send-count 边界
@@ -28,10 +29,12 @@ import torch.nn as nn
 from mini_infer import EPEngine
 from mini_infer.moe_layer import (
     EPMoELayer,
+    GroupedExpertMetadata,
     MoELayer,
     PackedControlPlane,
     RouterOutput,
     TopKRouter,
+    build_grouped_expert_metadata,
     build_packed_control_plane,
     build_dispatch_layout,
     shard_moe_state_dict,
@@ -175,6 +178,18 @@ class TestDispatchAndEP:
                 comm_mode="invalid",
             )
 
+    def test_ep_layer_rejects_invalid_expert_exec_mode(self):
+        with pytest.raises(ValueError, match="expert_exec_mode"):
+            EPMoELayer(
+                hidden_size=8,
+                intermediate_size=16,
+                num_experts=4,
+                top_k=2,
+                ep_size=2,
+                rank=0,
+                expert_exec_mode="invalid",
+            )
+
     def test_rank_state_dicts_can_roundtrip_through_files(self, tmp_path):
         dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2)
         rank_state_dicts = shard_moe_state_dict(dense.state_dict(), num_experts=4, ep_size=2)
@@ -252,6 +267,21 @@ class TestDispatchAndEP:
         assert control_plane.recv_count == 1
         assert control_plane.recv_back_count == 0
 
+    def test_build_grouped_expert_metadata_builds_contiguous_runs(self):
+        metadata = build_grouped_expert_metadata(
+            expert_ids=torch.tensor([2, 2, 3, 5, 5], dtype=torch.int64),
+            local_expert_offset=2,
+            num_local_experts=4,
+        )
+
+        assert isinstance(metadata, GroupedExpertMetadata)
+        assert metadata.total_tokens == 5
+        assert [(run.expert_id, run.local_expert_id, run.start, run.end) for run in metadata.runs] == [
+            (2, 0, 0, 2),
+            (3, 1, 2, 3),
+            (5, 3, 3, 5),
+        ]
+
     def test_build_packed_control_plane_rejects_invalid_length(self):
         with pytest.raises(ValueError, match="world_size"):
             build_packed_control_plane(
@@ -282,10 +312,18 @@ class TestDispatchAndEP:
         expected = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
         assert torch.allclose(combined, expected, atol=1e-6)
 
-    def test_ep_layer_matches_dense_reference_cpu(self):
+    @pytest.mark.parametrize("expert_exec_mode", ["naive", "grouped"])
+    def test_ep_layer_matches_dense_reference_cpu(self, expert_exec_mode: str):
         torch.manual_seed(5)
         dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2)
-        ep = EPMoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2, ep_size=1)
+        ep = EPMoELayer(
+            hidden_size=8,
+            intermediate_size=16,
+            num_experts=4,
+            top_k=2,
+            ep_size=1,
+            expert_exec_mode=expert_exec_mode,
+        )
         ep.load_state_dict(dense.state_dict(), strict=True)
 
         x = torch.randn(2, 3, 8)
@@ -331,6 +369,45 @@ class TestDispatchAndEP:
 
         assert engine.comm_mode == "packed"
 
+    def test_ep_engine_accepts_grouped_expert_exec_mode_on_cpu_init(self):
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            pytest.skip("需要至少 2 张 CUDA GPU")
+
+        shard = {"router.gate.weight": torch.zeros(4, 8)}
+        engine = EPEngine(
+            hidden_size=8,
+            intermediate_size=16,
+            num_experts=4,
+            top_k=2,
+            ep_size=2,
+            dtype="float32",
+            rank_state_dicts=[shard, shard],
+            src_rank=0,
+            comm_mode="packed",
+            expert_exec_mode="grouped",
+        )
+
+        assert engine.expert_exec_mode == "grouped"
+
+    def test_ep_engine_rejects_invalid_expert_exec_mode_on_cpu_init(self):
+        if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
+            pytest.skip("需要至少 2 张 CUDA GPU")
+
+        shard = {"router.gate.weight": torch.zeros(4, 8)}
+        with pytest.raises(ValueError, match="expert_exec_mode"):
+            EPEngine(
+                hidden_size=8,
+                intermediate_size=16,
+                num_experts=4,
+                top_k=2,
+                ep_size=2,
+                dtype="float32",
+                rank_state_dicts=[shard, shard],
+                src_rank=0,
+                comm_mode="packed",
+                expert_exec_mode="invalid",
+            )
+
     def test_ep_engine_rejects_invalid_comm_mode_on_cpu_init(self):
         if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
             pytest.skip("需要至少 2 张 CUDA GPU")
@@ -349,12 +426,15 @@ class TestDispatchAndEP:
                 comm_mode="invalid",
             )
 
-    @pytest.mark.parametrize("comm_mode", ["padded", "packed"])
+    @pytest.mark.parametrize(
+        ("comm_mode", "expert_exec_mode"),
+        [("padded", "naive"), ("packed", "naive"), ("packed", "grouped")],
+    )
     @pytest.mark.skipif(
         not torch.cuda.is_available() or torch.cuda.device_count() < 2,
         reason="需要至少 2 张 CUDA GPU",
     )
-    def test_ep_engine_matches_dense_reference_cuda(self, comm_mode: str):
+    def test_ep_engine_matches_dense_reference_cuda(self, comm_mode: str, expert_exec_mode: str):
         torch.manual_seed(6)
         dense = MoELayer(hidden_size=8, intermediate_size=16, num_experts=4, top_k=2).float().eval()
         x = torch.randn(2, 3, 8)
@@ -368,6 +448,7 @@ class TestDispatchAndEP:
             dtype="float32",
             src_rank=1,
             comm_mode=comm_mode,
+            expert_exec_mode=expert_exec_mode,
         )
         out, aux = engine.forward(x, return_aux=True)
         bench = engine.benchmark_forward(x, warmup=0, runs=1)
@@ -377,12 +458,15 @@ class TestDispatchAndEP:
         assert int(aux["expert_loads"].sum().item()) == x.shape[0] * x.shape[1] * dense.top_k
         assert float(bench["elapsed_s"]) > 0.0
 
-    @pytest.mark.parametrize("comm_mode", ["padded", "packed"])
+    @pytest.mark.parametrize(
+        ("comm_mode", "expert_exec_mode"),
+        [("padded", "naive"), ("packed", "naive"), ("packed", "grouped")],
+    )
     @pytest.mark.skipif(
         not torch.cuda.is_available() or torch.cuda.device_count() < 2,
         reason="需要至少 2 张 CUDA GPU",
     )
-    def test_ep_engine_handles_zero_send_count_cuda(self, comm_mode: str):
+    def test_ep_engine_handles_zero_send_count_cuda(self, comm_mode: str, expert_exec_mode: str):
         dense = MoELayer(
             hidden_size=8,
             intermediate_size=16,
@@ -404,6 +488,7 @@ class TestDispatchAndEP:
             dtype="float32",
             src_rank=1,
             comm_mode=comm_mode,
+            expert_exec_mode=expert_exec_mode,
         )
         out, aux = engine.forward(x, return_aux=True)
         bench = engine.benchmark_forward(x, warmup=0, runs=1)

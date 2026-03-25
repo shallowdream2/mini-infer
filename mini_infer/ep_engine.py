@@ -1,4 +1,4 @@
-"""Phase 17-20：2 卡 Expert Parallel 引擎原型。
+"""Phase 17-21：2 卡 Expert Parallel 引擎原型。
 
 这个文件复用 Phase 13 的 `mp.spawn + file:// rendezvous` 约定，
 把 `EPMoELayer` 接成可直接运行的 2 卡功能原型。Phase 18 开始 worker
@@ -8,6 +8,8 @@
 Phase 19 新增 `comm_mode`，用于在 `padded` 与 `packed` EP 通信路径之间切换。
 Phase 20 继续把 packed 路径的 worker-side control plane 收敛成显式 helper，并在
 benchmark 结果里单独暴露 split-size 控制面成本。
+Phase 21 继续增加 `expert_exec_mode`，用于在 `naive` 与 `grouped` local expert
+execution 之间切换。
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ from .moe_layer import (
     build_packed_control_plane,
     shard_moe_state_dict,
     _validate_comm_mode,
+    _validate_expert_exec_mode,
 )
 
 
@@ -86,6 +89,7 @@ def _ep_worker(
     rank_state_dict_dir: str,
     src_rank: int,
     comm_mode: str,
+    expert_exec_mode: str,
     warmup: int,
     runs: int,
     measure_steady_state: bool,
@@ -115,6 +119,7 @@ def _ep_worker(
             dist_group=None,
             src_rank=src_rank,
             comm_mode=comm_mode,
+            expert_exec_mode=expert_exec_mode,
         ).to(device=device, dtype=torch_dtype)
 
         rank_state_dict = torch.load(
@@ -239,6 +244,7 @@ class EPEngine:
         rank_state_dicts: list[dict[str, torch.Tensor]] | None = None,
         src_rank: int = 0,
         comm_mode: str = "padded",
+        expert_exec_mode: str = "naive",
     ) -> None:
         if ep_size < 2:
             raise ValueError(f"ep_size 必须 >= 2，当前 {ep_size}")
@@ -264,6 +270,7 @@ class EPEngine:
         self.dtype = dtype
         self.src_rank = src_rank
         self.comm_mode = _validate_comm_mode(comm_mode)
+        self.expert_exec_mode = _validate_expert_exec_mode(expert_exec_mode)
         self.rank_state_dicts = None if rank_state_dicts is None else [
             {
                 key: value.detach().cpu()
@@ -280,6 +287,7 @@ class EPEngine:
         dtype: str = "float16",
         src_rank: int = 0,
         comm_mode: str = "padded",
+        expert_exec_mode: str = "naive",
     ) -> "EPEngine":
         rank_state_dicts = shard_moe_state_dict(
             layer.state_dict(),
@@ -297,6 +305,7 @@ class EPEngine:
             rank_state_dicts=rank_state_dicts,
             src_rank=src_rank,
             comm_mode=comm_mode,
+            expert_exec_mode=expert_exec_mode,
         )
 
     def _run(
@@ -336,6 +345,7 @@ class EPEngine:
                     rank_state_dict_dir,
                     self.src_rank,
                     self.comm_mode,
+                    self.expert_exec_mode,
                     warmup,
                     runs,
                     measure_steady_state,

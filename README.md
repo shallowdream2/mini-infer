@@ -28,7 +28,7 @@ mini-infer 是面向 Qwen2.5 系列 decoder-only 模型的推理系统学习项�
 - **Non-Padded Expert Dispatch / EP 通信闭环**（Phase 19）：`ep_packed_bytes_per_layer = ep_ideal_bytes_per_layer`，正式 benchmark `EP packed / dense = 2.323x`，`EP packed / EP padded = 1.217x`
 - **EP Control Plane 收敛**（Phase 20）：packed control-plane 显式量化，正式 benchmark `EP packed / dense = 2.310x`，`EP packed / EP padded = 1.204x`，`control_plane_share ≈ 1.94%`
 
-项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-20 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 20；下一步是 Phase 21 的 infer-plan（优先考虑 grouped GEMM / dispatch overlap）。
+项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-20 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 20；Phase 21 的 `infer-plan` 已完成，当前下一步是 `infer-implement`（grouped local expert execution / dispatch-overlap-ready 原型）。项目重构 / 求职包装 workflow 已进入严格规则准备态，但当前仍未激活，需待 Phase 21 `infer-archive` 完成后再进入 `refactor-audit`。
 
 **权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
 
