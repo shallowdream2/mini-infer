@@ -353,10 +353,16 @@ def run_ep_benchmark(
     if selected_expert_exec_mode == "grouped":
         note += "; local expert execution uses grouped contiguous slices"
     if selected_comm_mode == "packed":
-        control_plane_note = (
-            "per-run packed control plane = GPU send-count sync to host + PackedControlPlane split-size helper; "
-            "source-rank router/dispatch GPU work excluded from this metric"
-        )
+        if selected_expert_exec_mode == "grouped":
+            control_plane_note = (
+                "per-run packed control plane = GPU send-count sync to host + PackedControlPlane split-size helper "
+                "+ grouped local-expert count sync/helper; source-rank router/dispatch GPU work excluded from this metric"
+            )
+        else:
+            control_plane_note = (
+                "per-run packed control plane = GPU send-count sync to host + PackedControlPlane split-size helper; "
+                "source-rank router/dispatch GPU work excluded from this metric"
+            )
     else:
         control_plane_note = "comm_mode=padded has no packed split-size control plane"
     result = {

@@ -25,7 +25,10 @@ import torch.multiprocessing as mp
 
 from .moe_layer import (
     EPMoELayer,
+    GroupedExpertMetadata,
     MoELayer,
+    build_grouped_expert_metadata_from_local_counts,
+    build_grouped_local_expert_counts,
     build_packed_control_plane,
     shard_moe_state_dict,
     _validate_comm_mode,
@@ -61,6 +64,21 @@ def _prepare_packed_control_plane(
         src_rank=src_rank,
     )
     return control_plane, time.perf_counter() - start_time
+
+
+def _prepare_grouped_metadata(
+    local_grouped_counts: torch.Tensor,
+    *,
+    local_expert_offset: int,
+) -> tuple[GroupedExpertMetadata, float]:
+    """把 rank-local grouped expert 计数收敛成可直接执行的 contiguous metadata。"""
+    start_time = time.perf_counter()
+    local_counts_cpu = local_grouped_counts.cpu().tolist()
+    metadata = build_grouped_expert_metadata_from_local_counts(
+        local_counts_cpu,
+        local_expert_offset=local_expert_offset,
+    )
+    return metadata, time.perf_counter() - start_time
 
 
 def _rank_state_dict_path(rank_state_dict_dir: str, rank: int) -> str:
@@ -141,9 +159,11 @@ def _ep_worker(
         def _forward_once(return_aux: bool):
             packed_forward_kwargs: dict[str, object] = {}
             control_plane_elapsed_s = 0.0
+            grouped_metadata = None
             if comm_mode == "packed":
                 packed_send_counts = torch.zeros(ep_size, dtype=torch.int64, device=device)
                 packed_source_context = None
+                grouped_counts = None
                 if rank == src_rank:
                     if hidden_states is None:
                         raise ValueError("packed EP source rank 需要 hidden_states 输入")
@@ -151,6 +171,12 @@ def _ep_worker(
                     packed_send_counts.copy_(
                         packed_source_context.layout.send_counts.to(device=device, dtype=torch.int64)
                     )
+                    if expert_exec_mode == "grouped":
+                        grouped_counts = build_grouped_local_expert_counts(
+                            packed_source_context.layout,
+                            ep_size=ep_size,
+                            num_local_experts=layer.experts_per_rank,
+                        ).to(device=device, dtype=torch.int64)
                 dist.broadcast(packed_send_counts, src=src_rank, group=None)
                 packed_control_plane, control_plane_elapsed_s = _prepare_packed_control_plane(
                     packed_send_counts=packed_send_counts,
@@ -159,9 +185,23 @@ def _ep_worker(
                     src_rank=src_rank,
                     device=rank,
                 )
+                if expert_exec_mode == "grouped":
+                    if grouped_counts is None:
+                        grouped_counts = torch.zeros(
+                            (ep_size, layer.experts_per_rank),
+                            dtype=torch.int64,
+                            device=device,
+                        )
+                    dist.broadcast(grouped_counts, src=src_rank, group=None)
+                    grouped_metadata, grouped_metadata_elapsed_s = _prepare_grouped_metadata(
+                        grouped_counts[rank],
+                        local_expert_offset=rank * layer.experts_per_rank,
+                    )
+                    control_plane_elapsed_s += grouped_metadata_elapsed_s
                 packed_forward_kwargs = {
                     "packed_source_context": packed_source_context,
                     "packed_control_plane": packed_control_plane,
+                    "grouped_metadata": grouped_metadata,
                 }
             return (
                 layer(
@@ -271,6 +311,8 @@ class EPEngine:
         self.src_rank = src_rank
         self.comm_mode = _validate_comm_mode(comm_mode)
         self.expert_exec_mode = _validate_expert_exec_mode(expert_exec_mode)
+        if ep_size > 1 and self.expert_exec_mode == "grouped" and self.comm_mode != "packed":
+            raise ValueError("distributed grouped expert execution 当前只支持 comm_mode='packed'")
         self.rank_state_dicts = None if rank_state_dicts is None else [
             {
                 key: value.detach().cpu()

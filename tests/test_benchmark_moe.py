@@ -327,6 +327,7 @@ def test_run_ep_benchmark_reports_control_plane_metrics(monkeypatch) -> None:
     assert result["control_plane_ms"] == 25.0
     assert result["control_plane_share"] == 0.1
     assert "PackedControlPlane" in result["control_plane_note"]
+    assert "grouped local-expert count sync/helper" in result["control_plane_note"]
     assert result["expert_exec_mode"] == "grouped"
     assert "grouped contiguous slices" in result["note"]
 

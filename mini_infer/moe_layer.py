@@ -103,6 +103,32 @@ class GroupedExpertMetadata:
     total_tokens: int
 
 
+def build_grouped_expert_metadata_from_local_counts(
+    local_counts_cpu: list[int],
+    *,
+    local_expert_offset: int,
+) -> GroupedExpertMetadata:
+    """根据每个 local expert 的 token 计数构造 grouped contiguous slices。"""
+    runs: list[GroupedExpertRun] = []
+    start = 0
+    for local_expert_id, count in enumerate(local_counts_cpu):
+        if count < 0:
+            raise ValueError(f"local_counts_cpu 中的计数必须 >= 0，当前 local_expert_id={local_expert_id}, count={count}")
+        if count == 0:
+            continue
+        end = start + count
+        runs.append(
+            GroupedExpertRun(
+                expert_id=local_expert_offset + local_expert_id,
+                local_expert_id=local_expert_id,
+                start=start,
+                end=end,
+            )
+        )
+        start = end
+    return GroupedExpertMetadata(runs=runs, total_tokens=start)
+
+
 def _flatten_tokens(x: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...]]:
     """把 [B,S,H] 或 [T,H] 统一展平到 [N,H]。"""
     if x.ndim < 2:
@@ -139,36 +165,52 @@ def build_grouped_expert_metadata(
     local_expert_offset: int,
     num_local_experts: int,
 ) -> GroupedExpertMetadata:
-    """把已按 expert 排序的 token 副本收敛成 grouped contiguous slices。"""
+    """把 CPU 上已按 expert 排序的 token 副本收敛成 grouped contiguous slices。"""
     if expert_ids.ndim != 1:
         raise ValueError(f"expert_ids 必须是 1D 张量，当前 shape={tuple(expert_ids.shape)}")
     if num_local_experts <= 0:
         raise ValueError(f"num_local_experts 必须 > 0，当前 {num_local_experts}")
     if expert_ids.numel() == 0:
         return GroupedExpertMetadata(runs=[], total_tokens=0)
+    if expert_ids.is_cuda:
+        raise ValueError("CUDA grouped metadata 必须在 hot path 外预先构造后传入")
+    if torch.any(expert_ids[1:] < expert_ids[:-1]):
+        raise ValueError("grouped expert_ids 必须按 expert_id 非降序排列")
 
     local_expert_ids = expert_ids.long() - local_expert_offset
     if torch.any(local_expert_ids < 0) or torch.any(local_expert_ids >= num_local_experts):
         raise ValueError("expert_ids 中存在不属于当前 local expert shard 的 id")
 
-    # 只把每个 local expert 的计数同步到 CPU，避免按 token 复制整条 expert_id 向量。
-    counts_cpu = torch.bincount(local_expert_ids, minlength=num_local_experts).cpu()
-    runs: list[GroupedExpertRun] = []
-    start = 0
-    for local_expert_id, count in enumerate(counts_cpu.tolist()):
-        if count == 0:
-            continue
-        end = start + count
-        runs.append(
-            GroupedExpertRun(
-                expert_id=local_expert_offset + local_expert_id,
-                local_expert_id=local_expert_id,
-                start=start,
-                end=end,
-            )
+    counts_cpu = torch.bincount(local_expert_ids, minlength=num_local_experts).tolist()
+    return build_grouped_expert_metadata_from_local_counts(
+        counts_cpu,
+        local_expert_offset=local_expert_offset,
+    )
+
+
+def build_grouped_local_expert_counts(
+    layout: DispatchLayout,
+    *,
+    ep_size: int,
+    num_local_experts: int,
+) -> torch.Tensor:
+    """在 source rank 上统计每个 rank / local expert 的 token 计数矩阵。"""
+    if ep_size <= 0:
+        raise ValueError(f"ep_size 必须 > 0，当前 {ep_size}")
+    if num_local_experts <= 0:
+        raise ValueError(f"num_local_experts 必须 > 0，当前 {num_local_experts}")
+    if layout.dest_ranks.numel() != layout.local_expert_ids.numel():
+        raise ValueError("layout.dest_ranks 与 layout.local_expert_ids 长度必须一致")
+    if layout.dest_ranks.numel() == 0:
+        return torch.zeros(
+            (ep_size, num_local_experts),
+            dtype=torch.int64,
+            device=layout.dest_ranks.device,
         )
-        start = end
-    return GroupedExpertMetadata(runs=runs, total_tokens=start)
+
+    flat_indices = layout.dest_ranks.long() * num_local_experts + layout.local_expert_ids.long()
+    counts = torch.bincount(flat_indices, minlength=ep_size * num_local_experts)
+    return counts.reshape(ep_size, num_local_experts)
 
 
 def build_packed_control_plane(
@@ -461,6 +503,8 @@ class EPMoELayer(nn.Module):
         self.comm_mode = _validate_comm_mode(comm_mode)
         self.expert_exec_mode = _validate_expert_exec_mode(expert_exec_mode)
         self.experts_per_rank = _validate_ep_partition(num_experts, ep_size)
+        if self.ep_size > 1 and self.expert_exec_mode == "grouped" and self.comm_mode != "packed":
+            raise ValueError("distributed grouped expert execution 当前只支持 comm_mode='packed'")
         self.local_expert_offset = self.rank * self.experts_per_rank
 
         self.router = TopKRouter(
@@ -556,6 +600,7 @@ class EPMoELayer(nn.Module):
         dispatched_x: torch.Tensor,
         expert_ids: torch.Tensor,
         valid_expert_ids: Optional[range] = None,
+        grouped_metadata: Optional[GroupedExpertMetadata] = None,
     ) -> torch.Tensor:
         outputs = torch.zeros(
             (dispatched_x.shape[0], self.hidden_size),
@@ -575,11 +620,21 @@ class EPMoELayer(nn.Module):
             local_expert_offset = valid_ids[0]
             num_local_experts = len(valid_ids)
 
-        metadata = build_grouped_expert_metadata(
-            expert_ids,
-            local_expert_offset=local_expert_offset,
-            num_local_experts=num_local_experts,
-        )
+        metadata = grouped_metadata
+        if metadata is None:
+            if expert_ids.is_cuda:
+                # local grouped CUDA path 不再尝试在层内做 D2H metadata 构造；
+                # benchmark 关注的 distributed packed/grouped 路径会显式传入 grouped_metadata。
+                return self._apply_experts_naive(
+                    dispatched_x=dispatched_x,
+                    expert_ids=expert_ids,
+                    valid_expert_ids=valid_expert_ids,
+                )
+            metadata = build_grouped_expert_metadata(
+                expert_ids,
+                local_expert_offset=local_expert_offset,
+                num_local_experts=num_local_experts,
+            )
 
         for run in metadata.runs:
             expert_in = dispatched_x[run.start : run.end]
@@ -592,12 +647,14 @@ class EPMoELayer(nn.Module):
         dispatched_x: torch.Tensor,
         expert_ids: torch.Tensor,
         valid_expert_ids: Optional[range] = None,
+        grouped_metadata: Optional[GroupedExpertMetadata] = None,
     ) -> torch.Tensor:
         if self.expert_exec_mode == "grouped":
             return self._apply_experts_grouped(
                 dispatched_x=dispatched_x,
                 expert_ids=expert_ids,
                 valid_expert_ids=valid_expert_ids,
+                grouped_metadata=grouped_metadata,
             )
         return self._apply_experts_naive(
             dispatched_x=dispatched_x,
@@ -643,6 +700,7 @@ class EPMoELayer(nn.Module):
         packed_send_counts_cpu: Optional[list[int]] = None,
         packed_source_context: Optional[PackedSourceContext] = None,
         packed_control_plane: Optional[PackedControlPlane] = None,
+        grouped_metadata: Optional[GroupedExpertMetadata] = None,
     ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
         if self.comm_mode == "packed":
             return self._forward_distributed_packed(
@@ -652,6 +710,7 @@ class EPMoELayer(nn.Module):
                 packed_send_counts_cpu=packed_send_counts_cpu,
                 packed_source_context=packed_source_context,
                 packed_control_plane=packed_control_plane,
+                grouped_metadata=grouped_metadata,
             )
         return self._forward_distributed_padded(x, num_tokens=num_tokens, return_aux=return_aux)
 
@@ -828,6 +887,7 @@ class EPMoELayer(nn.Module):
         packed_send_counts_cpu: Optional[list[int]] = None,
         packed_source_context: Optional[PackedSourceContext] = None,
         packed_control_plane: Optional[PackedControlPlane] = None,
+        grouped_metadata: Optional[GroupedExpertMetadata] = None,
     ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
         if not dist.is_initialized():
             raise RuntimeError("EPMoELayer 的 distributed 路径要求已初始化 torch.distributed")
@@ -892,6 +952,7 @@ class EPMoELayer(nn.Module):
             dispatched_x=recv_hidden,
             expert_ids=recv_expert_ids,
             valid_expert_ids=self.local_expert_ids(rank),
+            grouped_metadata=grouped_metadata,
         )
 
         recv_back_hidden = torch.empty(
@@ -939,6 +1000,7 @@ class EPMoELayer(nn.Module):
         packed_send_counts_cpu: Optional[list[int]] = None,
         packed_source_context: Optional[PackedSourceContext] = None,
         packed_control_plane: Optional[PackedControlPlane] = None,
+        grouped_metadata: Optional[GroupedExpertMetadata] = None,
     ) -> Optional[torch.Tensor] | tuple[Optional[torch.Tensor], Optional[EPForwardAux]]:
         if self.dist_group is None and not dist.is_initialized():
             if x is None:
@@ -957,6 +1019,7 @@ class EPMoELayer(nn.Module):
             packed_send_counts_cpu=packed_send_counts_cpu,
             packed_source_context=packed_source_context,
             packed_control_plane=packed_control_plane,
+            grouped_metadata=grouped_metadata,
         )
 
 
@@ -974,6 +1037,8 @@ __all__ = [
     "RoutingStats",
     "TopKRouter",
     "build_grouped_expert_metadata",
+    "build_grouped_expert_metadata_from_local_counts",
+    "build_grouped_local_expert_counts",
     "build_packed_control_plane",
     "build_dispatch_layout",
     "shard_moe_state_dict",
