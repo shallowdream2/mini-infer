@@ -6,7 +6,7 @@
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.1%2B-orange)
 ![CUDA](https://img.shields.io/badge/CUDA-12.1-green)
-![Tests](https://img.shields.io/badge/tests-287%20passed-brightgreen)
+[![Tests](https://github.com/psmarter/mini-infer/actions/workflows/tests.yml/badge.svg)](https://github.com/psmarter/mini-infer/actions/workflows/tests.yml)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ---
@@ -51,11 +51,11 @@ python serve.py --dry-run --port 8000   # 启动 OpenAI 兼容 HTTP API
 python quick_chat.py                     # 或者直接进入聊天
 ```
 
-运行测试套件（大多数无需 GPU）：
+运行测试套件：
 
 ```bash
-pip install -e ".[dev]"
-python -m pytest tests/ -q              # 287 tests passed
+make test-fast    # 不需要 GPU，207 tests，约 7s
+make test         # 全量测试，需要 GPU，约 50s
 ```
 
 **对比演示**（需要 Qwen2.5-1.5B，约 3 GB VRAM）：
