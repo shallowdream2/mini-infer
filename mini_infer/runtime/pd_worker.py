@@ -91,7 +91,7 @@ def run_prefill_worker(
 
     循环从 req_queue 取请求 → prefill → 提取 KV → 发送 KVPayload。
     """
-    from .model_runner import _sample_token
+    from ..modeling.model_runner import _sample_token
 
     if not config.dry_run:
         try:
@@ -184,7 +184,7 @@ def run_decode_worker(
 
     循环从 kv_queue 取 KVPayload → 重建 DynamicCache → decode loop → 发送结果。
     """
-    from .model_runner import _sample_token
+    from ..modeling.model_runner import _sample_token
 
     if not config.dry_run:
         try:
