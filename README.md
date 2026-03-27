@@ -40,9 +40,18 @@ mini-infer 从零实现了以下核心机制（按阶段顺序）：
 - **EP Control Plane 收敛**（Phase 20）：packed control-plane 显式量化，正式 benchmark `EP packed / dense = 2.310x`，`EP packed / EP padded = 1.204x`，`control_plane_share ≈ 1.94%`
 - **Grouped Expert Execution / Dispatch Overlap 原型**（Phase 21）：正式 benchmark `EP grouped / dense = 2.500x`，`EP grouped / EP packed = 1.070x`，`max_abs_diff_grouped = 0.000000`，并显式暴露 `ep_grouped_runtime_resident_ratio = 0.8334`
 
-项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-21 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 21；如继续技术主线，下一步应进入 Phase 22 的 `infer-plan`；如切换到项目重构 / 求职包装，现在已经可以进入 `refactor-audit`。
+项目面向单机 2 × RTX 4090 环境；dense 主线 benchmark 以 Qwen2.5-7B-Instruct（float16）为主，Phase 16 量化 benchmark 以 Qwen2.5-1.5B-Instruct 为主，Phase 17-21 的 MoE / EP benchmark 为 synthetic layer-level workload。当前主线实现已完成到 Phase 21。
 
-**权威来源**：`CLAUDE.md` 是项目规则和当前状态的权威来源；详细技术规划见 `本地资料/Claude计划/00-长期路线图.md`；本文件仅作快速索引。
+## 阶段总览
+
+| 主线 | 阶段 | 核心技术 | 关键指标 |
+|------|------|---------|---------|
+| Runtime | Phase 1–6 | Paged KV Cache + Continuous Batching + True PagedAttention | batch=8 达到 HF baseline 100%（406 tok/s） |
+| 调度优化 | Phase 7–10 | Preemption / Chunked Prefill / Prefix Caching | ITL spike −67%，TTFT −22% |
+| 算法加速 | Phase 11–12 | Speculative Decoding / CUDA Graph / Flash Decoding | accept_rate 55.85%，decode 延迟 −28.9% |
+| 分布式 | Phase 13–15 | Tensor Parallelism（NCCL）/ MLA / PD 解耦 | TP=2 greedy 与单卡完全一致 |
+| 量化 | Phase 16 | W8A8 per-channel int8 | 权重显存 −32.4%，greedy token match 71.8% |
+| MoE/EP | Phase 17–21 | Expert Parallelism / True Sharding / Grouped Execution | EP grouped / dense = 2.500× |
 
 ## 性能数据
 
@@ -99,19 +108,30 @@ mla_attention.py    MLA 三种实现（Phase 14）
 pd_engine.py / pd_worker.py  PD 解耦入口与 worker（Phase 15）
 ```
 
-详细架构说明、关键步骤和状态机参见 `CLAUDE.md`。
+详细模块说明见各源文件模块文档字符串。
 
 ## 快速开始
+
+无需模型权重，30 秒验证项目可运行：
+
+```bash
+git clone https://github.com/psmarter/mini-infer
+cd mini-infer
+pip install -e ".[serve]"
+
+# 启动 OpenAI 兼容 HTTP API（dry-run 模式）
+python serve.py --dry-run --port 8000
+
+# 或者直接进入聊天
+python quick_chat.py
+```
 
 ### 环境要求
 
 - Ubuntu 24.04 + CUDA（benchmark 需要 GPU）
 - Conda 环境 `ai-infra`（Python 3.10+，transformers 4.40+，PyTorch 2.x）
 
-说明：
-- AI/代理的非交互 shell 默认优先使用 `conda run -n ai-infra ...`
-- 交互 shell 如果已经完成 `conda init`，也可以继续使用 `conda activate ai-infra`
-- **真实模型（非 dry_run）的 `block_size` 必须是 256 的倍数**（flash_attn_with_kvcache 对齐要求），推荐使用默认值 `block_size=256`
+注意：**真实模型（非 dry_run）的 `block_size` 必须是 256 的倍数**（flash_attn_with_kvcache 对齐要求），推荐使用默认值 `block_size=256`。
 
 ### 单卡 benchmark
 
@@ -488,11 +508,7 @@ tests/
   test_paged_attention.py  Phase 6 GPU 测试（需要真实 GPU）
   test_triton_attn.py      Phase 6.5 Triton kernel 正确性测试
 
-.claude/                 Claude Code 协作配置（原始来源）
-.codex/                  Codex repo-local 技能源文件与安装说明
-CLAUDE.md                Claude 项目级协作规则
-CODEX.md                 Codex 项目级协作规则
-本地资料/                实验记录、博客草稿、知识整理（当前位于仓库内，以个人长期记录为主）
+本地资料/                实验记录、博客草稿、阶段里程碑总结、知识整理
 ```
 
 ## 开发阶段
@@ -523,8 +539,4 @@ CODEX.md                 Codex 项目级协作规则
 | Phase 20 | EP Control Plane 收敛（packed control-plane 显式量化；dense 22610.50 tok/s，`ep_padded` 43392.45 tok/s，`ep_packed` 52229.29 tok/s，`control_plane_share ≈ 1.94%`）| ✅ 完成 |
 | Phase 21 | Grouped Expert Execution / Dispatch Overlap 原型（dense 21878.76 tok/s，`ep_packed` 51121.99 tok/s，`ep_grouped` 54696.73 tok/s，`EP grouped / EP packed = 1.070x`，runtime resident trade-off 已显式量化）| ✅ 完成 |
 
-下一阶段：
-
-- Phase 22：待 infer-plan（优先考虑更完整的 grouped GEMM / kernel 级 local expert compute，或把当前 grouped EP 路径接进更完整的生成 / serving 链路）
-
-后续阶段验收口径详见 `CLAUDE.md`。
+下一阶段：Phase 22（方向待定，候选方向：更完整的 grouped GEMM / kernel 级 local expert compute，或把 grouped EP 路径接入完整的生成链路）
