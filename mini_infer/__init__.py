@@ -4,21 +4,21 @@ from __future__ import annotations
 
 from importlib import import_module
 
-from .config import EngineConfig
-from .request import Request, RequestState, SamplingParams
+from .core.config import EngineConfig
+from .core.request import Request, RequestState, SamplingParams
 
 _LAZY_IMPORTS = {
-    "LLMEngine": (".engine", "LLMEngine"),
-    "AsyncEngine": (".async_engine", "AsyncEngine"),
-    "PPEngine": (".pp_engine", "PPEngine"),
-    "ReplicaEngine": (".replica_engine", "ReplicaEngine"),
-    "SpecEngine": (".spec_engine", "SpecEngine"),
-    "TPEngine": (".tp_engine", "TPEngine"),
-    "PDEngine": (".pd_engine", "PDEngine"),
-    "EPEngine": (".ep_engine", "EPEngine"),
-    "QuantLinear": (".quantization", "QuantLinear"),
-    "quantize_model": (".quantization", "quantize_model"),
-    "QuantMode": (".quantization", "QuantMode"),
+    "LLMEngine":      (".runtime.engine",       "LLMEngine"),
+    "AsyncEngine":    (".runtime.async_engine",  "AsyncEngine"),
+    "SpecEngine":     (".runtime.spec_engine",   "SpecEngine"),
+    "PDEngine":       (".runtime.pd_engine",     "PDEngine"),
+    "PPEngine":       (".parallel.pp_engine",    "PPEngine"),
+    "ReplicaEngine":  (".parallel.replica_engine", "ReplicaEngine"),
+    "TPEngine":       (".parallel.tp_engine",    "TPEngine"),
+    "EPEngine":       (".parallel.ep_engine",    "EPEngine"),
+    "QuantLinear":    (".modeling.quantization", "QuantLinear"),
+    "quantize_model": (".modeling.quantization", "quantize_model"),
+    "QuantMode":      (".modeling.quantization", "QuantMode"),
 }
 
 __all__ = [

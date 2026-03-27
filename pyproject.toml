@@ -59,6 +59,25 @@ serve = [
 triton = [
     "triton>=2.1.0",
 ]
+# Phase 13/17+ 分布式（NCCL 随 PyTorch 一起安装，此处列出额外依赖）
+dist = [
+    "torch>=2.1.2",  # NCCL backend included
+]
+# 一键安装全部可选依赖（flash-attn 需单独编译，不计入）
+all = [
+    "fastapi>=0.100.0",
+    "uvicorn>=0.23.0",
+    "asgi-lifespan>=2.0",
+    "triton>=2.1.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "httpx>=0.24.0",
+]
+
+[project.scripts]
+mini-infer-serve = "mini_infer.cli.serve:main"
+mini-infer-chat  = "mini_infer.cli.chat:main"
+mini-infer-demo  = "mini_infer.cli.demo:main"
 
 [tool.setuptools.packages.find]
 include = ["mini_infer*"]

@@ -1,7 +1,7 @@
 # mini-infer
 
-> 从 PyTorch 原语出发，逐步实现 LLM 推理引擎的所有核心机制。
-> 每个阶段有独立的 benchmark 和技术分析，帮你真正理解 vLLM / TRT-LLM / Megatron-LM 背后的设计权衡。
+> 一个**从零实现 LLM 推理系统关键机制**的学习型推理引擎项目。
+> 不停留在"会调用模型"，而是亲手实现并验证 **Paged KV Cache、Continuous Batching、PagedAttention、Chunked Prefill、Prefix Caching、Speculative Decoding、CUDA Graph、Flash Decoding、Tensor Parallelism、MLA、MoE Expert Parallelism** 等核心能力，并通过 benchmark 分析它们的收益、代价与适用边界。
 
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.1%2B-orange)
@@ -13,13 +13,35 @@
 
 ## 项目定位
 
-`mini-infer` 不停留在"能调用模型就够了"的层面，也不假装自己是生产级 vLLM。
+`mini-infer` 不是一个只追求"能跑"的 demo，也不是直接对标生产级 vLLM 的工业 serving 框架。
+它的定位是：
 
-- **学习导向**：每个优化机制（PagedAttention、Chunked Prefill、Flash Decoding、TP、MoE EP …）亲手实现，用真实 benchmark 回答"它在什么条件下有效、代价是什么"
-- **工程导向**：统一引擎接口（`LLMEngine` / `AsyncEngine`）、OpenAI 兼容 HTTP 服务、测试套件与 Makefile——骨架完整，可直接运行
-- **研究导向**：覆盖 Runtime 基础 → 性能优化 → 分布式 → 量化 → MoE EP 完整技术主线，每个 phase 结果独立可复现
+- **学习导向**：把主流推理系统中的关键优化逐步拆开、实现、验证
+- **工程导向**：提供统一的引擎接口、服务接口、测试和 benchmark
+- **研究导向**：回答"某个优化为什么有效、在什么条件下有效、代价是什么"
 
-实验环境：Ubuntu 24.04，2 × RTX 4090，Qwen2.5 系列（0.5B / 1.5B / 7B）。
+因此，它既适合：
+
+- AI Infra / 推理方向学习与面试准备
+- 作为个人推理引擎作品集项目
+- 作为后续扩展成更完整 serving runtime 的基础骨架
+
+---
+
+## 你能在这个项目中看到什么
+
+这个项目围绕一条清晰主线展开：
+
+**1. 运行时基础能力**
+从最小推理链路开始，逐步构建 continuous batching、KV cache、调度器和批量 decode。
+
+**2. 关键性能优化机制**
+实现真实的 PagedAttention、Chunked Prefill、Prefix Caching、CUDA Graph、Flash Decoding、Speculative Decoding 等核心能力。
+
+**3. 扩展能力**
+逐步走向 Tensor Parallelism、MLA、Prefill/Decode 解耦、量化、MoE Expert Parallelism。
+
+换句话说，这不是"把一堆论文点拼在一起"，而是沿着**现代 LLM 推理系统演化路径**，一步一步把骨架搭出来。
 
 ---
 
@@ -32,275 +54,291 @@
 | **Prefix Caching**（block-level hash + LRU） | 共享前缀 TTFT **−22%** |
 | **Speculative Decoding**（0.5B draft + 7B target） | acceptance rate **55.85%** |
 | **CUDA Graph**（decode_batch 静态捕获） | 1.5B bs=1 decode 延迟 **−28.9%** |
-| **Flash Decoding**（Triton split-K） | seq=4096 时 **3.31×** vs 标准 Triton kernel，SM 利用率 9% → 103% |
+| **Flash Decoding**（Triton split-K） | seq=4096 延迟 **3.31×** vs 标准 Triton，SM 利用率 9%→103% |
 | **Tensor Parallelism**（NCCL all-reduce，Megatron-LM 风格） | TP=2 greedy 输出与单卡**完全一致** |
 | **MLA**（DeepSeek-V2/V3 架构） | latent cache 体积 **−56.25%** vs GQA |
-| **W8A8 量化**（per-channel int8 + mixed fallback） | 1.5B 权重显存 **−32.4%**，greedy match 71.8% |
-| **MoE Expert Parallelism**（Grouped Local Expert Execution） | EP grouped / dense = **2.500×** |
+| **W8A8 量化**（per-channel int8 + mixed fallback） | 权重显存 **−32.4%**，greedy match 71.8% |
+| **MoE Expert Parallelism**（Grouped Local Execution） | EP grouped / dense = **2.500×** |
+
+完整 benchmark 数据与复现命令见 [docs/benchmarks.md](docs/benchmarks.md)。
 
 ---
 
 ## 快速开始
 
-**无需模型权重**，30 秒验证项目可运行：
+### 安装
 
 ```bash
 git clone https://github.com/psmarter/mini-infer
 cd mini-infer
-pip install -e ".[serve]"
-
-python serve.py --dry-run --port 8000   # 启动 OpenAI 兼容 HTTP API
-python quick_chat.py                     # 或者直接进入聊天
+pip install -e ".[serve]"        # 基础依赖 + HTTP serving
+pip install -e ".[serve,dev]"    # 含测试工具
+pip install -e ".[all]"          # 安装全部可选依赖
 ```
 
-运行测试套件：
+如需 True PagedAttention（flash_attn block_table）路径：
 
 ```bash
-make test-fast    # 不需要 GPU，207 tests，约 7s
-make test         # 全量测试，需要 GPU，约 50s
+pip install "flash-attn>=2.5.0" --no-build-isolation
 ```
 
-**对比演示**（需要 Qwen2.5-1.5B，约 3 GB VRAM）：
+安装后可直接使用 CLI 命令：`mini-infer-serve` / `mini-infer-chat` / `mini-infer-demo`
+
+---
+
+## 先跑一个最小可用演示
+
+### 方式 A — 无需模型权重，30 秒验证
 
 ```bash
-export MODEL=/path/to/Qwen2.5-1.5B-Instruct
-export HF_HUB_OFFLINE=1
+python serve.py --dry-run --port 8000   # 或：mini-infer-serve --dry-run --port 8000
+python quick_chat.py
+```
 
-python demo.py --model $MODEL --mode quant         # FP16 vs W8A8：文本质量 + 显存对比
+### 方式 B — 功能对比演示（需要 Qwen2.5-1.5B，约 3 GB VRAM）
+
+```bash
+export MODEL=/path/to/Qwen2.5-1.5B-Instruct && export HF_HUB_OFFLINE=1
+
+python demo.py --model $MODEL --mode quant         # FP16 vs W8A8：显存 + 文本质量
 python demo.py --model $MODEL --mode cuda-graph    # Eager vs CUDA Graph：decode 延迟
-python demo.py --model $MODEL --mode prefix-cache  # 冷启动 vs 前缀命中：TTFT 对比
-python demo.py --model $MODEL --mode all           # 依次运行三种
+python demo.py --model $MODEL --mode prefix-cache  # 冷启动 vs 前缀命中：TTFT
+python demo.py --model $MODEL --mode all
 ```
 
-真实模型推理（需要 Qwen2.5-7B-Instruct）：
+### 方式 C — 主线 benchmark（需要 Qwen2.5-7B-Instruct）
 
 ```bash
-export MODEL=/path/to/Qwen2.5-7B-Instruct
-export HF_HUB_OFFLINE=1
+export MODEL=/path/to/Qwen2.5-7B-Instruct && export HF_HUB_OFFLINE=1
 python benchmarks/benchmark_flash.py --model $MODEL --batch-size 8 --compare
 ```
 
 ---
 
-## 架构
+## 服务化能力
+
+`mini-infer` 提供 OpenAI Chat Completions 子集兼容接口：
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`（streaming + non-streaming）
+- 通过 `AsyncEngine` 实现后台 step loop
+- 多并发请求自动合并进同一 decode batch
+
+**启动服务：**
+
+```bash
+mini-infer-serve --dry-run --port 8000                           # 无需模型权重
+mini-infer-serve --model /path/to/model --port 8000              # 真实模型
+mini-infer-serve --model /path/to/model --chunk-prefill-size 256 # 开启 Chunked Prefill
+```
+
+**curl 快速验证：**
+
+```bash
+curl http://localhost:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"mini-infer","messages":[{"role":"user","content":"Hello"}],"stream":false}'
+```
+
+Python 完整示例（non-streaming / streaming / 多轮对话）见 [`examples/openai_client.py`](examples/openai_client.py)。
+
+---
+
+## 架构总览
 
 ```mermaid
 graph TD
-    A["HTTP Request\n(OpenAI API)"] --> B["AsyncEngine\n后台 step loop"]
+    A["HTTP / CLI 请求"] --> B["AsyncEngine\n后台 step loop"]
     B --> C["LLMEngine\nContinuous Batching 主循环"]
     C --> D["Scheduler\nwaiting / running / swapped / prefilling"]
-    C --> E["KVCacheManager\nBlockTable + FreeBlockPool\n+ Prefix Cache"]
+    C --> E["KVCacheManager\nBlockTable + FreeBlockPool + Prefix Cache"]
     C --> F["ModelRunner\nprefill + decode_batch"]
     F --> G["PagedAttention\nflash_attn block_table"]
     F --> H["CUDA Graph\ndecode replay"]
     F --> I["QuantLinear\nW8A8 / mixed fallback"]
 
     subgraph dist ["分布式扩展"]
-        J["TPEngine\nNCCL all-reduce\n(Phase 13)"]
-        K["EPEngine\nMoE all-to-all\n(Phase 17–21)"]
+        J["TPEngine\nNCCL all-reduce (Phase 13)"]
+        K["EPEngine\nMoE all-to-all (Phase 17–21)"]
     end
 
     subgraph algo ["算法扩展"]
-        L["SpecEngine\ndraft + target\n(Phase 11)"]
-        M["PDEngine\nPrefill/Decode split\n(Phase 15)"]
+        L["SpecEngine\ndraft + target (Phase 11)"]
+        M["PDEngine\nPrefill/Decode split (Phase 15)"]
     end
 
     C --> dist
     C --> algo
 ```
 
-模块职责详见 [docs/architecture.md](docs/architecture.md)。
+详细模块说明见 [docs/architecture.md](docs/architecture.md)。
 
 ---
 
-## 实现路线（21 个阶段）
+## 当前实现路线
 
-| 主线 | 阶段 | 核心技术 | 代表指标 |
-|------|------|---------|---------|
-| Runtime 基础 | Phase 1–6 | Paged KV Cache + Continuous Batching + True PagedAttention | 100% HF baseline |
-| 调度优化 | Phase 7–10 | Preemption / Chunked Prefill / Prefix Caching | ITL −67%，TTFT −22% |
-| 算法加速 | Phase 11–12.5 | Speculative Decoding / CUDA Graph / Flash Decoding (Triton) | decode 延迟 −28.9% |
-| 分布式扩展 | Phase 13–15 | Tensor Parallelism（NCCL）/ MLA / PD 解耦 | TP=2 greedy 与单卡一致 |
-| 量化 | Phase 16 | W8A8 per-channel + mixed fallback | 权重显存 −32.4% |
-| MoE / EP | Phase 17–21 | Expert Parallelism / True Sharding / Non-Padded / Grouped Execution | EP grouped / dense = 2.500× |
+### Runtime 基础
+- 单卡最小推理链路（HF 模型加载、串行 decode、HF baseline 对比）
+- Paged KV Cache（BlockTable + FreeBlockPool）
+- Continuous Batching + Prefill/Decode 分离
+- Scheduler（waiting / running / swapped / prefilling 四队列）
+- Preemption + Priority Scheduling（GPU↔CPU KV swap）
+
+### 性能优化
+- True PagedAttention（flash_attn block_table，batch=8 达到 100% HF baseline）
+- Triton Decode Attention Kernel（online softmax + GQA，Phase 6.5）
+- Chunked Prefill（ITL spike −57%–67%，Phase 9）
+- Prefix Caching（block-level SHA-256 hash + LRU，TTFT −22%，Phase 10）
+- Speculative Decoding（draft + target，acceptance_rate 55.85%，Phase 11）
+- CUDA Graph（decode_batch 静态捕获，延迟 −28.9%，Phase 12）
+- Flash Decoding / Split-K Attention（3.31× vs 标准 Triton，Phase 12.5）
+
+### 扩展能力
+- HTTP serving（OpenAI Chat Completions 子集兼容，Phase 8）
+- Tensor Parallelism（NCCL all-reduce，Megatron-LM 风格，Phase 13）
+- MLA（DeepSeek-V2/V3 架构，latent cache −56.25%，Phase 14）
+- Prefill/Decode 解耦（同机双进程原型，Phase 15）
+- W8A8 量化（per-channel int8 + mixed fallback，权重显存 −32.4%，Phase 16）
+- MoE Expert Parallelism（Grouped Local Execution，2.500× vs dense，Phase 17–21）
 
 <details>
-<summary>展开完整阶段列表</summary>
+<summary>展开完整 21 阶段列表</summary>
 
 | 阶段 | 内容 | 状态 |
 |------|------|------|
-| Phase 1 | 单卡最小推理链路（真实模型加载、串行 decode、HF baseline 对比） | ✅ |
+| Phase 1 | 单卡最小推理链路 | ✅ |
 | Phase 2 | Paged KV Cache + Prefill/Decode 分离 + Continuous Batching | ✅ |
-| Phase 3 | gather_batch_kv 向量化 + DynamicCache（batch=8 吞吐 +79.8%） | ✅ |
+| Phase 3 | gather_batch_kv 向量化 + DynamicCache（batch=8 吞吐 88.4% HF） | ✅ |
 | Phase 4 | 双卡扩展（Replica + HF Pipeline Parallel） | ✅ |
 | Phase 5 | Profiling + 技术总结 | ✅ |
-| Phase 6 | True PagedAttention（flash_attn block_table，batch=8 达到 100% HF） | ✅ |
-| Phase 6.5 | Triton decode attention kernel（online softmax，GQA，roofline 分析） | ✅ |
-| Phase 7 | Preemption + Priority Scheduling（GPU↔CPU KV swap） | ✅ |
-| Phase 8 | OpenAI Chat Completions 兼容 HTTP API（FastAPI + SSE + AsyncEngine） | ✅ |
-| Phase 9 | Chunked Prefill（ITL spike −57% @ chunk=256） | ✅ |
-| Phase 10 | Prefix Caching（block-level hash + LRU，TTFT −22%） | ✅ |
-| Phase 11 | Speculative Decoding（0.5B draft + 7B target，acceptance_rate 55.85%） | ✅ |
-| Phase 12 | CUDA Graph（decode_batch 静态捕获，1.5B bs=1 延迟 −28.9%） | ✅ |
-| Phase 12.5 | Flash Decoding（Triton split-K，1.5B seq=4096 延迟 3.31× vs triton_65） | ✅ |
-| Phase 13 | Tensor Parallelism（真 TP，NCCL all-reduce，Megatron-LM 风格） | ✅ |
-| Phase 14 | MLA（DeepSeek-V2/V3 架构，latent cache −56.25% vs GQA，矩阵吸收优化） | ✅ |
-| Phase 15 | PD 解耦（同机双进程，KV 序列化传输，TTFT 三段分解） | ✅ |
-| Phase 16 | W8A8 量化（per-channel int8，attention 层跳过，混合 fallback） | ✅ |
-| Phase 17 | MoE + Expert Parallelism（synthetic MoE + 2-GPU，EP / dense = 1.891×） | ✅ |
-| Phase 18 | True Expert Sharding（per-rank local expert shard，shard_ratio = 0.5002） | ✅ |
-| Phase 19 | Non-Padded EP Dispatch（ep_packed_bytes = ep_ideal_bytes，2.323×） | ✅ |
-| Phase 20 | EP Control Plane 收敛（control_plane_share ≈ 1.94%，2.310×） | ✅ |
-| Phase 21 | Grouped Expert Execution（EP grouped / dense = 2.500×，resident ratio 0.8334） | ✅ |
+| Phase 6 | True PagedAttention（flash_attn block_table，100% HF） | ✅ |
+| Phase 6.5 | Triton decode attention kernel | ✅ |
+| Phase 7 | Preemption + Priority Scheduling | ✅ |
+| Phase 8 | OpenAI Chat Completions 兼容 HTTP API | ✅ |
+| Phase 9 | Chunked Prefill（ITL spike −57%） | ✅ |
+| Phase 10 | Prefix Caching（TTFT −22%） | ✅ |
+| Phase 11 | Speculative Decoding（acceptance_rate 55.85%） | ✅ |
+| Phase 12 | CUDA Graph（decode 延迟 −28.9%） | ✅ |
+| Phase 12.5 | Flash Decoding（3.31× vs triton_65） | ✅ |
+| Phase 13 | Tensor Parallelism（NCCL，Megatron-LM 风格） | ✅ |
+| Phase 14 | MLA（DeepSeek-V2/V3，latent cache −56.25%） | ✅ |
+| Phase 15 | PD 解耦（同机双进程，KV 传输） | ✅ |
+| Phase 16 | W8A8 量化（权重显存 −32.4%） | ✅ |
+| Phase 17 | MoE + Expert Parallelism（1.891×） | ✅ |
+| Phase 18 | True Expert Sharding（shard_ratio 0.5002） | ✅ |
+| Phase 19 | Non-Padded EP Dispatch（2.323×） | ✅ |
+| Phase 20 | EP Control Plane 收敛（2.310×） | ✅ |
+| Phase 21 | Grouped Expert Execution（2.500×） | ✅ |
+
+详细阶段说明见 [docs/phases.md](docs/phases.md)。
 
 </details>
 
 ---
 
-## 性能数据
+## 推荐使用方式
 
-### 单卡吞吐演进（Qwen2.5-7B-Instruct，batch=8，max_new_tokens=128）
+### 1. 当作学习型推理引擎阅读
 
-| 实现 | batch=8 吞吐 | vs HF |
-|------|------------|-------|
-| HF Transformers baseline | ~406 tok/s | 100% |
-| Phase 1（串行 decode） | 56 tok/s | 13.8% |
-| Phase 2（Paged KV + Batch Decode） | 201 tok/s | 49.5% |
-| Phase 3（向量化 gather + DynamicCache） | 361 tok/s | 88.4% |
-| **Phase 6（True PagedAttention）** | **406 tok/s** | **100.0%** |
+按 phase 或模块阅读代码，理解每个优化机制的实现逻辑与设计权衡。
 
-### MoE Expert Parallelism 演进（synthetic MoE，2×RTX 4090）
+推荐阅读顺序：`engine.py` → `scheduler.py` → `kv_cache.py` → `attention.py` → `model_runner.py`
 
-| 实现 | 吞吐（tok/s） | vs dense |
-|------|------------|---------|
-| Dense（1 GPU） | ~22,000 | 1.00× |
-| EP padded（2 GPU） | ~43,000 | ~1.96× |
-| EP packed（2 GPU） | ~52,000 | ~2.32× |
-| **EP grouped（2 GPU）** | **~54,700** | **2.500×** |
+详细模块指南见 [docs/architecture.md](docs/architecture.md)。
 
-### 各阶段关键数据
+### 2. 当作 benchmark playground
 
-| 阶段 | 指标 |
-|------|------|
-| Chunked Prefill（Phase 9） | ITL spike −57%（chunk=256）；−67%（chunk=128） |
-| Prefix Caching（Phase 10） | 共享 1 个 block 时 TTFT −22% |
-| Speculative Decoding（Phase 11） | acceptance_rate 55.85%，0.5B draft + 7B target |
-| CUDA Graph（Phase 12） | 1.5B bs=1 decode 延迟 −28.9% |
-| Flash Decoding（Phase 12.5） | 1.5B seq=4096 延迟 3.31× vs 标准 Triton；SM 利用率 9% → 103% |
-| W8A8 量化（Phase 16） | 1.5B 权重显存 −32.4%（3392→2292 MB），greedy match 71.8% |
-| PD 解耦（Phase 15） | TTFT 分解：prefill 12.3ms / transfer ≈14.7ms / decode 519ms |
+运行 benchmark 脚本，对比某个机制前后的吞吐、TTFT、ITL、显存和正确性。
+
+每个 phase 对应一个独立的 benchmark 脚本，大多数支持 `--dry_run` / `--compare` 参数。完整索引见 [docs/benchmarks.md](docs/benchmarks.md)。
+
+### 3. 当作后续完整引擎的基础骨架
+
+在现有代码上继续扩展：接入新模型、修改调度策略、添加量化方案、扩展 serving 接口或并行策略。
 
 ---
 
-## 运行 Benchmark
+## 目录建议（演进方向）
 
-### 核心主线（Phase 6，需要 Qwen2.5-7B）
+当前仓库已经具备核心功能，如果希望进一步产品化，推荐分阶段演进到如下结构：
 
-```bash
-export MODEL=/path/to/Qwen2.5-7B-Instruct
-export HF_HUB_OFFLINE=1
-
-# HF baseline 对照
-python benchmarks/benchmark_hf.py --model $MODEL --batch-size 8 --max-new-tokens 128
-
-# mini-infer 主线（True PagedAttention）
-python benchmarks/benchmark_flash.py --model $MODEL --batch-size 8 --compare
+```text
+mini-infer/
+├─ mini_infer/
+│  ├─ core/            # request / config / sampling / common types
+│  ├─ runtime/         # engine / scheduler / async_engine / pd_engine
+│  ├─ cache/           # kv_cache / prefix_cache / block manager
+│  ├─ modeling/        # model_runner / quantization / mla / moe
+│  ├─ kernels/         # attention / triton_attn / flash_decode
+│  ├─ parallel/        # tp / ep / replica / pp
+│  ├─ serving/         # server / openai schema / clients
+│  └─ cli/             # console scripts ✅（已建）
+├─ benchmarks/
+├─ tests/
+├─ examples/           # ✅（已建）
+├─ docs/               # ✅（已建）
+│  ├─ architecture.md
+│  ├─ phases.md
+│  ├─ benchmarks.md
+│  └─ faq.md
+├─ scripts/            # ✅（已建）
+├─ assets/
+│  └─ charts/          # benchmark 可视化图表（待补充）
+├─ serve.py
+├─ quick_chat.py
+├─ demo.py
+└─ pyproject.toml
 ```
 
-### MoE Expert Parallelism（Phase 17–21，需要 2 GPU，无需模型权重）
+注意：这是适合分阶段迁移的演进方向，不是"必须立即重构"的目标结构。
+
+---
+
+## 设计边界
+
+这个项目当前更接近：
+
+- **高质量学习型推理系统**
+- **研究/面试/作品集友好的工程项目**
+- **可继续向完整 serving runtime 演进的基础版引擎**
+
+它当前**还不是**：
+
+- 完整生产级 serving 框架
+- 支持多模型、多租户、复杂调度策略的成熟系统
+- 面向线上 SLA 的工业级部署方案
+
+这不是缺点，反而是它的价值所在：
+你可以清晰看到每个模块为什么存在、如何演进，而不是被成熟框架的复杂度淹没。
+
+---
+
+## 路线建议
+
+如果你准备继续把它打造成一个"更像完整推理引擎"的项目，建议优先做这几件事：
+
+1. **补齐结果可视化** — 添加 benchmark 图表（吞吐演进折线、ITL 对比柱状图、MoE EP 通信演进图）
+2. **统一配置系统** — CLI + 环境变量 + dataclass + 默认配置文件，三者合一
+3. **渐进目录分层** — 先按 `runtime / cache / kernels / parallel / serving` 分组，不推倒重来
+4. **量化扩展** — FP8、Triton INT8 GEMM、AWQ/SmoothQuant 级精度优化
+5. **建立"主线可运行演示"** — 让第一次进入仓库的用户在 3 分钟内完成一次成功体验
+
+---
+
+## 测试与质量保证
 
 ```bash
-python benchmarks/benchmark_moe.py \
-    --compare --batch-size 4 --seq-len 16 \
-    --hidden-size 512 --intermediate-size 1024 \
-    --num-experts 8 --top-k 2 --dtype float16 \
-    --warmup 2 --runs 5 --src-rank 1
+make test-fast    # 不需要 GPU，207 tests，约 7s（推荐作为最小验证门槛）
+make test         # 全量测试，需要 GPU，约 50s
+make test-gpu     # 仅 GPU 专项（paged_attention / Triton / Flash Decoding）
 ```
 
-### W8A8 量化（Phase 16，需要 Qwen2.5-1.5B）
+建议：
+- `test-fast` 作为 PR / commit 最小门槛
+- `test` 作为本地全量验证
+- 外部环境可使用 `PYTHON=python make test-fast` 覆盖默认 conda 路径
 
-```bash
-export QUANT_MODEL=/path/to/Qwen2.5-1.5B-Instruct
-python benchmarks/benchmark_quant.py --model $QUANT_MODEL --compare --batch-size 4
-```
-
-<details>
-<summary>展开全部 benchmark 命令（Phase 6.5 ~ Phase 15）</summary>
-
-#### Triton Kernel（Phase 6.5，无需模型权重）
-
-```bash
-python benchmarks/benchmark_triton.py
-python -m pytest tests/test_triton_attn.py -v
-```
-
-#### Preemption（Phase 7）
-
-```bash
-python benchmarks/benchmark_preemption.py --dry-only   # 无需模型权重
-python benchmarks/benchmark_preemption.py              # 需要 Qwen2.5-7B
-```
-
-#### HTTP Server + Chunked Prefill（Phase 8/9）
-
-```bash
-python serve.py --dry-run --port 8000
-python serve.py --model $MODEL --chunk-prefill-size 256 --port 8000
-python benchmarks/benchmark_chunked_prefill.py --model $MODEL --chunk-size 256
-```
-
-#### Prefix Caching（Phase 10）
-
-```bash
-python benchmarks/benchmark_prefix_cache.py --dry_run
-python benchmarks/benchmark_prefix_cache.py --model $MODEL --batch_size 8
-```
-
-#### Speculative Decoding（Phase 11）
-
-```bash
-python benchmarks/benchmark_spec.py --dry_run
-python benchmarks/benchmark_spec.py --draft auto --target auto --K 4 --target_only
-```
-
-#### CUDA Graph（Phase 12）
-
-```bash
-python benchmarks/benchmark_cuda_graph.py \
-    --model /path/to/Qwen2.5-1.5B-Instruct \
-    --num-kv-heads 2 --head-dim 128 --num-layers 28
-```
-
-#### Flash Decoding（Phase 12.5，无需模型权重）
-
-```bash
-python benchmarks/benchmark_flash_decode.py
-python benchmarks/benchmark_flash_decode.py --num-q-heads 28 --num-kv-heads 4
-```
-
-#### Tensor Parallelism（Phase 13）
-
-```bash
-export TP_MODEL=/path/to/Qwen2.5-1.5B-Instruct
-torchrun --nproc_per_node 2 benchmarks/benchmark_tp.py --model $TP_MODEL --mode torchrun_tp
-```
-
-#### MLA（Phase 14，需要 DeepSeek-V2-Lite）
-
-```bash
-python benchmarks/benchmark_mla.py --section 1   # 理论 KV 大小（无需权重）
-python benchmarks/benchmark_mla.py --section 2   # 真实显存测量
-python benchmarks/benchmark_mla.py --section 3   # 三种实现延迟对比
-```
-
-#### PD 解耦（Phase 15）
-
-```bash
-TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 \
-    python benchmarks/benchmark_pd_disagg.py --section 3   # TTFT 三段分解
-```
-
-</details>
+大多数测试支持 `dry_run` 模式，不依赖真实模型权重。GPU 专项测试在 RTX 4090（CUDA 12.1）上验证通过。
 
 ---
 
@@ -345,18 +383,23 @@ mini_infer/
   │  moe_layer.py           TopKRouter / MoELayer / EPMoELayer（Phase 17–21）
   │  moe_model.py           SyntheticMoEConfig / SyntheticMoEModel
   │
-  └─ Serving ──────────────────────────────────────────────────────────
-     server.py              FastAPI HTTP server（OpenAI Chat Completions 子集）
-     openai_schema.py       Request / Response Pydantic 模型
-     clients/               交互式聊天客户端
+  ├─ Serving ──────────────────────────────────────────────────────────
+  │  server.py              FastAPI HTTP server（OpenAI Chat Completions 子集）
+  │  openai_schema.py       Request / Response Pydantic 模型
+  │  clients/               交互式聊天客户端
+  │
+  └─ CLI ──────────────────────────────────────────────────────────────
+     cli/                   console scripts（mini-infer-serve/chat/demo）
 
-serve.py       HTTP server CLI 入口（argparse + uvicorn）
+serve.py       HTTP server CLI 入口
 quick_chat.py  一键 dry-run 聊天
 demo.py        功能对比演示（quant / cuda-graph / prefix-cache）
 benchmarks/    每个 phase 对应一个 benchmark 脚本（21 个）
 tests/         测试套件（35+ 模块，287 tests，大多数支持 dry_run）
-examples/      API 使用示例（openai_client.py）
-docs/          架构说明（architecture.md）
+examples/      API 使用示例（openai_client.py / local_chat.py）
+docs/          架构、阶段与 benchmark 说明
+scripts/       工具脚本（benchmark 结果收集）
+assets/        图表与可视化资源（待补充）
 ```
 
 </details>
@@ -365,20 +408,11 @@ docs/          架构说明（architecture.md）
 
 ## 适合谁
 
-- 正在准备 **AI Infra / 推理系统 / 分布式训练推理**方向的求职者，想把"会用框架"升级为"理解框架内部"
-- 想真正搞懂 **vLLM / TensorRT-LLM / Megatron-LM** 背后设计权衡，而不只是读论文
-- 需要一个"有深度、有代码、有 benchmark 数据"的**个人代表性项目**
+这个项目特别适合：
 
----
-
-## 设计边界
-
-- Phase 17–21 的 MoE/EP benchmark 基于 **synthetic layer-level workload**（单层 MoE forward），不包含完整 serving 链路
-- Phase 16 量化是 W8A8 **第一版原型**，非 AWQ/SmoothQuant 级别精度优化；decode 路径以 int8 权重 + float activation 的 mixed fallback 为主
-- Tensor Parallelism 以 Qwen2.5-1.5B 验证正确性，未在 7B 上做完整吞吐对比
-- 项目面向学习闭环，不是生产 serving 系统
-
-每个阶段的 prototype 边界和 benchmark 口径已在各阶段 infer-benchmark / infer-summarize 中详细记录。
+- 想找 **AI Infra / 推理 / 系统优化** 相关岗位的人
+- 想真正弄懂 **vLLM / TensorRT-LLM / Megatron-LM** 背后机制的人
+- 想做一个"有深度、有代码、有结果"的**个人代表项目**的人
 
 ---
 
@@ -392,8 +426,10 @@ docs/          架构说明（architecture.md）
 | flash-attn | 2.5.9.post1 |
 | CUDA | 12.1 |
 
-```bash
-pip install -e ".[serve,dev]"   # 安装所有依赖
-```
+真实模型推理时 `block_size` 必须是 256 的倍数（`flash_attn_with_kvcache` 对齐要求）。
 
-注意：真实模型推理时 `block_size` 必须是 256 的倍数（flash_attn_with_kvcache 对齐要求）。
+---
+
+## License
+
+MIT
