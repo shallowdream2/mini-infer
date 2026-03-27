@@ -10,7 +10,7 @@
 
 用法示例：
   # 需要 Qwen2.5-1.5B（约 3 GB VRAM）
-  export MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+  export MODEL=/path/to/Qwen2.5-1.5B-Instruct
   export HF_HUB_OFFLINE=1
 
   python demo.py --model $MODEL --mode quant

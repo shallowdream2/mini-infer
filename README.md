@@ -11,13 +11,15 @@
 
 ---
 
-## 为什么做这个项目
+## 项目定位
 
-大多数"LLM 推理入门"项目停留在 API 调用层，无法解释为什么 vLLM 要用 PagedAttention、为什么需要 Chunked Prefill、MoE 的 Expert Parallelism 到底在通信什么。
+`mini-infer` 不停留在"能调用模型就够了"的层面，也不假装自己是生产级 vLLM。
 
-本项目的目标是：**每个优化机制都亲手实现一遍，用真实 benchmark 回答它在什么情况下有效、代价是什么、和工业系统的差距在哪里。**
+- **学习导向**：每个优化机制（PagedAttention、Chunked Prefill、Flash Decoding、TP、MoE EP …）亲手实现，用真实 benchmark 回答"它在什么条件下有效、代价是什么"
+- **工程导向**：统一引擎接口（`LLMEngine` / `AsyncEngine`）、OpenAI 兼容 HTTP 服务、测试套件与 Makefile——骨架完整，可直接运行
+- **研究导向**：覆盖 Runtime 基础 → 性能优化 → 分布式 → 量化 → MoE EP 完整技术主线，每个 phase 结果独立可复现
 
-环境：Ubuntu 24.04，2 × RTX 4090，Qwen2.5 系列模型（0.5B / 1.5B / 7B）。
+实验环境：Ubuntu 24.04，2 × RTX 4090，Qwen2.5 系列（0.5B / 1.5B / 7B）。
 
 ---
 
@@ -61,7 +63,7 @@ make test         # 全量测试，需要 GPU，约 50s
 **对比演示**（需要 Qwen2.5-1.5B，约 3 GB VRAM）：
 
 ```bash
-export MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+export MODEL=/path/to/Qwen2.5-1.5B-Instruct
 export HF_HUB_OFFLINE=1
 
 python demo.py --model $MODEL --mode quant         # FP16 vs W8A8：文本质量 + 显存对比
@@ -106,6 +108,8 @@ graph TD
     C --> dist
     C --> algo
 ```
+
+模块职责详见 [docs/architecture.md](docs/architecture.md)。
 
 ---
 
@@ -216,7 +220,7 @@ python benchmarks/benchmark_moe.py \
 ### W8A8 量化（Phase 16，需要 Qwen2.5-1.5B）
 
 ```bash
-export QUANT_MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+export QUANT_MODEL=/path/to/Qwen2.5-1.5B-Instruct
 python benchmarks/benchmark_quant.py --model $QUANT_MODEL --compare --batch-size 4
 ```
 
@@ -263,7 +267,7 @@ python benchmarks/benchmark_spec.py --draft auto --target auto --K 4 --target_on
 
 ```bash
 python benchmarks/benchmark_cuda_graph.py \
-    --model ~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306 \
+    --model /path/to/Qwen2.5-1.5B-Instruct \
     --num-kv-heads 2 --head-dim 128 --num-layers 28
 ```
 
@@ -277,7 +281,7 @@ python benchmarks/benchmark_flash_decode.py --num-q-heads 28 --num-kv-heads 4
 #### Tensor Parallelism（Phase 13）
 
 ```bash
-export TP_MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+export TP_MODEL=/path/to/Qwen2.5-1.5B-Instruct
 torchrun --nproc_per_node 2 benchmarks/benchmark_tp.py --model $TP_MODEL --mode torchrun_tp
 ```
 
@@ -307,33 +311,63 @@ TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 \
 
 ```
 mini_infer/
-  engine.py              LLMEngine：continuous batching 主循环
-  scheduler.py           Scheduler：waiting/running/swapped/prefilling 队列
-  kv_cache.py            KVCacheManager：Paged KV Cache + Prefix Cache
-  attention.py           PagedDecodeContext + patch（Phase 6）
-  model_runner.py        ModelRunner：prefill + decode_batch + CUDA Graph
-  quantization.py        QuantLinear / quantize_model（W8A8，Phase 16）
-  moe_layer.py           TopKRouter / MoELayer / EPMoELayer（Phase 17–21）
-  moe_model.py           SyntheticMoEConfig / SyntheticMoEModel
-  ep_engine.py           2-GPU EPEngine（NCCL all-to-all，Phase 17–21）
-  async_engine.py        AsyncEngine：后台 step loop + asyncio.Queue
-  server.py              FastAPI HTTP server（OpenAI Chat Completions 子集）
-  tp_engine.py           TPEngine：真 TP（NCCL all-reduce，Phase 13）
-  tp_model_runner.py     Megatron-LM 风格权重切分 + all-reduce hook
-  spec_engine.py         SpecEngine：draft + target speculative decoding
-  mla_attention.py       MLA 三种实现（Naive / LatentCache / Absorbed）
-  pd_engine.py           PDEngine：Disaggregated Prefill/Decode
-  triton_attn.py         Triton decode attention kernel（Phase 6.5）
-  triton_flash_decode.py Flash Decoding split-K kernel（Phase 12.5）
+  ┌─ Runtime Core ─────────────────────────────────────────────────────
+  │  engine.py              LLMEngine：continuous batching 主循环
+  │  scheduler.py           Scheduler：waiting/running/swapped/prefilling 队列
+  │  async_engine.py        AsyncEngine：后台 step loop（Phase 8 HTTP serving）
+  │  config.py              EngineConfig dataclass
+  │  request.py             Request / RequestState / SamplingParams
+  │
+  ├─ KV Cache & Attention ─────────────────────────────────────────────
+  │  kv_cache.py            KVCacheManager：BlockTable + Prefix Cache（Phase 2/10）
+  │  attention.py           PagedDecodeContext + model patch（Phase 6）
+  │  triton_attn.py         Triton decode attention kernel（Phase 6.5）
+  │  triton_flash_decode.py Flash Decoding split-K kernel（Phase 12.5）
+  │
+  ├─ Model Execution ──────────────────────────────────────────────────
+  │  model_runner.py        ModelRunner：prefill + decode_batch + CUDA Graph
+  │  quantization.py        QuantLinear / quantize_model（W8A8，Phase 16）
+  │  mla_attention.py       MLA 三种实现（Naive / LatentCache / Absorbed，Phase 14）
+  │
+  ├─ Distributed ──────────────────────────────────────────────────────
+  │  tp_engine.py           TPEngine：真 TP（NCCL all-reduce，Phase 13）
+  │  tp_model_runner.py     Megatron-LM 风格权重切分 + all-reduce hook
+  │  ep_engine.py           2-GPU EPEngine（NCCL all-to-all，Phase 17–21）
+  │  replica_engine.py      ReplicaEngine：数据并行副本（Phase 4）
+  │  pp_engine.py           PPEngine：HF Pipeline Parallel（Phase 4）
+  │
+  ├─ Specialized Engines ──────────────────────────────────────────────
+  │  spec_engine.py         SpecEngine：draft + target（Phase 11）
+  │  pd_engine.py           PDEngine：Disaggregated Prefill/Decode（Phase 15）
+  │  pd_worker.py           PrefillWorker / DecodeWorker + KV 传输
+  │
+  ├─ MoE ──────────────────────────────────────────────────────────────
+  │  moe_layer.py           TopKRouter / MoELayer / EPMoELayer（Phase 17–21）
+  │  moe_model.py           SyntheticMoEConfig / SyntheticMoEModel
+  │
+  └─ Serving ──────────────────────────────────────────────────────────
+     server.py              FastAPI HTTP server（OpenAI Chat Completions 子集）
+     openai_schema.py       Request / Response Pydantic 模型
+     clients/               交互式聊天客户端
 
-serve.py                 HTTP server CLI 入口
-quick_chat.py            一键 dry-run 聊天
-benchmarks/              每个 phase 对应一个 benchmark 脚本（21 个）
-tests/                   测试套件（35+ 模块，287 tests，大多数支持 dry_run）
-本地资料/                实验记录、阶段里程碑总结、博客草稿
+serve.py       HTTP server CLI 入口（argparse + uvicorn）
+quick_chat.py  一键 dry-run 聊天
+demo.py        功能对比演示（quant / cuda-graph / prefix-cache）
+benchmarks/    每个 phase 对应一个 benchmark 脚本（21 个）
+tests/         测试套件（35+ 模块，287 tests，大多数支持 dry_run）
+examples/      API 使用示例（openai_client.py）
+docs/          架构说明（architecture.md）
 ```
 
 </details>
+
+---
+
+## 适合谁
+
+- 正在准备 **AI Infra / 推理系统 / 分布式训练推理**方向的求职者，想把"会用框架"升级为"理解框架内部"
+- 想真正搞懂 **vLLM / TensorRT-LLM / Megatron-LM** 背后设计权衡，而不只是读论文
+- 需要一个"有深度、有代码、有 benchmark 数据"的**个人代表性项目**
 
 ---
 
@@ -344,7 +378,7 @@ tests/                   测试套件（35+ 模块，287 tests，大多数支持
 - Tensor Parallelism 以 Qwen2.5-1.5B 验证正确性，未在 7B 上做完整吞吐对比
 - 项目面向学习闭环，不是生产 serving 系统
 
-每个阶段的 prototype 边界和 benchmark 口径在 `本地资料/里程碑总结/` 和 `本地资料/实验记录/` 中有详细说明。
+每个阶段的 prototype 边界和 benchmark 口径已在各阶段 infer-benchmark / infer-summarize 中详细记录。
 
 ---
 

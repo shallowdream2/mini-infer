@@ -5,18 +5,38 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mini-infer"
-version = "0.1.0"
-description = "面向 Qwen2.5 类 decoder-only 模型的推理系统学习项目，实现 Paged KV Cache、Continuous Batching、True PagedAttention、Chunked Prefill、Prefix Caching、Speculative Decoding、CUDA Graph、Flash Decoding、Tensor Parallelism、MLA 和 PD 解耦"
+version = "0.21.0"
+description = "面向 decoder-only 模型的学习型推理引擎，实现并验证 Paged KV Cache、Continuous Batching、True PagedAttention、Chunked Prefill、Prefix Caching、Speculative Decoding、CUDA Graph、Flash Decoding、Tensor Parallelism、MLA、W8A8 量化与 MoE Expert Parallelism"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
     { name = "pc" }
 ]
+keywords = [
+    "llm", "inference", "pytorch", "cuda", "transformer",
+    "paged-attention", "continuous-batching", "speculative-decoding",
+    "tensor-parallelism", "moe", "expert-parallelism", "flash-attention",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: System :: Distributed Computing",
+]
 dependencies = [
     "torch>=2.1.2",
     "transformers>=4.40.0,<5.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/psmarter/mini-infer"
+Repository = "https://github.com/psmarter/mini-infer"
 
 [project.optional-dependencies]
 dev = [
@@ -34,6 +54,10 @@ serve = [
     "fastapi>=0.100.0",
     "uvicorn>=0.23.0",
     "asgi-lifespan>=2.0",  # 测试用，触发 ASGI lifespan 事件
+]
+# Phase 6.5 / 12.5：Triton kernel（需 GPU 环境手动安装）
+triton = [
+    "triton>=2.1.0",
 ]
 
 [tool.setuptools.packages.find]
