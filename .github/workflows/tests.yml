@@ -24,7 +24,8 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install torch==2.1.2 --index-url https://download.pytorch.org/whl/cpu
+          pip install "torch==2.1.2" --index-url https://download.pytorch.org/whl/cpu
+          pip install "transformers==4.43.4" "numpy<2.0" "tokenizers<0.21"
           pip install -e ".[dev,serve]"
 
       - name: Run dry-run tests (no GPU required)
