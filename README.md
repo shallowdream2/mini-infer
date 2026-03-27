@@ -58,6 +58,18 @@ pip install -e ".[dev]"
 python -m pytest tests/ -q              # 287 tests passed
 ```
 
+**对比演示**（需要 Qwen2.5-1.5B，约 3 GB VRAM）：
+
+```bash
+export MODEL=~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+export HF_HUB_OFFLINE=1
+
+python demo.py --model $MODEL --mode quant         # FP16 vs W8A8：文本质量 + 显存对比
+python demo.py --model $MODEL --mode cuda-graph    # Eager vs CUDA Graph：decode 延迟
+python demo.py --model $MODEL --mode prefix-cache  # 冷启动 vs 前缀命中：TTFT 对比
+python demo.py --model $MODEL --mode all           # 依次运行三种
+```
+
 真实模型推理（需要 Qwen2.5-7B-Instruct）：
 
 ```bash
