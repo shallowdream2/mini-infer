@@ -1,14 +1,43 @@
 # mini-infer
 
-一个从零实现的 LLM 推理引擎，覆盖 Paged KV Cache、Continuous Batching、PagedAttention、Chunked Prefill、Prefix Caching、Speculative Decoding、CUDA Graph、Flash Decoding、Tensor Parallelism、MLA、MoE Expert Parallelism 等关键机制，每项能力均有独立 benchmark 验证。
+**LLM inference engine built from scratch** — paged KV cache, continuous batching, chunked prefill, prefix caching, speculative decoding, CUDA graph, tensor parallelism, MoE expert parallelism, and OpenAI-compatible HTTP serving. Each mechanism is independently benchmarked against HuggingFace Transformers. Core serving path reaches **100% of HF baseline throughput** at batch=8. Ships with dry-run mode (no model weights needed), `/healthz`, Docker, and CI.
+
+> 从零实现的 LLM 推理引擎。核心 serving 路径（PagedAttention + Continuous Batching + OpenAI HTTP API）在 Qwen2.5-7B 达到 HF Transformers **100% 吞吐**，支持 `--dry-run` 无权重启动验证。
 
 [![CI](https://github.com/psmarter/mini-infer/actions/workflows/smoke.yml/badge.svg)](https://github.com/psmarter/mini-infer/actions/workflows/smoke.yml)
+[![lint](https://github.com/psmarter/mini-infer/actions/workflows/lint.yml/badge.svg)](https://github.com/psmarter/mini-infer/actions/workflows/lint.yml)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-blue)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.1%2B-orange)
 ![CUDA](https://img.shields.io/badge/CUDA-12.1-green)
 ![License](https://img.shields.io/badge/license-MIT-blue)
 
 ![demo](assets/demo.gif)
+
+---
+
+## 立即验证（无需模型权重）
+
+```bash
+pip install -e ".[serve,dev]"
+mini-infer-serve --dry-run --port 8000
+curl http://localhost:8000/healthz   # → {"status":"ok","model":"dry",...}
+```
+
+---
+
+## 如何阅读这个仓库
+
+5 个文件覆盖核心推理机制，建议按序阅读：
+
+| 文件 | 内容 |
+|------|------|
+| [`mini_infer/cache/kv_cache.py`](mini_infer/cache/kv_cache.py) | Paged KV Cache：BlockTable、FreeBlockPool、prefix cache LRU eviction |
+| [`mini_infer/runtime/scheduler.py`](mini_infer/runtime/scheduler.py) | 四队列调度器：waiting / running / swapped / prefilling，preemption，chunked prefill |
+| [`mini_infer/runtime/async_engine.py`](mini_infer/runtime/async_engine.py) | Continuous batching：后台 step loop + asyncio.Queue，HTTP 请求合并入同一 decode_batch |
+| [`mini_infer/serving/server.py`](mini_infer/serving/server.py) | OpenAI Chat Completions HTTP API：SSE streaming、non-streaming、`/healthz` |
+| [`mini_infer/parallel/tp_engine.py`](mini_infer/parallel/tp_engine.py) | Tensor Parallelism：NCCL all-reduce，Megatron-LM 风格列/行并行 |
+
+分布式 / 量化扩展另见 [`mini_infer/modeling/quantization.py`](mini_infer/modeling/quantization.py)、[`mini_infer/parallel/ep_engine.py`](mini_infer/parallel/ep_engine.py)。
 
 ---
 
@@ -19,7 +48,7 @@
 | 技术 | 关键数据 |
 |------|---------|
 | **True PagedAttention**（flash_attn block_table） | batch=8 吞吐达到 HF Transformers **100%**（406 tok/s） |
-| **Chunked Prefill** | ITL spike 降低 **57%–67%** |
+| **Chunked Prefill** | 混合 serving 场景 ITL spike 降低 **57%–67%** |
 | **Prefix Caching**（block-level hash + LRU） | 共享前缀 TTFT **−22%** |
 
 **独立 benchmark 实验（功能完整，未接入默认 serving 路径）**
@@ -38,7 +67,7 @@
 | 技术 | 关键数据 |
 |------|---------|
 | **W8A8 量化**（per-channel int8 + mixed fallback） | 权重显存 **−32.4%**，greedy match 71.8%（见注 ²） |
-| **PD 解耦**（同机双进程） | TTFT 三段分解：prefill / transfer / decode |
+| **PD 解耦**（同机双进程） | TTFT 三段分解：prefill 12.3ms / transfer ≈14.7ms / decode 519ms |
 
 完整 benchmark 数据与复现命令见 [docs/benchmarks.md](docs/benchmarks.md)。
 
@@ -67,6 +96,9 @@ mini-infer-serve --dry-run --port 8000
 
 # 真实模型（需要 Qwen2.5-7B-Instruct）
 mini-infer-serve --model /path/to/Qwen2.5-7B --port 8000
+
+# 开启 CUDA Graph + W8A8 量化
+mini-infer-serve --model /path/to/Qwen2.5-7B --use-cuda-graph --quant-mode w8a8 --port 8000
 ```
 
 ```bash
@@ -120,7 +152,7 @@ graph TD
 | True PagedAttention（flash_attn block_table） | ✅ 主链路 | batch=8 达到 HF **100%** |
 | OpenAI Chat Completions HTTP API | ✅ 主链路 | SSE streaming / non-streaming |
 | Speculative Decoding（0.5B draft + 7B target） | 🔬 独立实验 | acceptance 55.85%（SpecEngine，未接入 serve CLI） |
-| CUDA Graph（decode_batch 静态捕获） | 🔬 独立实验 | decode 延迟 −28.9%（ModelRunner，未接入 serve CLI） |
+| CUDA Graph（decode_batch 静态捕获） | 🔬 独立实验 | decode 延迟 −28.9%（`--use-cuda-graph` 实验开关） |
 | Flash Decoding（Triton split-K） | 🔬 独立实验 | 3.31× vs 标准 Triton，SM 9%→103% |
 | Triton decode attention kernel | 🔬 独立实验 | 对比 flash_attn，未接入主链路 |
 | Tensor Parallelism（NCCL all-reduce） | 🔬 独立实验 | greedy 输出与单卡一致（正确性验证） |
@@ -161,7 +193,7 @@ tests/          # 287 collected items（含参数化展开），大多数支持 
 |------|------|
 | [docs/architecture.md](docs/architecture.md) | 包结构、模块说明、请求生命周期 |
 | [docs/benchmarks.md](docs/benchmarks.md) | 所有能力的 benchmark 数据与复现命令 |
-| [docs/faq.md](docs/faq.md) | 常见问题：安装、环境、与 vLLM 的区别 |
+| [docs/faq.md](docs/faq.md) | 常见问题：安装、环境、CUDA Graph / W8A8 开关 |
 | [docs/roadmap.md](docs/roadmap.md) | 后续扩展方向与已知 gap |
 
 ---
