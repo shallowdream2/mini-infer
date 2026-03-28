@@ -78,6 +78,32 @@ Phase 6.5 的 Triton decode attention kernel 在 seq=4096 时比 `flash_attn` �
 - `TPEngine`：用 `mp.spawn` + NCCL 替换单进程 forward
 - `PDEngine`：拆分成两个独立的 Worker 进程
 
+### 如何在 serving 时开启 CUDA Graph 或 W8A8 量化？
+
+通过 CLI 标志：
+
+```bash
+mini-infer-serve --model /path/to/model --use-cuda-graph
+mini-infer-serve --model /path/to/model --quant-mode w8a8
+mini-infer-serve --model /path/to/model --use-cuda-graph --quant-mode w8a8
+```
+
+或通过环境变量（使用 `uvicorn` 直接启动时）：
+
+```bash
+MINI_INFER_MODEL=/path/to/model \
+MINI_INFER_USE_CUDA_GRAPH=1 \
+MINI_INFER_QUANT_MODE=w8a8 \
+uvicorn mini_infer.serving.server:app --host 0.0.0.0 --port 8000
+```
+
+启动后可访问 `GET /healthz` 确认当前配置：
+
+```bash
+curl http://localhost:8000/healthz
+# {"status":"ok","model":"...","use_cuda_graph":true,"quant_mode":"w8a8",...}
+```
+
 ### MoE benchmark 为什么是 synthetic workload？
 
 Phase 17–21 的 EP benchmark 基于 **synthetic MoE layer**（单层 forward），不包含完整 LLM serving 链路。原因：

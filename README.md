@@ -22,7 +22,7 @@
 | **Chunked Prefill** | ITL spike 降低 **57%–67%** |
 | **Prefix Caching**（block-level hash + LRU） | 共享前缀 TTFT **−22%** |
 
-**独立 benchmark 实验（引擎已实现，未接入默认 serving 路径）**
+**独立 benchmark 实验（功能完整，未接入默认 serving 路径）**
 
 | 技术 | 关键数据 |
 |------|---------|
@@ -31,8 +31,14 @@
 | **Flash Decoding**（Triton split-K） | seq=4096 延迟 **3.31×** vs 标准 Triton，SM 利用率 9%→103% |
 | **Tensor Parallelism**（NCCL all-reduce，Megatron-LM 风格） | TP=2 greedy 输出与单卡**完全一致**（见注 ¹） |
 | **MLA**（DeepSeek-V2/V3 架构） | latent cache 体积 **−56.25%** vs GQA |
-| **W8A8 量化**（per-channel int8 + mixed fallback） | 权重显存 **−32.4%**，greedy match 71.8%（见注 ²） |
 | **MoE Expert Parallelism**（Grouped Local Execution） | EP grouped / dense = **2.500×** |
+
+**原型实现（correctness-first，有明确边界限制）**
+
+| 技术 | 关键数据 |
+|------|---------|
+| **W8A8 量化**（per-channel int8 + mixed fallback） | 权重显存 **−32.4%**，greedy match 71.8%（见注 ²） |
+| **PD 解耦**（同机双进程） | TTFT 三段分解：prefill / transfer / decode |
 
 完整 benchmark 数据与复现命令见 [docs/benchmarks.md](docs/benchmarks.md)。
 

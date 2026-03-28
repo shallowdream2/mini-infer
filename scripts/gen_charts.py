@@ -285,38 +285,6 @@ def chart_w8a8():
     print("✓ 06_w8a8_quant.png")
 
 
-# ── 图 7：综合能力总览（雷达图）──────────────────────────────────────────────
-def chart_overview_radar():
-    # 各项能力指标（0-10，根据实验结论相对打分）
-    categories   = ["吞吐\n(batch decode)", "延迟\n(decode latency)", "内存效率\n(KV cache)",
-                    "分布式扩展\n(EP 2.5×)", "长序列\n(Flash Decode)"]
-    values_mini  = [10.0, 8.5, 7.5, 9.5, 8.0]
-    values_base  = [8.8,  7.1, 5.0, 5.0, 5.0]
-
-    N      = len(categories)
-    angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
-    angles += angles[:1]
-    v_mini = values_mini + values_mini[:1]
-    v_base = values_base + values_base[:1]
-
-    fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-    ax.plot(angles, v_mini, "o-", color=BLUE,  linewidth=2, label="mini-infer (Phase 21)")
-    ax.fill(angles, v_mini, alpha=0.15, color=BLUE)
-    ax.plot(angles, v_base, "s--", color=GRAY, linewidth=1.5, label="Phase 3 基线")
-    ax.fill(angles, v_base, alpha=0.08, color=GRAY)
-
-    ax.set_thetagrids(np.degrees(angles[:-1]), categories)
-    ax.set_ylim(0, 10)
-    ax.set_yticks([2, 4, 6, 8, 10])
-    ax.set_yticklabels(["2", "4", "6", "8", "10"], fontsize=8)
-    ax.set_title("mini-infer 综合能力总览", fontweight="bold", pad=20)
-    ax.legend(loc="lower right", bbox_to_anchor=(1.25, -0.05))
-    fig.tight_layout()
-    fig.savefig(os.path.join(OUT_DIR, "07_overview_radar.png"), bbox_inches="tight")
-    plt.close(fig)
-    print("✓ 07_overview_radar.png")
-
-
 if __name__ == "__main__":
     chart_throughput_evolution()
     chart_cuda_graph()
@@ -324,5 +292,4 @@ if __name__ == "__main__":
     chart_flash_decode()
     chart_chunked_prefill()
     chart_w8a8()
-    chart_overview_radar()
     print(f"\n所有图表已保存到 {os.path.abspath(OUT_DIR)}/")

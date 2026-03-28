@@ -13,8 +13,10 @@ Phase 8/9 OpenAI Chat Completions 子集兼容 HTTP server。
   uvicorn mini_infer.serving.server:app --host 0.0.0.0 --port 8000
   # 如需真实模型，可先设置环境变量
   MINI_INFER_MODEL=/path/to/model uvicorn mini_infer.serving.server:app --host 0.0.0.0 --port 8000
-  # Phase 9：显式开启 chunked prefill
+  # 开启 chunked prefill
   MINI_INFER_MODEL=/path/to/model MINI_INFER_CHUNK_PREFILL_SIZE=256 uvicorn mini_infer.serving.server:app --host 0.0.0.0 --port 8000
+  # 开启 CUDA Graph + W8A8 量化
+  MINI_INFER_MODEL=/path/to/model MINI_INFER_USE_CUDA_GRAPH=1 MINI_INFER_QUANT_MODE=w8a8 uvicorn mini_infer.serving.server:app --host 0.0.0.0 --port 8000
 
 启动时全局初始化 AsyncEngine，所有请求共享同一 step loop，
 实现 continuous batching（多并发 HTTP 请求被合并进同一 decode_batch）。
@@ -74,6 +76,8 @@ def _default_engine_config() -> EngineConfig:
         num_gpu_blocks=int(os.getenv("MINI_INFER_NUM_GPU_BLOCKS", "200")),
         block_size=int(os.getenv("MINI_INFER_BLOCK_SIZE", "256")),
         chunk_prefill_size=int(os.getenv("MINI_INFER_CHUNK_PREFILL_SIZE", "0")),
+        use_cuda_graph=_parse_env_bool("MINI_INFER_USE_CUDA_GRAPH", False),
+        quant_mode=os.getenv("MINI_INFER_QUANT_MODE", ""),
     )
 
 
@@ -145,6 +149,31 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="mini-infer", lifespan=lifespan)
+
+
+# ---------------------------------------------------------------------------
+# GET /healthz
+# ---------------------------------------------------------------------------
+
+
+@app.get("/healthz")
+async def healthz() -> dict:
+    """健康检查端点，返回引擎状态。"""
+    if _engine is None:
+        return {"status": "initializing"}
+    try:
+        _engine.ensure_healthy()
+        config = app.state.engine_config
+        return {
+            "status": "ok",
+            "model": config.model_name,
+            "device": config.device,
+            "use_cuda_graph": config.use_cuda_graph,
+            "quant_mode": config.quant_mode or "none",
+            "chunk_prefill_size": config.chunk_prefill_size,
+        }
+    except RuntimeError as exc:
+        return {"status": "error", "detail": str(exc)}
 
 
 # ---------------------------------------------------------------------------

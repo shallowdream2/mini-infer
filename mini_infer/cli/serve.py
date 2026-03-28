@@ -29,7 +29,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-gpu-blocks", type=int, default=200)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--chunk-prefill-size", type=int, default=0,
-                        help="Phase 9：每步 prefill 的 token 上限（0=禁用）")
+                        help="每步 prefill 的 token 上限（0=禁用，256 推荐）")
+    parser.add_argument("--use-cuda-graph", action="store_true",
+                        help="启用 CUDA Graph：decode_batch 静态捕获，降低 Python dispatch 开销")
+    parser.add_argument("--quant-mode", type=str, default="",
+                        choices=["", "w8a8"],
+                        help="量化模式：'' = FP16（默认），'w8a8' = per-channel int8 权重量化")
     return parser.parse_args()
 
 
@@ -49,6 +54,8 @@ def main() -> None:
         num_gpu_blocks=args.num_gpu_blocks,
         block_size=args.block_size,
         chunk_prefill_size=args.chunk_prefill_size,
+        use_cuda_graph=args.use_cuda_graph,
+        quant_mode=args.quant_mode,
     )
     app.state.engine_config = config  # type: ignore[attr-defined]
 

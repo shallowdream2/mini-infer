@@ -1,11 +1,11 @@
 # Roadmap
 
-mini-infer 作为学习型推理引擎，当前实现了 21 个完整阶段（Phase 1–21）。
+mini-infer 是一个面向 decoder-only 模型的推理引擎原型，完整实现并基准验证了从 Paged KV Cache 到 MoE Expert Parallelism 的核心推理机制。
 本文件记录已明确的后续扩展方向，以及与生产级框架之间的已知 gap。
 
 ## 当前已完成的主线能力
 
-完整 21 阶段说明见 [docs/phases.md](phases.md)。核心成果速览：
+完整能力说明见 [docs/phases.md](phases.md)。核心成果速览：
 
 | 层次 | 代表技术 | 关键数据 |
 |------|----------|---------|
@@ -55,7 +55,7 @@ mini-infer 作为学习型推理引擎，当前实现了 21 个完整阶段（Ph
 | 调度精细度 | 基础 priority + preemption | 完整 SLO、KV 共享感知 |
 | 部署 | 单机原型 | K8s、多机 RDMA |
 
-这些 gap 是**有意识的设计选择**：mini-infer 的目标是把核心机制讲清楚，而不是复现完整的生产系统。
+这些 gap 是**有意识的范围边界**：mini-infer 专注于把核心推理机制实现清楚并给出可复现的 benchmark，不追求复现完整的生产系统。
 
 ## 贡献指南
 
