@@ -14,11 +14,18 @@
 
 ## 核心成果
 
+**主 serving 路径（`mini-infer-serve` 默认启动）**
+
 | 技术 | 关键数据 |
 |------|---------|
 | **True PagedAttention**（flash_attn block_table） | batch=8 吞吐达到 HF Transformers **100%**（406 tok/s） |
 | **Chunked Prefill** | ITL spike 降低 **57%–67%** |
 | **Prefix Caching**（block-level hash + LRU） | 共享前缀 TTFT **−22%** |
+
+**独立 benchmark 实验（引擎已实现，未接入默认 serving 路径）**
+
+| 技术 | 关键数据 |
+|------|---------|
 | **Speculative Decoding**（0.5B draft + 7B target） | acceptance rate **55.85%** |
 | **CUDA Graph**（decode_batch 静态捕获） | 1.5B bs=1 decode 延迟 **−28.9%** |
 | **Flash Decoding**（Triton split-K） | seq=4096 延迟 **3.31×** vs 标准 Triton，SM 利用率 9%→103% |
@@ -105,9 +112,9 @@ graph TD
 | Chunked Prefill | ✅ 主链路 | ITL spike −57%–67% |
 | Prefix Caching（block-level hash + LRU） | ✅ 主链路 | TTFT −22% |
 | True PagedAttention（flash_attn block_table） | ✅ 主链路 | batch=8 达到 HF **100%** |
-| Speculative Decoding（0.5B draft + 7B target） | ✅ 主链路 | acceptance 55.85% |
-| CUDA Graph（decode_batch 静态捕获） | ✅ 主链路 | decode 延迟 −28.9% |
 | OpenAI Chat Completions HTTP API | ✅ 主链路 | SSE streaming / non-streaming |
+| Speculative Decoding（0.5B draft + 7B target） | 🔬 独立实验 | acceptance 55.85%（SpecEngine，未接入 serve CLI） |
+| CUDA Graph（decode_batch 静态捕获） | 🔬 独立实验 | decode 延迟 −28.9%（ModelRunner，未接入 serve CLI） |
 | Flash Decoding（Triton split-K） | 🔬 独立实验 | 3.31× vs 标准 Triton，SM 9%→103% |
 | Triton decode attention kernel | 🔬 独立实验 | 对比 flash_attn，未接入主链路 |
 | Tensor Parallelism（NCCL all-reduce） | 🔬 独立实验 | greedy 输出与单卡一致（正确性验证） |
@@ -119,19 +126,6 @@ graph TD
 > ✅ 主链路：接入完整 serving 路径，可通过 HTTP API 端对端验证
 > 🔬 独立实验：独立 benchmark 脚本，有量化数据，未接入主 serving 链路
 > 🔧 原型：功能已实现，correctness-first，有边界限制（见注 ¹²）
-
----
-
-## 与 vLLM 的区别
-
-| 维度 | mini-infer | vLLM |
-|------|-----------|------|
-| **目标** | 从零实现并测量关键推理机制 | 生产级：高吞吐、多模型、SLO 保障 |
-| **PagedAttention** | 与 vLLM 同路线（flash_attn block_table） | 相同路线，更成熟 |
-| **量化** | W8A8 手工实现，greedy match 71.8% | PTQ / AWQ / GPTQ 完整工具链 |
-| **模型覆盖** | Qwen2.5 / DeepSeek-V2（synthetic MoE） | 数十种架构，自动适配 |
-| **调度器** | 手工实现，四队列 + chunked prefill | 完整 SLO、KV 共享感知 |
-| **部署** | 单机原型 | K8s、多机 RDMA、完整监控 |
 
 ---
 
@@ -163,6 +157,19 @@ tests/          # 287 collected items（含参数化展开），大多数支持 
 | [docs/benchmarks.md](docs/benchmarks.md) | 所有能力的 benchmark 数据与复现命令 |
 | [docs/faq.md](docs/faq.md) | 常见问题：安装、环境、与 vLLM 的区别 |
 | [docs/roadmap.md](docs/roadmap.md) | 后续扩展方向与已知 gap |
+
+---
+
+## 与 vLLM 的区别
+
+| 维度 | mini-infer | vLLM |
+|------|-----------|------|
+| **目标** | 从零实现并测量关键推理机制 | 生产级：高吞吐、多模型、SLO 保障 |
+| **PagedAttention** | 与 vLLM 同路线（flash_attn block_table） | 相同路线，更成熟 |
+| **量化** | W8A8 手工实现，greedy match 71.8% | PTQ / AWQ / GPTQ 完整工具链 |
+| **模型覆盖** | Qwen2.5 / DeepSeek-V2（synthetic MoE） | 数十种架构，自动适配 |
+| **调度器** | 手工实现，四队列 + chunked prefill | 完整 SLO、KV 共享感知 |
+| **部署** | 单机原型 | K8s、多机 RDMA、完整监控 |
 
 ---
 

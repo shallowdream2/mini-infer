@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mini-infer"
 version = "0.21.0"
-description = "面向 decoder-only 模型的学习型推理引擎，实现并验证 Paged KV Cache、Continuous Batching、True PagedAttention、Chunked Prefill、Prefix Caching、Speculative Decoding、CUDA Graph、Flash Decoding、Tensor Parallelism、MLA、W8A8 量化与 MoE Expert Parallelism"
+description = "面向 decoder-only 模型的推理引擎，实现并基准验证 Paged KV Cache、Continuous Batching、True PagedAttention、Chunked Prefill、Prefix Caching、Speculative Decoding、CUDA Graph、Flash Decoding、Tensor Parallelism、MLA、W8A8 量化与 MoE Expert Parallelism"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

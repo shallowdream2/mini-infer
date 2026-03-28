@@ -1,5 +1,5 @@
 {
-  "$comment": "CUDA Graph decode 延迟 benchmark 数据。来源：benchmark_cuda_graph.py —— Qwen2.5-1.5B-Instruct，decode step latency，CUDA 12.1，RTX 4090。实验记录：本地资料/里程碑总结/。",
+  "$comment": "CUDA Graph decode 延迟 benchmark 数据。来源：benchmarks/benchmark_cuda_graph.py。环境：CUDA 12.1，RTX 4090，torch 2.1.2+cu121。详细复现命令见 docs/benchmarks.md。",
   "meta": {
     "model": "Qwen2.5-1.5B-Instruct",
     "metric": "decode_step_latency_ms",

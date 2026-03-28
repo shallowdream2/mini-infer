@@ -1,5 +1,5 @@
 {
-  "$comment": "MoE Expert Parallelism 吞吐演进 benchmark 数据。来源：benchmark_moe.py —— Synthetic MoE layer，2 × RTX 4090，NCCL all-to-all。实验记录：本地资料/实验记录/2026-03-25-phase21-grouped-execution-benchmark.md。",
+  "$comment": "MoE Expert Parallelism 吞吐演进 benchmark 数据。来源：benchmarks/benchmark_moe.py --compare。环境：2 × RTX 4090，CUDA 12.1，torch 2.1.2+cu121，NCCL。详细复现命令见 docs/benchmarks.md。",
   "meta": {
     "workload": "Synthetic MoE layer (single forward pass)",
     "hardware": "2 × RTX 4090",

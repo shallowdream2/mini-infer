@@ -1,5 +1,5 @@
 {
-  "$comment": "Flash Decoding (Split-K) attention latency benchmark 数据。来源：benchmark_flash_decode.py —— Qwen2.5-1.5B-Instruct，单头 decode attention，bs=1，CUDA 12.1，RTX 4090。实验记录：本地资料/里程碑总结/。",
+  "$comment": "Flash Decoding (Split-K) attention latency benchmark 数据。来源：benchmarks/benchmark_flash_decode.py。环境：CUDA 12.1，RTX 4090，torch 2.1.2+cu121。详细复现命令见 docs/benchmarks.md。",
   "meta": {
     "model": "Qwen2.5-1.5B-Instruct",
     "hardware": "RTX 4090",

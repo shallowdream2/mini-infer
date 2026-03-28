@@ -1,5 +1,5 @@
 {
-  "$comment": "W8A8 量化 benchmark 数据。来源：benchmark_quant.py —— Qwen2.5-1.5B-Instruct，per-channel int8 + attention skip，CUDA 12.1，RTX 4090。实验记录：本地资料/实验记录/2026-03-25-phase16-per-channel-benchmark.md。",
+  "$comment": "W8A8 量化 benchmark 数据。来源：benchmarks/benchmark_quant.py --compare。环境：CUDA 12.1，RTX 4090，torch 2.1.2+cu121。详细复现命令见 docs/benchmarks.md。",
   "meta": {
     "model": "Qwen2.5-1.5B-Instruct",
     "hardware": "RTX 4090",

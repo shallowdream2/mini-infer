@@ -1,9 +1,13 @@
-# 默认使用系统 python；在 ai-infra conda 环境中覆盖：
+# 默认使用系统 python；在 conda 环境中覆盖：
 #   PYTHON="conda run -n ai-infra python" make test
+#
+# 模型路径默认值指向标准 HuggingFace 缓存；可通过环境变量覆盖：
+#   MODEL_1_5B=/your/path make bench-quant
+#   MODEL_7B=/your/path   make bench
 PYTHON     ?= python
 PYTEST     ?= python -m pytest
-MODEL_1_5B := $(HOME)/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
-MODEL_7B   := $(HOME)/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct
+MODEL_1_5B ?= $(HOME)/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306
+MODEL_7B   ?= $(HOME)/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct
 
 # ── 测试 ──────────────────────────────────────────────────────────────
 .PHONY: test test-fast test-gpu
