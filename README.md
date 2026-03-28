@@ -97,13 +97,28 @@ graph TD
 
 ---
 
-## 实现范围
+## 能力状态
 
-**Runtime** — Paged KV Cache、Continuous Batching、Scheduler（四队列 + Preemption + Chunked Prefill）、OpenAI 兼容 HTTP serving
+| 能力 | 状态 | 关键数据 |
+|------|------|---------|
+| Paged KV Cache + Continuous Batching | ✅ 主链路 | 主推理路径核心 |
+| Chunked Prefill | ✅ 主链路 | ITL spike −57%–67% |
+| Prefix Caching（block-level hash + LRU） | ✅ 主链路 | TTFT −22% |
+| True PagedAttention（flash_attn block_table） | ✅ 主链路 | batch=8 达到 HF **100%** |
+| Speculative Decoding（0.5B draft + 7B target） | ✅ 主链路 | acceptance 55.85% |
+| CUDA Graph（decode_batch 静态捕获） | ✅ 主链路 | decode 延迟 −28.9% |
+| OpenAI Chat Completions HTTP API | ✅ 主链路 | SSE streaming / non-streaming |
+| Flash Decoding（Triton split-K） | 🔬 独立实验 | 3.31× vs 标准 Triton，SM 9%→103% |
+| Triton decode attention kernel | 🔬 独立实验 | 对比 flash_attn，未接入主链路 |
+| Tensor Parallelism（NCCL all-reduce） | 🔬 独立实验 | greedy 输出与单卡一致（正确性验证） |
+| MLA（DeepSeek-V2/V3 latent cache） | 🔬 独立实验 | cache 体积 −56.25% vs GQA |
+| MoE Expert Parallelism（synthetic workload） | 🔬 独立实验 | EP grouped / dense = 2.500× |
+| W8A8 量化（per-channel int8） | 🔧 原型 | 显存 −32.4%，greedy match 71.8% |
+| PD 解耦（同机双进程） | 🔧 原型 | TTFT 三段分解（prefill/transfer/decode） |
 
-**性能优化** — True PagedAttention（100% HF baseline）、Prefix Caching（TTFT −22%）、Speculative Decoding（55.85%）、CUDA Graph（−28.9%）、Flash Decoding（3.31×）
-
-**分布式 / 扩展** — Tensor Parallelism（NCCL）、MLA（DeepSeek-V2/V3）、PD 解耦、W8A8 量化（显存 −32.4%）、MoE EP Grouped Execution（2.500×）
+> ✅ 主链路：接入完整 serving 路径，可通过 HTTP API 端对端验证
+> 🔬 独立实验：独立 benchmark 脚本，有量化数据，未接入主 serving 链路
+> 🔧 原型：功能已实现，correctness-first，有边界限制（见注 ¹²）
 
 ---
 
@@ -120,16 +135,6 @@ graph TD
 
 ---
 
-## 设计边界
-
-- **已完整实现**：Runtime 基础 + 关键性能优化 + 分布式基础能力，每项有 benchmark 数据
-- **原型范围**：PD 解耦（同机双进程）、W8A8（correctness-first）、TP（正确性验证，1.5B 规模未提速）
-- **尚未实现**：Multi-LoRA、SLO 感知调度、跨机 RDMA、FP8、生产级监控
-
-详见 [docs/roadmap.md](docs/roadmap.md)。
-
----
-
 ## 目录结构
 
 ```
@@ -143,7 +148,7 @@ mini_infer/
 └─ serving/     # FastAPI server、OpenAI schema
 
 benchmarks/     # 每项能力对应一个 benchmark 脚本（21 个）
-tests/          # 287 tests，大多数支持 dry_run，不依赖模型权重
+tests/          # 287 collected items（含参数化展开），大多数支持 dry_run，不依赖模型权重
 ```
 
 `make test-fast` 跑 CPU dry-run 全量测试（约 10s）；`make test` 含 GPU 专项。

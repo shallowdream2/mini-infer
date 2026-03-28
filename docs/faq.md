@@ -22,7 +22,11 @@ pip install "flash-attn>=2.5.0" --no-build-isolation
 ### 必须用 Conda 吗？
 
 不必须。`pip install -e ".[serve,dev]"` 在任何 Python 3.10+ 虚拟环境中都可以工作。
-Makefile 默认使用 `conda run -n ai-infra`，外部用户可以通过 `PYTHON=python make test-fast` 覆盖。
+Makefile 默认使用系统 `python`；如需在 conda 环境中运行，使用：
+
+```bash
+PYTHON="conda run -n ai-infra python" make test-fast
+```
 
 ---
 

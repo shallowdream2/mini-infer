@@ -1,21 +1,33 @@
 """
-gen_charts.py — 从实验记录数据生成 mini-infer benchmark 对比图表。
+gen_charts.py — 从 benchmarks/results/*.json 读取实验数据并生成对比图表。
 输出目录：assets/charts/
 用法：python scripts/gen_charts.py
 """
 
+import json
 import os
+
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import matplotlib.font_manager as fm
 import numpy as np
 
-OUT_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "charts")
+# ── 路径 ──────────────────────────────────────────────────────────────────────
+_SCRIPT_DIR  = os.path.dirname(__file__)
+_ROOT        = os.path.join(_SCRIPT_DIR, "..")
+OUT_DIR      = os.path.join(_ROOT, "assets", "charts")
+RESULTS_DIR  = os.path.join(_ROOT, "benchmarks", "results")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# ── 中文字体 ─────────────────────────────────────────────────────────────────
+
+def _load(filename: str) -> dict:
+    path = os.path.join(RESULTS_DIR, filename)
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+# ── 中文字体 ──────────────────────────────────────────────────────────────────
 _CJK_FONT_PATHS = [
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/arphic/uming.ttc",
@@ -28,7 +40,7 @@ for _fp in _CJK_FONT_PATHS:
         _cjk_font = _prop.get_name()
         break
 
-# ── 全局样式 ────────────────────────────────────────────────────────────────
+# ── 全局样式 ──────────────────────────────────────────────────────────────────
 if _cjk_font:
     plt.rcParams["font.family"] = [_cjk_font, "DejaVu Sans", "sans-serif"]
 
@@ -60,12 +72,16 @@ RED    = "#C44E52"
 PURPLE = "#8172B2"
 GRAY   = "#8C8C8C"
 
-# ── 图 1：主线吞吐演进（Phase 3 → 6 → HF baseline）────────────────────────
+
+# ── 图 1：主线吞吐演进 ────────────────────────────────────────────────────────
 def chart_throughput_evolution():
-    phases   = ["Phase 3\n(DynamicCache)", "Phase 6\n(True PagedAttn)", "HF Baseline\n(Transformers)"]
-    tps      = [361.3, 406.3, 406.4]
-    colors   = [ORANGE, BLUE, GRAY]
-    pct      = ["88.4%", "100.0%", "—"]
+    d = _load("throughput_evolution.json")
+    rows   = d["data"]
+    phases = [r["label"].split(" (")[0] + "\n(" + r["label"].split("(")[1] if "(" in r["label"] else r["label"]
+              for r in rows]
+    tps    = [r["throughput_tok_s"] for r in rows]
+    pct    = [f'{r["vs_hf_pct"]:.1f}%' if r["vs_hf_pct"] < 100 else "—" for r in rows]
+    colors = [ORANGE, BLUE, GRAY]
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     bars = ax.bar(phases, tps, color=colors, width=0.45, zorder=3)
@@ -75,10 +91,11 @@ def chart_throughput_evolution():
                 f"{t:.0f} tok/s\n({p})",
                 ha="center", va="bottom", fontsize=10, fontweight="bold")
 
+    hf_tps = rows[-1]["throughput_tok_s"]
     ax.set_ylim(0, 480)
     ax.set_ylabel("Throughput (tok/s)")
-    ax.set_title("主线吞吐演进 — Qwen2.5-7B, batch=8, max_new_tokens=128")
-    ax.axhline(406.4, color=GRAY, linestyle="--", linewidth=1.2, zorder=2, label="HF baseline")
+    ax.set_title(f"主线吞吐演进 — {d['meta']['model']}, batch={d['meta']['batch_size']}")
+    ax.axhline(hf_tps, color=GRAY, linestyle="--", linewidth=1.2, zorder=2, label="HF baseline")
     ax.legend()
     fig.tight_layout()
     fig.savefig(os.path.join(OUT_DIR, "01_throughput_evolution.png"))
@@ -86,15 +103,17 @@ def chart_throughput_evolution():
     print("✓ 01_throughput_evolution.png")
 
 
-# ── 图 2：CUDA Graph decode 延迟（1.5B 模型，bs 1/2/4/8）──────────────────
+# ── 图 2：CUDA Graph decode 延迟 ──────────────────────────────────────────────
 def chart_cuda_graph():
-    bs         = [1, 2, 4, 8]
-    eager_ms   = [7.33, 7.44, 7.73, 8.31]
-    graph_ms   = [5.21, 5.88, 6.43, 6.79]
-    speedups   = [1.41, 1.27, 1.20, 1.22]
+    d      = _load("cuda_graph.json")
+    rows   = d["data"]
+    bs         = [r["batch_size"] for r in rows]
+    eager_ms   = [r["eager_ms"]   for r in rows]
+    graph_ms   = [r["graph_ms"]   for r in rows]
+    speedups   = [r["speedup"]    for r in rows]
 
-    x   = np.arange(len(bs))
-    w   = 0.35
+    x = np.arange(len(bs))
+    w = 0.35
     fig, ax = plt.subplots(figsize=(7, 4.5))
 
     b1 = ax.bar(x - w/2, eager_ms, w, color=ORANGE, label="Eager", zorder=3)
@@ -109,7 +128,7 @@ def chart_cuda_graph():
     ax.set_xticks(x)
     ax.set_xticklabels([f"bs={b}" for b in bs])
     ax.set_ylabel("Decode step latency (ms)")
-    ax.set_title("CUDA Graph vs Eager — Qwen2.5-1.5B decode latency")
+    ax.set_title(f"CUDA Graph vs Eager — {d['meta']['model']} decode latency")
     ax.legend()
     fig.tight_layout()
     fig.savefig(os.path.join(OUT_DIR, "02_cuda_graph.png"))
@@ -117,12 +136,14 @@ def chart_cuda_graph():
     print("✓ 02_cuda_graph.png")
 
 
-# ── 图 3：MoE EP 吞吐演进（dense → padded → packed → grouped）──────────────
+# ── 图 3：MoE EP 吞吐演进 ─────────────────────────────────────────────────────
 def chart_moe_ep():
-    labels = ["Dense\n(1 GPU)", "EP padded\n(2 GPU)", "EP packed\n(2 GPU)", "EP grouped\n(2 GPU)"]
-    tps    = [21878.76, 42765.91, 51121.99, 54696.73]
+    d      = _load("moe_ep_evolution.json")
+    rows   = d["data"]
+    labels = [r["label"] for r in rows]
+    tps    = [r["throughput_tok_s"] for r in rows]
+    ratios = [f'{r["vs_dense"]:.3f}×' for r in rows]
     colors = [GRAY, ORANGE, GREEN, BLUE]
-    ratios = ["1.0×", "1.954×", "2.337×", "2.500×"]
 
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
     bars = ax.bar(labels, tps, color=colors, width=0.5, zorder=3)
@@ -134,35 +155,39 @@ def chart_moe_ep():
 
     ax.set_ylim(0, 65000)
     ax.set_ylabel("Throughput (tok/s)")
-    ax.set_title("MoE Expert Parallelism 吞吐演进 — Synthetic MoE, 2 × RTX 4090")
+    ax.set_title(f"MoE Expert Parallelism 吞吐演进 — {d['meta']['hardware']}")
     fig.tight_layout()
     fig.savefig(os.path.join(OUT_DIR, "03_moe_ep_evolution.png"))
     plt.close(fig)
     print("✓ 03_moe_ep_evolution.png")
 
 
-# ── 图 4：Flash Decoding 延迟 vs seq_len（1.5B，块式 KV）──────────────────
+# ── 图 4：Flash Decoding 延迟 vs seq_len ──────────────────────────────────────
 def chart_flash_decode():
-    seq_lens      = [128, 256, 512, 1024, 2048, 4096]
-    flash_attn_ms = [0.015, 0.014, 0.012, 0.010, 0.016, 0.013]
-    triton_65_ms  = [0.020, 0.023, 0.044, 0.074, 0.129, 0.256]
-    flash_dec_ms  = [0.062, 0.063, 0.063, 0.063, 0.068, 0.100]
+    d    = _load("flash_decode.json")
+    rows = d["data"]
+    seq_lens      = [r["seq_len"]        for r in rows]
+    flash_attn_ms = [r["flash_attn_ms"]  for r in rows]
+    triton_65_ms  = [r["triton_65_ms"]   for r in rows]
+    flash_dec_ms  = [r["flash_decode_ms"] for r in rows]
+    crossover     = d["summary"]["crossover_seq_len"]
 
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
     ax.plot(seq_lens, flash_attn_ms, "o-", color=GRAY,   label="flash_attn（基准）", linewidth=2)
-    ax.plot(seq_lens, triton_65_ms,  "s-", color=ORANGE, label="Triton baseline（split-K ref）", linewidth=2)
-    ax.plot(seq_lens, flash_dec_ms,  "^-", color=BLUE,   label="Flash Decoding（split-K Triton）", linewidth=2)
+    ax.plot(seq_lens, triton_65_ms,  "s-", color=ORANGE, label="Triton baseline", linewidth=2)
+    ax.plot(seq_lens, flash_dec_ms,  "^-", color=BLUE,   label="Flash Decoding（split-K）", linewidth=2)
 
-    ax.axvline(2048, color=GREEN, linestyle=":", linewidth=1.2, label="crossover ≈ 2048")
+    ax.axvline(crossover, color=GREEN, linestyle=":", linewidth=1.2, label=f"crossover ≈ {crossover}")
     ax.set_xlabel("Sequence length (tokens)")
     ax.set_ylabel("Attention latency (ms)")
-    ax.set_title("Flash Decoding (Split-K) vs Triton baseline — Qwen2.5-1.5B, bs=1")
+    ax.set_title(f"Flash Decoding (Split-K) vs Triton — {d['meta']['model']}, bs=1")
     ax.legend(loc="upper left")
     ax.set_xscale("log", base=2)
     ax.set_xticks(seq_lens)
     ax.set_xticklabels([str(s) for s in seq_lens])
-    ax.annotate("3.31× faster\nvs Triton @ seq=4096",
-                xy=(4096, 0.100), xytext=(2200, 0.18),
+    speedup = d["summary"]["speedup_vs_triton_at_4096"]
+    ax.annotate(f"{speedup:.2f}× faster\nvs Triton @ seq=4096",
+                xy=(4096, flash_dec_ms[-1]), xytext=(2200, 0.18),
                 arrowprops=dict(arrowstyle="->", color=BLUE),
                 fontsize=9, color=BLUE)
     fig.tight_layout()
@@ -171,19 +196,21 @@ def chart_flash_decode():
     print("✓ 04_flash_decode.png")
 
 
-# ── 图 5：Chunked Prefill — ITL spike 对比 ─────────────────────────────────
+# ── 图 5：Chunked Prefill ITL spike 对比 ──────────────────────────────────────
 def chart_chunked_prefill():
-    categories = ["无 Chunked Prefill\n(chunk=0)", "chunk=128", "chunk=256"]
-    itl_spike  = [138.4, 45.9, 58.6]   # ms，短请求最大 ITL
-    throughput = [290.0, 296.8, 301.3]  # tok/s 总吞吐
+    d          = _load("chunked_prefill.json")
+    rows       = d["data"]
+    categories = [r["label"]              for r in rows]
+    itl_spike  = [r["max_itl_spike_ms"]   for r in rows]
+    throughput = [r["throughput_tok_s"]   for r in rows]
 
     x  = np.arange(len(categories))
     w  = 0.35
     fig, ax1 = plt.subplots(figsize=(7.5, 4.5))
     ax2 = ax1.twinx()
 
-    b1 = ax1.bar(x - w/2, itl_spike,  w, color=RED,   label="Max ITL spike (ms)", zorder=3)
-    b2 = ax2.bar(x + w/2, throughput, w, color=BLUE,  label="Throughput (tok/s)", zorder=3)
+    b1 = ax1.bar(x - w/2, itl_spike,  w, color=RED,  label="Max ITL spike (ms)", zorder=3)
+    b2 = ax2.bar(x + w/2, throughput, w, color=BLUE, label="Throughput (tok/s)", zorder=3)
 
     for bar, v in zip(b1, itl_spike):
         ax1.text(bar.get_x() + bar.get_width() / 2, v + 2,
@@ -198,13 +225,14 @@ def chart_chunked_prefill():
     ax2.set_ylabel("Throughput (tok/s)", color=BLUE)
     ax1.set_ylim(0, 200)
     ax2.set_ylim(270, 320)
-    ax1.set_title("Chunked Prefill — ITL spike vs throughput — Qwen2.5-7B")
+    ax1.set_title(f"Chunked Prefill — ITL spike vs throughput — {d['meta']['model']}")
 
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
     ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
 
-    ax1.annotate("−66.8%", xy=(1 - w/2, 45.9), xytext=(0.5, 120),
+    reduction = d["summary"]["itl_spike_reduction_chunk128_pct"]
+    ax1.annotate(f"−{reduction:.1f}%", xy=(1 - w/2, itl_spike[1]), xytext=(0.5, 120),
                  arrowprops=dict(arrowstyle="->", color="gray"),
                  fontsize=10, color=RED, fontweight="bold")
 
@@ -214,28 +242,30 @@ def chart_chunked_prefill():
     print("✓ 05_chunked_prefill.png")
 
 
-# ── 图 6：W8A8 量化 — 显存收益 vs 精度代价 ─────────────────────────────────
+# ── 图 6：W8A8 量化显存与吞吐 ─────────────────────────────────────────────────
 def chart_w8a8():
+    d = _load("w8a8_quant.json")
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(9, 4.5))
 
     # 左图：显存对比
     models  = ["FP16", "W8A8"]
-    mem_mb  = [3392.4, 2292.0]
-    colors_ = [ORANGE, BLUE]
-    bars = ax1.bar(models, mem_mb, color=colors_, width=0.4, zorder=3)
+    mem_mb  = [d["memory"]["fp16_weight_mb"], d["memory"]["w8a8_weight_mb"]]
+    bars = ax1.bar(models, mem_mb, color=[ORANGE, BLUE], width=0.4, zorder=3)
     for bar, v in zip(bars, mem_mb):
         ax1.text(bar.get_x() + bar.get_width() / 2, v + 30,
                  f"{v:.0f} MB", ha="center", va="bottom", fontsize=10, fontweight="bold")
     ax1.set_ylim(0, 4200)
     ax1.set_ylabel("Weight memory (MB)")
     ax1.set_title("显存：权重占用")
-    ax1.annotate("−32.4%", xy=(1, 2292), xytext=(0.6, 3000),
+    reduction = d["memory"]["reduction_pct"]
+    ax1.annotate(f"−{reduction:.1f}%", xy=(1, mem_mb[1]), xytext=(0.6, 3000),
                  arrowprops=dict(arrowstyle="->", color=BLUE),
                  fontsize=11, color=BLUE, fontweight="bold")
 
     # 右图：decode tps 对比
     models2 = ["FP16", "W8A8\n(mixed fallback)"]
-    tps2    = [534.8, 190.6]
+    tps2    = [d["throughput"]["fp16_decode_tok_s"], d["throughput"]["w8a8_decode_tok_s"]]
     bars2 = ax2.bar(models2, tps2, color=[ORANGE, RED], width=0.4, zorder=3)
     for bar, v in zip(bars2, tps2):
         ax2.text(bar.get_x() + bar.get_width() / 2, v + 8,
@@ -243,39 +273,36 @@ def chart_w8a8():
     ax2.set_ylim(0, 650)
     ax2.set_ylabel("Decode throughput (tok/s)")
     ax2.set_title("推理吞吐（小 M 限制）")
+    ax2.text(0.5, 0.12, "decode 退回 FP16 mixed fallback\n（torch._int_mm 小 M 限制）",
+             transform=ax2.transAxes, ha="center", fontsize=8.5,
+             color="gray", style="italic",
+             bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff3cd", alpha=0.8))
 
-    note = ax2.text(0.5, 0.12, "decode 退回 FP16 mixed fallback\n（torch._int_mm 小 M 限制）",
-                    transform=ax2.transAxes, ha="center", fontsize=8.5,
-                    color="gray", style="italic",
-                    bbox=dict(boxstyle="round,pad=0.3", facecolor="#fff3cd", alpha=0.8))
-
-    fig.suptitle("W8A8 量化（per-channel int8）— Qwen2.5-1.5B", fontweight="bold")
+    fig.suptitle(f"W8A8 量化（per-channel int8）— {d['meta']['model']}", fontweight="bold")
     fig.tight_layout()
     fig.savefig(os.path.join(OUT_DIR, "06_w8a8_quant.png"))
     plt.close(fig)
     print("✓ 06_w8a8_quant.png")
 
 
-# ── 图 7：综合性能总览（雷达图）────────────────────────────────────────────
+# ── 图 7：综合能力总览（雷达图）──────────────────────────────────────────────
 def chart_overview_radar():
-    # 各项能力指标（0-10 满分，根据实验结论主观打分）
-    # 设计: 5 个维度，用多边形对比 mini-infer 与"未实现"基线
-    categories = ["吞吐\n(batch decode)", "延迟\n(decode latency)", "内存效率\n(KV cache)",
-                  "分布式扩展\n(EP 2.5×)", "长序列\n(Flash Decode)"]
-    values_mini = [10.0, 8.5, 7.5, 9.5, 8.0]  # 归一化到 10 分
-    values_base = [8.8,  7.1, 5.0, 5.0,  5.0]   # 无优化的起点
+    # 各项能力指标（0-10，根据实验结论相对打分）
+    categories   = ["吞吐\n(batch decode)", "延迟\n(decode latency)", "内存效率\n(KV cache)",
+                    "分布式扩展\n(EP 2.5×)", "长序列\n(Flash Decode)"]
+    values_mini  = [10.0, 8.5, 7.5, 9.5, 8.0]
+    values_base  = [8.8,  7.1, 5.0, 5.0, 5.0]
 
-    N = len(categories)
+    N      = len(categories)
     angles = np.linspace(0, 2 * np.pi, N, endpoint=False).tolist()
     angles += angles[:1]
-
     v_mini = values_mini + values_mini[:1]
     v_base = values_base + values_base[:1]
 
     fig, ax = plt.subplots(figsize=(6, 6), subplot_kw=dict(polar=True))
-    ax.plot(angles, v_mini, "o-", color=BLUE,   linewidth=2, label="mini-infer (Phase 21)")
+    ax.plot(angles, v_mini, "o-", color=BLUE,  linewidth=2, label="mini-infer (Phase 21)")
     ax.fill(angles, v_mini, alpha=0.15, color=BLUE)
-    ax.plot(angles, v_base, "s--", color=GRAY,  linewidth=1.5, label="Phase 3 基线")
+    ax.plot(angles, v_base, "s--", color=GRAY, linewidth=1.5, label="Phase 3 基线")
     ax.fill(angles, v_base, alpha=0.08, color=GRAY)
 
     ax.set_thetagrids(np.degrees(angles[:-1]), categories)

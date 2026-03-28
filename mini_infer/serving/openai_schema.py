@@ -12,9 +12,9 @@ Phase 8 OpenAI Chat Completions 子集兼容 schema。
 from __future__ import annotations
 
 import time
-from typing import Literal
+from typing import List, Literal
 
-from pydantic import BaseModel, Field, conlist
+from pydantic import BaseModel, Field
 
 
 # ---------------------------------------------------------------------------
@@ -29,7 +29,7 @@ class ChatMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str = Field(min_length=1)
-    messages: conlist(ChatMessage, min_items=1)
+    messages: List[ChatMessage]
     stream: bool = False
     max_tokens: int = Field(default=128, ge=1)
     temperature: float = Field(default=0.0, ge=0.0)

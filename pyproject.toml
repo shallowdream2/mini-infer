@@ -51,9 +51,9 @@ dev = [
 flash = [
     "flash-attn>=2.5.0",
 ]
-# Phase 8+：HTTP 服务化
+# Phase 8+：HTTP 服务化（fastapi<0.115 兼容 pydantic v1；>=0.115 需 pydantic v2）
 serve = [
-    "fastapi>=0.100.0",
+    "fastapi>=0.100.0,<0.115.0",
     "uvicorn>=0.23.0",
     "asgi-lifespan>=2.0",  # 测试用，触发 ASGI lifespan 事件
 ]
@@ -67,7 +67,7 @@ dist = [
 ]
 # 一键安装全部可选依赖（flash-attn 需单独编译，不计入）
 all = [
-    "fastapi>=0.100.0",
+    "fastapi>=0.100.0,<0.115.0",
     "uvicorn>=0.23.0",
     "asgi-lifespan>=2.0",
     "triton>=2.1.0",
