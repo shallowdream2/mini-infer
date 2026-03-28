@@ -1,6 +1,6 @@
 # mini-infer
 
-**LLM inference engine built from scratch** — paged KV cache, continuous batching, chunked prefill, prefix caching, speculative decoding, CUDA graph, tensor parallelism, MoE expert parallelism, and OpenAI-compatible HTTP serving. Each mechanism has a dedicated benchmark with quantitative results. Core serving path reaches **100% of HF baseline throughput** at batch=8. Ships with dry-run mode (no model weights needed), `/healthz`, Docker, and CI.
+**LLM inference engine built from scratch** — paged KV cache, continuous batching, chunked prefill, prefix caching, speculative decoding, CUDA graph, tensor parallelism, MoE expert parallelism, and OpenAI-compatible HTTP serving. Each mechanism has a dedicated benchmark with quantitative results. Core serving path reaches **100% of HF baseline throughput** at batch=8; concurrent HTTP throughput scales **3.9× (1→8 clients, 55.7→219.1 tok/s)**. Ships with dry-run mode (no model weights needed), `/healthz`, Docker, and CI.
 
 > 从零实现的 LLM 推理引擎。核心 serving 路径（PagedAttention + Continuous Batching + OpenAI HTTP API）在 Qwen2.5-7B 达到 HF Transformers **100% 吞吐**，支持 `--dry-run` 无权重启动验证。
 
@@ -47,6 +47,7 @@ curl http://localhost:8000/healthz   # → {"status":"ok","model":"dry",...}
 
 | 技术 | 关键数据 |
 |------|---------|
+| **Continuous Batching HTTP API**（AsyncEngine + OpenAI 兼容） | 并发 1→8 吞吐 **55.7→219.1 tok/s**（3.9×，Qwen2.5-7B，RTX 4090） |
 | **True PagedAttention**（flash_attn block_table） | batch=8 吞吐达到 HF Transformers **100%**（406 tok/s） |
 | **Chunked Prefill** | 混合 serving 场景 ITL spike 降低 **57%–67%** |
 | **Prefix Caching**（block-level hash + LRU） | 共享前缀 TTFT **−22%** |

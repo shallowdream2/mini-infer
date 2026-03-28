@@ -1,7 +1,7 @@
 # Benchmarks
 
 所有 benchmark 在 Ubuntu 24.04 + 2 × RTX 4090（CUDA 12.1）上运行。
-模型使用 Qwen2.5 系列（0.5B / 1.5B / 7B）及 DeepSeek-V2-Lite（Phase 14）。
+模型使用 Qwen2.5 系列（0.5B / 1.5B / 7B）及 DeepSeek-V2-Lite（MLA 实验）。
 
 ---
 
@@ -9,24 +9,24 @@
 
 | 技术 | 模型 | 指标 | 数值 |
 |------|------|------|------|
-| HTTP Serving（Phase 8） | Qwen2.5-7B | 并发 1→8 吞吐 | 55.7 → **219.1 tok/s**（3.9×） |
-| True PagedAttention（Phase 6） | Qwen2.5-7B | batch=8 吞吐 vs HF | **100.0%**（406 tok/s） |
-| Chunked Prefill（Phase 9） | Qwen2.5-7B | ITL spike 降低 | **−57%**（chunk=256）/ **−67%**（chunk=128） |
-| Prefix Caching（Phase 10） | Qwen2.5-7B | 共享前缀 TTFT | **−22%** |
-| Speculative Decoding（Phase 11） | 0.5B+7B | acceptance_rate | **55.85%** |
-| CUDA Graph（Phase 12） | Qwen2.5-1.5B | decode 延迟 bs=1 | **−28.9%** |
-| Flash Decoding（Phase 12.5） | Qwen2.5-1.5B | seq=4096 延迟 vs triton_65 | **3.31×** |
-| Flash Decoding（Phase 12.5） | — | SM 利用率变化 | 9% → **103%** |
-| Tensor Parallelism（Phase 13） | Qwen2.5-1.5B | TP=2 greedy 输出 | 与单卡**完全一致** |
-| MLA（Phase 14） | DeepSeek-V2-Lite | latent cache 体积 vs GQA | **−56.25%** |
-| W8A8 量化（Phase 16） | Qwen2.5-1.5B | 权重显存（3392→2292 MB） | **−32.4%** |
-| W8A8 量化（Phase 16） | Qwen2.5-1.5B | greedy token match | **71.8%** |
-| PD 解耦（Phase 15） | Qwen2.5-7B | TTFT 三段分解 | prefill 12.3ms / transfer ≈14.7ms / decode 519ms |
-| EP grouped（Phase 21） | synthetic MoE | EP / dense 吞吐比 | **2.500×** |
+| HTTP Serving（Continuous Batching） | Qwen2.5-7B | 并发 1→8 吞吐 | 55.7 → **219.1 tok/s**（3.9×） |
+| True PagedAttention | Qwen2.5-7B | batch=8 吞吐 vs HF | **100.0%**（406 tok/s） |
+| Chunked Prefill | Qwen2.5-7B | ITL spike 降低 | **−57%**（chunk=256）/ **−67%**（chunk=128） |
+| Prefix Caching | Qwen2.5-7B | 共享前缀 TTFT | **−22%** |
+| Speculative Decoding | 0.5B+7B | acceptance_rate | **55.85%** |
+| CUDA Graph | Qwen2.5-1.5B | decode 延迟 bs=1 | **−28.9%** |
+| Flash Decoding（split-K） | Qwen2.5-1.5B | seq=4096 延迟 vs triton | **3.31×** |
+| Flash Decoding（split-K） | — | SM 利用率变化 | 9% → **103%** |
+| Tensor Parallelism | Qwen2.5-1.5B | TP=2 greedy 输出 | 与单卡**完全一致** |
+| MLA | DeepSeek-V2-Lite | latent cache 体积 vs GQA | **−56.25%** |
+| W8A8 量化 | Qwen2.5-1.5B | 权重显存（3392→2292 MB） | **−32.4%** |
+| W8A8 量化 | Qwen2.5-1.5B | greedy token match | **71.8%** |
+| PD 解耦 | Qwen2.5-7B | TTFT 三段分解 | prefill 12.3ms / transfer ≈14.7ms / decode 519ms |
+| MoE Expert Parallelism（grouped） | synthetic MoE | EP / dense 吞吐比 | **2.500×** |
 
 ---
 
-## HTTP Serving 吞吐（Phase 8）
+## HTTP Serving 吞吐
 
 **测试条件：** Qwen2.5-7B-Instruct，RTX 4090，max_tokens=64，非流式并发请求
 **口径说明：** 使用 httpx.ASGITransport（进程内），TTFT 为近似值（等于整体响应延迟，非真实流式首 token 时间）
@@ -38,7 +38,7 @@
 | 4 | 254 | 1.46 | 174.0 |
 | **8** | **510** | **2.33** | **219.1** |
 
-并发 1→8 吞吐提升 3.9×，体现 Continuous Batching 将多个 HTTP 请求合并进同一 decode_batch 的效果。峰值显存 18.76 GB（与 Phase 6/7 相同，HTTP 层不引入额外 GPU 内存）。
+并发 1→8 吞吐提升 3.9×，体现 Continuous Batching 将多个 HTTP 请求合并进同一 decode_batch 的效果。峰值显存 18.76 GB（HTTP 层不引入额外 GPU 内存）。
 
 **复现命令：**
 
@@ -50,17 +50,17 @@ HF_HUB_OFFLINE=1 python benchmarks/benchmark_server.py \
 
 ---
 
-## 单卡吞吐演进（Phase 1 → Phase 6）
+## 单卡吞吐演进
 
 **测试条件：** Qwen2.5-7B-Instruct，batch=8，max_new_tokens=128，RTX 4090
 
 | 实现 | 吞吐 | vs HF |
 |------|------|-------|
 | HF Transformers baseline | ~406 tok/s | 100% |
-| Phase 1（串行 decode） | 56 tok/s | 13.8% |
-| Phase 2（Paged KV + Batch Decode） | 201 tok/s | 49.5% |
-| Phase 3（向量化 gather + DynamicCache） | 361 tok/s | 88.4% |
-| Phase 6（True PagedAttention） | **406 tok/s** | **100.0%** |
+| 串行 decode（初始版） | 56 tok/s | 13.8% |
+| Paged KV Cache + Batch Decode | 201 tok/s | 49.5% |
+| 向量化 KV gather + DynamicCache | 361 tok/s | 88.4% |
+| True PagedAttention（flash_attn block_table） | **406 tok/s** | **100.0%** |
 
 **复现命令：**
 
@@ -73,7 +73,7 @@ python benchmarks/benchmark_flash.py --model $MODEL --batch-size 8 --compare
 
 ---
 
-## Chunked Prefill（Phase 9）
+## Chunked Prefill
 
 **测试条件：** 长 prompt + 混合 decode，Qwen2.5-7B，chunk_size ∈ {128, 256}
 
@@ -91,7 +91,7 @@ python benchmarks/benchmark_chunked_prefill.py --model $MODEL --chunk-size 256
 
 ---
 
-## Prefix Caching（Phase 10）
+## Prefix Caching
 
 **测试条件：** 共享前缀请求，block 级 SHA-256 hash + LRU，Qwen2.5-7B，batch=8
 
@@ -109,7 +109,7 @@ python benchmarks/benchmark_prefix_cache.py --model $MODEL --batch_size 8
 
 ---
 
-## Speculative Decoding（Phase 11）
+## Speculative Decoding
 
 **测试条件：** 0.5B draft + 7B target，modified rejection sampling，K=4
 
@@ -127,7 +127,7 @@ python benchmarks/benchmark_spec.py --draft auto --target auto --K 4 --target_on
 
 ---
 
-## CUDA Graph（Phase 12）
+## CUDA Graph
 
 **测试条件：** Qwen2.5-1.5B，batch_size=1，decode step 延迟，RTX 4090
 
@@ -146,7 +146,7 @@ python benchmarks/benchmark_cuda_graph.py \
 
 ---
 
-## Flash Decoding / Split-K Attention（Phase 12.5）
+## Flash Decoding / Split-K Attention
 
 **测试条件：** seq_len sweep，Qwen2.5-1.5B（28Q/2KV heads），RTX 4090
 
@@ -168,7 +168,7 @@ python benchmarks/benchmark_flash_decode.py --num-q-heads 28 --num-kv-heads 4
 
 ---
 
-## Tensor Parallelism（Phase 13）
+## Tensor Parallelism
 
 **测试条件：** Qwen2.5-1.5B，TP=2，NCCL all-reduce，Megatron-LM 风格
 
@@ -185,7 +185,7 @@ torchrun --nproc_per_node 2 benchmarks/benchmark_tp.py --model $TP_MODEL --mode 
 
 ---
 
-## MLA（Phase 14）
+## MLA（Multi-head Latent Attention）
 
 **测试条件：** DeepSeek-V2-Lite，MHA / GQA / MLA 三种 KV cache 方案对比
 
@@ -205,7 +205,7 @@ python benchmarks/benchmark_mla.py --section 3   # 三种实现延迟对比
 
 ---
 
-## W8A8 量化（Phase 16）
+## W8A8 量化
 
 **测试条件：** Qwen2.5-1.5B，per-channel int8，attention 层跳过（mixed fallback），batch=4
 
@@ -223,7 +223,7 @@ python benchmarks/benchmark_quant.py --model $QUANT_MODEL --compare --batch-size
 
 ---
 
-## PD 解耦（Phase 15）
+## PD 解耦（Disaggregated Prefill/Decode）
 
 **测试条件：** 同机双进程，KV 序列化传输，Qwen2.5-7B
 
@@ -242,21 +242,21 @@ TOKENIZERS_PARALLELISM=false HF_HUB_OFFLINE=1 \
 
 ---
 
-## MoE Expert Parallelism 演进（Phase 17–21）
+## MoE Expert Parallelism
 
 **测试条件：** synthetic MoE（2-GPU，2×RTX 4090），hidden_size=512，num_experts=8，top_k=2，dtype=float16
 
 | 实现 | 吞吐（tok/s） | vs dense | 通信量 | 备注 |
 |------|------------|---------|--------|------|
 | Dense（1 GPU） | ~22,000 | 1.00× | — | 单卡基准 |
-| EP padded（2 GPU） | ~43,000 | ~1.96× | 有 padding 冗余 | Phase 17 |
-| EP packed（2 GPU） | ~52,000 | ~2.32× | 消除 padding | Phase 19 |
-| EP grouped（2 GPU） | **~54,700** | **2.500×** | — | Phase 21 |
+| EP padded（2 GPU） | ~43,000 | ~1.96× | 有 padding 冗余 | 基础 EP |
+| EP packed（2 GPU） | ~52,000 | ~2.32× | 消除 padding | Non-padded dispatch |
+| EP grouped（2 GPU） | **~54,700** | **2.500×** | — | Grouped execution |
 
 其他关键指标：
-- Phase 18：per-rank expert shard，`shard_ratio = 0.5002`（接近理想值 0.5）
-- Phase 20：control_plane_share ≈ 1.94%
-- Phase 21：`ep_grouped_runtime_resident_ratio = 0.8334`（约 83% 的 token 在本地 rank 执行）
+- per-rank expert shard：`shard_ratio = 0.5002`（接近理想值 0.5）
+- EP control plane：`control_plane_share ≈ 1.94%`
+- Grouped execution：`ep_grouped_runtime_resident_ratio = 0.8334`（约 83% 的 token 在本地 rank 执行）
 
 **复现命令：**
 
@@ -273,7 +273,7 @@ python benchmarks/benchmark_moe.py \
 ## Benchmark 口径说明
 
 - 所有结果在 Ubuntu 24.04 + RTX 4090（CUDA 12.1）上获取，无虚拟化
-- MoE benchmark（Phase 17–21）基于 **synthetic layer-level workload**，不含完整 serving 链路
+- MoE Expert Parallelism benchmark 基于 **synthetic layer-level workload**，不含完整 serving 链路
 - W8A8 量化的 greedy match 71.8% 表示与 FP16 基线逐 token 比较的一致率；decode 路径以 mixed fallback 为主
-- PD 解耦（Phase 15）为同机双进程原型，transfer 时间包含 socket 序列化开销
-- Flash Decoding（Phase 12.5）为独立 kernel benchmark，未接入主推理链路
+- PD 解耦为同机双进程原型，transfer 时间包含 socket 序列化开销
+- Flash Decoding 为独立 kernel benchmark，未接入主推理链路
