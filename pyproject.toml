@@ -37,6 +37,8 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/psmarter/mini-infer"
 Repository = "https://github.com/psmarter/mini-infer"
+Issues = "https://github.com/psmarter/mini-infer/issues"
+Documentation = "https://github.com/psmarter/mini-infer/blob/main/docs/architecture.md"
 
 [project.optional-dependencies]
 dev = [

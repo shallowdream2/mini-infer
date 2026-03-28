@@ -141,10 +141,6 @@ CUDA Graph 仅对 decode_batch 有效（输入 shape 固定），不适用于 pr
 - Phase 19：packed dispatch（ep_packed_bytes = ep_ideal_bytes，消除 padding）
 - Phase 21：grouped local execution（**2.500× vs dense**）
 
-## 后续可扩展方向
+## 后续扩展方向
 
-- FP8 量化 / Triton INT8 GEMM
-- TP + EP 混合并行
-- SLO-aware 请求调度
-- Token-level prefix cache eviction
-- 完整 serving runtime（multi-lora、request priority API）
+详见 [docs/roadmap.md](roadmap.md)。

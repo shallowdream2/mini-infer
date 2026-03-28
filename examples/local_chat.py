@@ -1,26 +1,23 @@
 """examples/local_chat.py — 不启动 HTTP 服务，直接使用 Python API 与 mini-infer 交互。
 
+与 examples/openai_client.py 的区别
+-----------------------------------
+- local_chat.py  ：直接调用 LLMEngine Python API，无需 HTTP 服务，无网络延迟
+- openai_client.py：通过 OpenAI 兼容接口，需要先启动 mini-infer-serve
+
 使用方法
 --------
-方式 A：dry-run（无需模型权重）
+方式 A — dry-run（无需模型权重，验证安装是否正确）
 
     python examples/local_chat.py --dry-run
 
-方式 B：真实模型
+方式 B — 真实模型（流式 step 循环，展示 add_request / step / is_finished 接口）
 
     python examples/local_chat.py --model /path/to/Qwen2.5-1.5B-Instruct
 
-方式 C：自定义参数
+方式 C — 批量生成（generate 接口，最简洁）
 
-    python examples/local_chat.py \\
-        --model /path/to/Qwen2.5-1.5B-Instruct \\
-        --max-tokens 256 \\
-        --temperature 0.7
-
-与 examples/openai_client.py 的区别
------------------------------------
-- local_chat.py：直接调用 Python API（LLMEngine），无需 HTTP 服务，无网络延迟
-- openai_client.py：通过 OpenAI 兼容接口，需要先启动 serve.py
+    python examples/local_chat.py --model /path/to/Qwen2.5-1.5B-Instruct --batch
 """
 
 from __future__ import annotations
@@ -33,19 +30,19 @@ import time
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="mini-infer local chat example")
     parser.add_argument("--model", type=str, default="", help="模型目录路径")
-    parser.add_argument("--dry-run", action="store_true", help="使用 stub model，无需真实权重")
+    parser.add_argument("--dry-run", action="store_true", help="stub model，无需真实权重")
+    parser.add_argument("--batch", action="store_true", help="使用 generate() 而非 step 循环")
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--dtype", type=str, default="float16")
-    parser.add_argument("--max-tokens", type=int, default=128, help="最大生成 token 数")
-    parser.add_argument("--temperature", type=float, default=0.0, help="采样温度（0.0 = greedy）")
+    parser.add_argument("--max-tokens", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=0.0, help="0.0 = greedy")
     parser.add_argument("--block-size", type=int, default=256)
     return parser.parse_args()
 
 
 def build_engine(args: argparse.Namespace):
-    """初始化 LLMEngine。"""
-    from mini_infer.config import EngineConfig
-    from mini_infer.engine import LLMEngine
+    from mini_infer.core.config import EngineConfig
+    from mini_infer.runtime.engine import LLMEngine
 
     if not args.dry_run and not args.model:
         raise SystemExit("请指定 --model 或 --dry-run")
@@ -57,55 +54,50 @@ def build_engine(args: argparse.Namespace):
         dry_run=args.dry_run,
         block_size=args.block_size,
     )
-    print(f"[local_chat] 初始化引擎：model={config.model_name!r}  dry_run={config.dry_run}")
-    engine = LLMEngine(config)
-    return engine
+    print(f"[local_chat] model={config.model_name!r}  dry_run={config.dry_run}")
+    return LLMEngine(config)
 
 
-def generate(engine, prompt: str, max_new_tokens: int, temperature: float) -> tuple[str, float]:
-    """单次生成，返回（生成文本, 耗时）。"""
-    from mini_infer.request import Request, SamplingParams
+# ── 接口演示 A：add_request + step + is_finished（逐 token 流式）──────────────
 
-    req = Request(
-        request_id=f"req-{int(time.time() * 1000)}",
-        prompt=prompt,
-        sampling_params=SamplingParams(
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-        ),
-    )
+def generate_streaming(engine, prompt: str, max_tokens: int, temperature: float) -> tuple[str, float]:
+    """
+    使用 add_request / step / is_finished 接口。
 
+    engine.add_request(prompt, max_new_tokens, temperature) -> request_id
+    engine.step()  -> {request_id: [new_token_texts]}
+    engine.is_finished(request_id) -> bool
+    """
     t0 = time.perf_counter()
-    engine.add_request(req)
+    request_id = engine.add_request(prompt, max_new_tokens=max_tokens, temperature=temperature)
 
-    output_tokens: list[int] = []
-    while True:
-        finished = engine.step()
-        # 收集本步产出的 token
-        if req.output_token_ids:
-            output_tokens = list(req.output_token_ids)
-        if req.is_finished():
-            break
-    elapsed = time.perf_counter() - t0
+    parts: list[str] = []
+    while not engine.is_finished(request_id):
+        new_tokens: dict[str, list[str]] = engine.step()
+        parts.extend(new_tokens.get(request_id, []))
 
-    # 解码输出
-    text = ""
-    if hasattr(engine, "tokenizer") and engine.tokenizer is not None:
-        text = engine.tokenizer.decode(output_tokens, skip_special_tokens=True)
-    elif output_tokens:
-        # dry-run：直接展示 token id 列表
-        text = f"[dry-run token ids] {output_tokens[:20]}{'...' if len(output_tokens) > 20 else ''}"
-    return text, elapsed
+    return "".join(parts), time.perf_counter() - t0
 
 
-def main() -> int:
-    args = parse_args()
-    engine = build_engine(args)
+# ── 接口演示 B：generate()（批量，最简洁）────────────────────────────────────
 
-    print("\n=== mini-infer local chat ===")
-    print("输入 'quit' 或 'exit' 退出，'clear' 重置对话历史\n")
+def generate_batch(engine, prompt: str, max_tokens: int, temperature: float) -> tuple[str, float]:
+    """使用 engine.generate([prompt], ...) 批量接口，一次性拿到完整结果。"""
+    t0 = time.perf_counter()
+    results = engine.generate([prompt], max_new_tokens=max_tokens, temperature=temperature)
+    return results[0], time.perf_counter() - t0
 
-    history: list[dict] = []
+
+# ── 交互循环 ─────────────────────────────────────────────────────────────────
+
+def chat_loop(engine, args: argparse.Namespace) -> int:
+    generate_fn = generate_batch if args.batch else generate_streaming
+    mode = "generate()" if args.batch else "add_request/step/is_finished"
+
+    print(f"\n=== mini-infer local chat  [{mode}] ===")
+    print("输入 'quit' 退出，'clear' 清空对话历史\n")
+
+    history: list[dict[str, str]] = []
 
     while True:
         try:
@@ -114,33 +106,30 @@ def main() -> int:
             print("\n再见！")
             break
 
+        if not user_input:
+            continue
         if user_input.lower() in {"quit", "exit"}:
             print("再见！")
             break
-
         if user_input.lower() == "clear":
             history.clear()
             print("[对话历史已清空]\n")
             continue
 
-        if not user_input:
-            continue
-
         history.append({"role": "user", "content": user_input})
+        prompt = "\n".join(f"{m['role'].upper()}: {m['content']}" for m in history) + "\nASSISTANT:"
 
-        # 构建完整 prompt（简单拼接，不做 chat template）
-        prompt = "\n".join(
-            f"{m['role'].upper()}: {m['content']}" for m in history
-        ) + "\nASSISTANT:"
-
-        text, elapsed = generate(engine, prompt, args.max_tokens, args.temperature)
-
+        text, elapsed = generate_fn(engine, prompt, args.max_tokens, args.temperature)
         print(f"Assistant: {text}")
-        print(f"[{elapsed:.2f}s, {len(text.split()):.0f} words]\n")
-
+        print(f"[{elapsed:.2f}s]\n")
         history.append({"role": "assistant", "content": text})
 
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    return chat_loop(build_engine(args), args)
 
 
 if __name__ == "__main__":

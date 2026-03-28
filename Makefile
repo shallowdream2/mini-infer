@@ -61,7 +61,7 @@ serve-real:
 
 ## 聊天（dry-run 模式）
 chat:
-	conda run --no-capture-output -n ai-infra python quick_chat.py
+	$(PYTHON) quick_chat.py
 
 # ── Benchmark ────────────────────────────────────────────────────────
 .PHONY: bench bench-moe bench-quant
