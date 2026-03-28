@@ -9,6 +9,7 @@
 
 | 技术 | 模型 | 指标 | 数值 |
 |------|------|------|------|
+| HTTP Serving（Phase 8） | Qwen2.5-7B | 并发 1→8 吞吐 | 55.7 → **219.1 tok/s**（3.9×） |
 | True PagedAttention（Phase 6） | Qwen2.5-7B | batch=8 吞吐 vs HF | **100.0%**（406 tok/s） |
 | Chunked Prefill（Phase 9） | Qwen2.5-7B | ITL spike 降低 | **−57%**（chunk=256）/ **−67%**（chunk=128） |
 | Prefix Caching（Phase 10） | Qwen2.5-7B | 共享前缀 TTFT | **−22%** |
@@ -22,6 +23,30 @@
 | W8A8 量化（Phase 16） | Qwen2.5-1.5B | greedy token match | **71.8%** |
 | PD 解耦（Phase 15） | Qwen2.5-7B | TTFT 三段分解 | prefill 12.3ms / transfer ≈14.7ms / decode 519ms |
 | EP grouped（Phase 21） | synthetic MoE | EP / dense 吞吐比 | **2.500×** |
+
+---
+
+## HTTP Serving 吞吐（Phase 8）
+
+**测试条件：** Qwen2.5-7B-Instruct，RTX 4090，max_tokens=64，非流式并发请求
+**口径说明：** 使用 httpx.ASGITransport（进程内），TTFT 为近似值（等于整体响应延迟，非真实流式首 token 时间）
+
+| 并发数 | 总 tokens | 耗时 (s) | 吞吐 (tok/s) |
+|--------|-----------|----------|-------------|
+| 1 | 64 | 1.15 | 55.7 |
+| 2 | 128 | 1.37 | 93.1 |
+| 4 | 254 | 1.46 | 174.0 |
+| **8** | **510** | **2.33** | **219.1** |
+
+并发 1→8 吞吐提升 3.9×，体现 Continuous Batching 将多个 HTTP 请求合并进同一 decode_batch 的效果。峰值显存 18.76 GB（与 Phase 6/7 相同，HTTP 层不引入额外 GPU 内存）。
+
+**复现命令：**
+
+```bash
+HF_HUB_OFFLINE=1 python benchmarks/benchmark_server.py \
+  --model /path/to/Qwen2.5-7B-Instruct \
+  --max-tokens 64 --trials 5 --concurrency 1 2 4 8
+```
 
 ---
 

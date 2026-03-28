@@ -27,7 +27,6 @@ import time
 
 import torch
 
-
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
@@ -81,11 +80,14 @@ def main():
     head_dim    = args.head_dim
 
     from mini_infer.kernels.triton_attn import (
+        flash_decode_attention,
         reference_decode_attention,
         triton_decode_attention,
-        flash_decode_attention,
     )
-    from mini_infer.kernels.triton_flash_decode import flash_decode_triton, auto_num_splits
+    from mini_infer.kernels.triton_flash_decode import (
+        auto_num_splits,
+        flash_decode_triton,
+    )
 
     print(f"\n{'='*80}")
     print(f"Flash Decoding Benchmark — batch={batch}, "

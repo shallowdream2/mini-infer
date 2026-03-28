@@ -32,10 +32,9 @@ import time
 
 import torch
 
-from mini_infer.parallel.ep_engine import EPEngine
 from mini_infer.modeling.moe_layer import MoELayer, shard_moe_state_dict
 from mini_infer.modeling.moe_model import SyntheticMoEConfig
-
+from mini_infer.parallel.ep_engine import EPEngine
 
 _DTYPE_MAP = {
     "float16": torch.float16,

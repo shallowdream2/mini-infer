@@ -209,12 +209,18 @@ def section3_latency(model_path: str):
 
     测试条件：batch=1，seq_len=[1, 64, 256, 1024]（模拟不同长度的 decode 步骤）
     """
-    import torch
     import time
+
+    import torch
     from transformers import AutoConfig, AutoModelForCausalLM
+
     from mini_infer.modeling.mla_attention import (
-        MLAConfig, MLAAttentionNaive, MLAAttentionLatentCache,
-        MLAAttentionAbsorbed, MLAKVCacheNaive, MLAKVCacheLatent,
+        MLAAttentionAbsorbed,
+        MLAAttentionLatentCache,
+        MLAAttentionNaive,
+        MLAConfig,
+        MLAKVCacheLatent,
+        MLAKVCacheNaive,
     )
 
     print("=" * 60)

@@ -28,7 +28,6 @@ import torch
 import triton
 import triton.testing
 
-
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
@@ -100,9 +99,9 @@ def roofline_analysis(batch, seq_len, num_q_heads, num_kv_heads, head_dim):
 
 def run_benchmark(batch, seq_len, num_q_heads=28, num_kv_heads=4, head_dim=128):
     from mini_infer.kernels.triton_attn import (
-        triton_decode_attention,
         flash_decode_attention,
         reference_decode_attention,
+        triton_decode_attention,
     )
 
     device = "cuda"
@@ -171,7 +170,7 @@ def main():
     print(f"PyTorch:     {torch.__version__}")
     print(f"Triton:      {triton.__version__}")
     print(f"flash_attn:  {flash_attn.__version__}")
-    print(f"Triton decode attention benchmark（Qwen2.5-7B 参数：28Q/4KV heads, head_dim=128）")
+    print("Triton decode attention benchmark（Qwen2.5-7B 参数：28Q/4KV heads, head_dim=128）")
     print("=" * 70)
 
     batch_sizes = [args.batch_size] if args.batch_size else [1, 8]

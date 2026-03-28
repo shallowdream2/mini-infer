@@ -32,17 +32,17 @@
 import argparse
 import gc
 import time
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional
 from transformers import AutoConfig
 
-from mini_infer.core.config import EngineConfig
 from mini_infer.cache.kv_cache import KVCacheManager
+from mini_infer.core.config import EngineConfig
+from mini_infer.core.request import Request, RequestState, SamplingParams
 from mini_infer.modeling.model_runner import ModelRunner
 from mini_infer.modeling.quantization import QuantLinear
-from mini_infer.core.request import Request, RequestState, SamplingParams
-
 
 # --------------------------------------------------------------------------- #
 # 固定 prompt 集（exact match 评估用，12 条）

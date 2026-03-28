@@ -252,7 +252,7 @@ def benchmark_pp(
 
 def print_result(result: MultiGPUBenchmarkResult) -> None:
     ttft_str = f"{result.ttft_ms:.1f} ms"
-    print(f"\n========== mini-infer Phase 4 Multi-GPU Benchmark ==========")
+    print("\n========== mini-infer Phase 4 Multi-GPU Benchmark ==========")
     print(f"模式:           {result.mode}")
     print(f"模型:           {result.model_name}")
     print(f"batch_size:     {result.batch_size}")

@@ -241,7 +241,7 @@ def print_result(result: BenchmarkResult) -> None:
 def print_comparison(mini: BenchmarkResult, hf: BenchmarkResult) -> None:
     ratio = mini.throughput_tok_s / hf.throughput_tok_s * 100
     print(f"\n{'=' * 65}")
-    print(f"  Phase 6 True PagedAttention vs HF Transformers 对比")
+    print("  Phase 6 True PagedAttention vs HF Transformers 对比")
     print(f"{'=' * 65}")
     print(f"  {'指标':<20} {'mini-infer Phase 6':>20} {'HF baseline':>20}")
     print(f"  {'-' * 62}")

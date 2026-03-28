@@ -63,7 +63,6 @@ def run_scenario(engine: LLMEngine, long_prompt: str, short_prompts: list[str]) 
     # 连续记录 token 时间戳（全程）
     short_token_times: dict[str, list[float]] = {r: [] for r in rid_shorts}
     ttft_long: float | None = None
-    long_prefill_done = False
     total_tokens = 0
     t0 = time.perf_counter()
     prev_lens: dict[str, int] = {rid: 0 for rid in rid_shorts}
@@ -102,7 +101,7 @@ def run_scenario(engine: LLMEngine, long_prompt: str, short_prompts: list[str]) 
                 short_token_times[rid].extend([t_now] * inc)
             elif rid == rid_long and ttft_long is None:
                 ttft_long = t_now - t_long_start
-                long_prefill_done = True  # 此 step 完成了长请求的 prefill
+                pass  # 此 step 完成了长请求的 prefill
 
     t_end = time.perf_counter()
     total_wall = t_end - t0
@@ -110,8 +109,6 @@ def run_scenario(engine: LLMEngine, long_prompt: str, short_prompts: list[str]) 
     # ── 计算 max_itl_spike：长请求到达后、完成 prefill 前的最大 ITL ────────
     # 用 t_long_start 作为"到达时刻"插入各短请求时间线，
     # 找 t_long_start 之后直到长请求 TTFT 之前（含）的最大间隔
-    t_long_first_token = t_long_start + (ttft_long if ttft_long else 0)
-
     max_spike = 0.0
     for rid, times in short_token_times.items():
         if not times:

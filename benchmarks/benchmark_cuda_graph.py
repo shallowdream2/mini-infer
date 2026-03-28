@@ -27,7 +27,6 @@ import torch
 from mini_infer.core.config import EngineConfig
 from mini_infer.runtime.engine import LLMEngine
 
-
 PROMPTS = [
     "The quick brown fox jumps over the lazy dog.",
     "Artificial intelligence is transforming the way we work.",

@@ -195,7 +195,7 @@ def benchmark_mini_mixed(
     short_count = sum(1 for t in max_tokens_list if t <= 32)
     long_count = len(max_tokens_list) - short_count
 
-    print(f"热身中（1 条短请求，4 token）...")
+    print("热身中（1 条短请求，4 token）...")
     _ = engine.generate(prompts[:1], max_new_tokens=4)
     if torch.cuda.is_available():
         torch.cuda.synchronize()

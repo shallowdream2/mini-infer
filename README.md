@@ -1,6 +1,6 @@
 # mini-infer
 
-**LLM inference engine built from scratch** — paged KV cache, continuous batching, chunked prefill, prefix caching, speculative decoding, CUDA graph, tensor parallelism, MoE expert parallelism, and OpenAI-compatible HTTP serving. Each mechanism is independently benchmarked against HuggingFace Transformers. Core serving path reaches **100% of HF baseline throughput** at batch=8. Ships with dry-run mode (no model weights needed), `/healthz`, Docker, and CI.
+**LLM inference engine built from scratch** — paged KV cache, continuous batching, chunked prefill, prefix caching, speculative decoding, CUDA graph, tensor parallelism, MoE expert parallelism, and OpenAI-compatible HTTP serving. Each mechanism has a dedicated benchmark with quantitative results. Core serving path reaches **100% of HF baseline throughput** at batch=8. Ships with dry-run mode (no model weights needed), `/healthz`, Docker, and CI.
 
 > 从零实现的 LLM 推理引擎。核心 serving 路径（PagedAttention + Continuous Batching + OpenAI HTTP API）在 Qwen2.5-7B 达到 HF Transformers **100% 吞吐**，支持 `--dry-run` 无权重启动验证。
 

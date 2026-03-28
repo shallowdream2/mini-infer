@@ -244,7 +244,7 @@ def main() -> None:
         to_result = bench_target_only(target_engine, prompts, args.max_new_tokens)
 
         speedup = spec_result["throughput_tps"] / to_result["throughput_tps"] if to_result["throughput_tps"] > 0 else float("inf")
-        print(f"\n[对比] Spec vs. Target-only")
+        print("\n[对比] Spec vs. Target-only")
         print(f"  target-only time:  {to_result['elapsed_s']:.2f}s")
         print(f"  target-only tps:   ~{to_result['throughput_tps']:.1f}")
         print(f"  spec tps:          ~{spec_result['throughput_tps']:.1f}")

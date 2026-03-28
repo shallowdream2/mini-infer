@@ -34,7 +34,6 @@ from typing import Any
 from mini_infer.core.config import EngineConfig
 from mini_infer.runtime.engine import LLMEngine
 
-
 # ---------------------------------------------------------------------------
 # 辅助函数
 # ---------------------------------------------------------------------------
@@ -164,7 +163,7 @@ def main() -> None:
         args.block_size = 4  # dry_run 使用小 block_size
 
     print("=" * 70)
-    print(f"Phase 10 Prefix Cache Benchmark")
+    print("Phase 10 Prefix Cache Benchmark")
     print(f"  model={args.model}, dry_run={dry_run}")
     print(f"  num_gpu_blocks={args.num_gpu_blocks}, block_size={args.block_size}")
     print(f"  max_new_tokens={args.max_new_tokens}, batch_size={args.batch_size}")

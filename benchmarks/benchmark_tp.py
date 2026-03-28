@@ -38,7 +38,6 @@ import time
 
 import torch
 
-
 # ──────────────────────────────────────────────
 # 工具
 # ──────────────────────────────────────────────
@@ -141,8 +140,9 @@ def _bench_tp(
     dtype: str,
     tp_size: int = 2,
 ) -> dict:
-    from mini_infer.parallel.tp_engine import TPEngine
     from transformers import AutoTokenizer
+
+    from mini_infer.parallel.tp_engine import TPEngine
 
     engine = TPEngine(model_path=model_path, tp_size=tp_size, dtype=dtype)
     tok = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
@@ -187,6 +187,7 @@ def _run_torchrun_tp(
     Rank 0 打印 throughput + per-GPU VRAM。
     """
     import torch.distributed as dist
+
     from mini_infer.parallel.tp_model_runner import TensorParallelModelRunner
 
     dist.init_process_group(backend="nccl")
@@ -364,7 +365,6 @@ def main() -> None:
         tp_s = r.get("throughput_tok_s", 0)
         v0 = r.get("vram_gpu0_gb", 0)
         v1 = r.get("vram_gpu1_gb", 0)
-        vram_note = r.get("note_vram", "")
         vram_str0 = f"{v0:.2f} GB" if v0 > 0 else "N/A"
         vram_str1 = f"{v1:.2f} GB" if v1 > 0 else "N/A"
         print(f"{r['mode']:<12} {tp_s:>12.1f}/s {vram_str0:>12} {vram_str1:>12}")

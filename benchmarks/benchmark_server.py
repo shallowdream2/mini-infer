@@ -132,7 +132,7 @@ async def measure_single_request(
 
     # 解析 SSE
     lines = resp.text.strip().split("\n")
-    data_lines = [l[6:] for l in lines if l.startswith("data: ") and l[6:] != "[DONE]"]
+    data_lines = [line[6:] for line in lines if line.startswith("data: ") and line[6:] != "[DONE]"]
     chunks = [json.loads(d) for d in data_lines]
 
     # 统计 content 文本块
@@ -230,7 +230,7 @@ def print_single_results(results: list[SingleRequestResult]) -> None:
     tok_list = [r.output_tokens for r in results]
 
     print("\n── 单请求延迟（SSE 流式，ASGI Transport）")
-    print(f"  注意：TTFT 为近似值（ASGITransport 缓冲完整响应，无法分离首 token）")
+    print("  注意：TTFT 为近似值（ASGITransport 缓冲完整响应，无法分离首 token）")
     print(f"  样本数      : {len(results)}")
     print(f"  TTFT        : mean={sum(ttft_list)/len(ttft_list):.1f}ms  "
           f"min={min(ttft_list):.1f}ms  max={max(ttft_list):.1f}ms  [近似 = 整体延迟]")
@@ -303,7 +303,7 @@ async def run_benchmark(args: argparse.Namespace) -> None:
         print_single_results(single_results)
 
         # ── 并发吞吐 ──────────────────────────────────────────────────────────
-        print(f"\n并发吞吐测量...")
+        print("\n并发吞吐测量...")
         concurrency_levels = args.concurrency
         concurrency_results = []
         for c in concurrency_levels:
