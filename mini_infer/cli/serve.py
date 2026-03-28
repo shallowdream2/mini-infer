@@ -17,7 +17,7 @@ from mini_infer.core.config import EngineConfig
 from mini_infer.serving.server import app
 
 
-def _parse_args() -> argparse.Namespace:
+def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="mini-infer — OpenAI Chat Completions 兼容服务")
     parser.add_argument("--model", type=str, default="", help="模型目录路径")
     parser.add_argument("--host", type=str, default="0.0.0.0")
@@ -34,7 +34,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def main() -> None:
-    args = _parse_args()
+    args = parse_args()
 
     if not args.dry_run and not args.model:
         raise SystemExit("请指定 --model 或 --dry-run")
