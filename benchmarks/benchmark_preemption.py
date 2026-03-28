@@ -102,8 +102,8 @@ def bench_scheduler_latency(n_trials: int = 1000) -> None:
     """在 dry_run 模式下测量 swap_out / swap_in 调度路径的延迟（不含模型）。"""
     print("\n=== Scheduler latency（dry_run，不含模型 forward）===")
 
-    from mini_infer.kv_cache import KVCacheManager
-    from mini_infer.request import Request, RequestState, SamplingParams
+    from mini_infer.cache.kv_cache import KVCacheManager
+    from mini_infer.core.request import Request, RequestState, SamplingParams
 
     config = EngineConfig(
         model_name="stub",
@@ -287,8 +287,8 @@ def bench_gpu_swap_latency() -> None:
     """
     print("\n=== GPU Swap 真实延迟（含 tensor 拷贝，不含模型加载）===")
 
-    from mini_infer.kv_cache import KVCacheManager
-    from mini_infer.request import Request, RequestState, SamplingParams
+    from mini_infer.cache.kv_cache import KVCacheManager
+    from mini_infer.core.request import Request, RequestState, SamplingParams
 
     # 直接构建 KVCacheManager，用 7B 的实际参数（num_layers=28, num_kv_heads=4, head_dim=128）
     config = EngineConfig(

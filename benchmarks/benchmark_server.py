@@ -47,8 +47,8 @@ from asgi_lifespan import LifespanManager
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-from mini_infer.config import EngineConfig
-from mini_infer.server import app
+from mini_infer.core.config import EngineConfig
+from mini_infer.serving.server import app
 
 # ── Workload ──────────────────────────────────────────────────────────────────
 

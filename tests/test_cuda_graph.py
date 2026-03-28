@@ -10,10 +10,10 @@ Phase 12 CUDA Graph 单元测试（dry_run 路径）。
 
 import pytest
 
-from mini_infer.config import EngineConfig
-from mini_infer.engine import LLMEngine
-from mini_infer.kv_cache import KVCacheManager
-from mini_infer.model_runner import ModelRunner
+from mini_infer.core.config import EngineConfig
+from mini_infer.runtime.engine import LLMEngine
+from mini_infer.cache.kv_cache import KVCacheManager
+from mini_infer.modeling.model_runner import ModelRunner
 
 
 def _dry_runner() -> ModelRunner:

@@ -20,8 +20,8 @@ import pytest_asyncio
 import httpx
 from asgi_lifespan import LifespanManager
 
-from mini_infer.config import EngineConfig
-from mini_infer.server import app, _default_engine_config
+from mini_infer.core.config import EngineConfig
+from mini_infer.serving.server import app, _default_engine_config
 import serve
 
 

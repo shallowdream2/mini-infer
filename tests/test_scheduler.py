@@ -1,7 +1,7 @@
 """这个文件覆盖调度器的批次行为和 Phase 2 continuous batching 接口，验证等待/运行队列的状态流转。"""
 
-from mini_infer.request import Request, RequestState, SamplingParams
-from mini_infer.scheduler import Scheduler
+from mini_infer.core.request import Request, RequestState, SamplingParams
+from mini_infer.runtime.scheduler import Scheduler
 
 
 def build_state(request_id: str) -> RequestState:

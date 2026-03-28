@@ -17,7 +17,7 @@ import os
 import torch
 import pytest
 
-from mini_infer.mla_attention import (
+from mini_infer.modeling.mla_attention import (
     MLAConfig,
     MLAAttentionNaive,
     MLAAttentionLatentCache,

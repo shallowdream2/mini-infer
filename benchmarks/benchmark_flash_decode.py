@@ -80,12 +80,12 @@ def main():
     num_kv_heads = args.num_kv_heads
     head_dim    = args.head_dim
 
-    from mini_infer.triton_attn import (
+    from mini_infer.kernels.triton_attn import (
         reference_decode_attention,
         triton_decode_attention,
         flash_decode_attention,
     )
-    from mini_infer.triton_flash_decode import flash_decode_triton, auto_num_splits
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton, auto_num_splits
 
     print(f"\n{'='*80}")
     print(f"Flash Decoding Benchmark — batch={batch}, "

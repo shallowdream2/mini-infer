@@ -44,7 +44,7 @@ _MODEL_PATH_DEFAULT = os.path.expanduser(
 
 def section1_theory():
     """打印 GQA vs MLA naive vs MLA latent 的理论 KV cache 大小对比。"""
-    from mini_infer.mla_attention import compute_kv_cache_bytes
+    from mini_infer.modeling.mla_attention import compute_kv_cache_bytes
 
     print("=" * 60)
     print("Section 1：理论 KV Cache 大小对比")
@@ -212,7 +212,7 @@ def section3_latency(model_path: str):
     import torch
     import time
     from transformers import AutoConfig, AutoModelForCausalLM
-    from mini_infer.mla_attention import (
+    from mini_infer.modeling.mla_attention import (
         MLAConfig, MLAAttentionNaive, MLAAttentionLatentCache,
         MLAAttentionAbsorbed, MLAKVCacheNaive, MLAKVCacheLatent,
     )

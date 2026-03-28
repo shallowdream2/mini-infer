@@ -42,10 +42,6 @@ jobs:
           from mini_infer.kernels.attention import patch_model_for_paged_decode
           from mini_infer.modeling.model_runner import ModelRunner
           print('all canonical imports OK')
-          # backward-compat shims
-          from mini_infer.engine import LLMEngine
-          from mini_infer.config import EngineConfig
-          print('shim imports OK')
           "
 
       - name: CLI help smoke

@@ -21,13 +21,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-import mini_infer.ep_engine as ep_engine_mod
+import mini_infer.parallel.ep_engine as ep_engine_mod
 import pytest
 import torch
 import torch.nn as nn
 
 from mini_infer import EPEngine
-from mini_infer.moe_layer import (
+from mini_infer.modeling.moe_layer import (
     EPMoELayer,
     GroupedExpertMetadata,
     MoELayer,
@@ -42,7 +42,7 @@ from mini_infer.moe_layer import (
     shard_moe_state_dict,
     summarize_routing,
 )
-from mini_infer.moe_model import SyntheticMoEConfig, SyntheticMoEModel
+from mini_infer.modeling.moe_model import SyntheticMoEConfig, SyntheticMoEModel
 
 
 @dataclass

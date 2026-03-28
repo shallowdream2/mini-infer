@@ -24,8 +24,8 @@ import time
 
 import torch
 
-from mini_infer.config import EngineConfig
-from mini_infer.engine import LLMEngine
+from mini_infer.core.config import EngineConfig
+from mini_infer.runtime.engine import LLMEngine
 
 
 PROMPTS = [

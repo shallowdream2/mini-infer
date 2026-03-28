@@ -10,11 +10,11 @@ Phase 8/9 OpenAI Chat Completions 子集兼容 HTTP server。
 
 或直接通过 uvicorn：
   # 未注入 app.state.engine_config 时，默认回退到 dry_run 配置
-  uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
+  uvicorn mini_infer.serving.server:app --host 0.0.0.0 --port 8000
   # 如需真实模型，可先设置环境变量
-  MINI_INFER_MODEL=/path/to/model uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
+  MINI_INFER_MODEL=/path/to/model uvicorn mini_infer.serving.server:app --host 0.0.0.0 --port 8000
   # Phase 9：显式开启 chunked prefill
-  MINI_INFER_MODEL=/path/to/model MINI_INFER_CHUNK_PREFILL_SIZE=256 uvicorn mini_infer.server:app --host 0.0.0.0 --port 8000
+  MINI_INFER_MODEL=/path/to/model MINI_INFER_CHUNK_PREFILL_SIZE=256 uvicorn mini_infer.serving.server:app --host 0.0.0.0 --port 8000
 
 启动时全局初始化 AsyncEngine，所有请求共享同一 step loop，
 实现 continuous batching（多并发 HTTP 请求被合并进同一 decode_batch）。

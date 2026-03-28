@@ -39,9 +39,9 @@ import time
 
 import torch
 
-from mini_infer.config import EngineConfig
-from mini_infer.engine import LLMEngine
-from mini_infer.spec_engine import SpecEngine
+from mini_infer.core.config import EngineConfig
+from mini_infer.runtime.engine import LLMEngine
+from mini_infer.runtime.spec_engine import SpecEngine
 
 # ---------------------------------------------------------------------------
 # 常量 / 辅助

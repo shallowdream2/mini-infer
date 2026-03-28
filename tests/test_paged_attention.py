@@ -63,7 +63,7 @@ def test_paged_attention_matches_hf_greedy() -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     from mini_infer import EngineConfig, LLMEngine
-    from mini_infer.request import SamplingParams
+    from mini_infer.core.request import SamplingParams
 
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
 

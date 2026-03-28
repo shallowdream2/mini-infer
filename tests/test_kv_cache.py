@@ -13,9 +13,9 @@ dry_run=True 的测试不依赖 GPU；gather 和 build_block_tables 正确性测
 
 import torch
 
-from mini_infer.config import EngineConfig
-from mini_infer.kv_cache import KVCacheManager
-from mini_infer.request import Request, RequestState, SamplingParams
+from mini_infer.core.config import EngineConfig
+from mini_infer.cache.kv_cache import KVCacheManager
+from mini_infer.core.request import Request, RequestState, SamplingParams
 
 
 def _make_config(block_size: int = 4, num_gpu_blocks: int = 10) -> EngineConfig:

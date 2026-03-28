@@ -18,8 +18,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from mini_infer.quantization import QuantLinear, QuantMode, quantize_model
-from mini_infer.config import EngineConfig
+from mini_infer.modeling.quantization import QuantLinear, QuantMode, quantize_model
+from mini_infer.core.config import EngineConfig
 
 
 # --------------------------------------------------------------------------- #

@@ -65,9 +65,9 @@ def section2_gpu_equivalence():
     import os
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-    from mini_infer.config import EngineConfig
-    from mini_infer.engine import LLMEngine
-    from mini_infer.pd_engine import PDEngine
+    from mini_infer.core.config import EngineConfig
+    from mini_infer.runtime.engine import LLMEngine
+    from mini_infer.runtime.pd_engine import PDEngine
 
     MODEL = "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
     MODEL = os.path.expanduser(MODEL)
@@ -128,9 +128,9 @@ def section3_timing():
     import os
     os.environ["HF_HUB_OFFLINE"] = "1"
 
-    from mini_infer.config import EngineConfig
-    from mini_infer.engine import LLMEngine
-    from mini_infer.pd_engine import PDEngine
+    from mini_infer.core.config import EngineConfig
+    from mini_infer.runtime.engine import LLMEngine
+    from mini_infer.runtime.pd_engine import PDEngine
 
     MODEL = "~/.cache/huggingface/hub/models--Qwen--Qwen2.5-1.5B-Instruct/snapshots/989aa7980e4cf806f80c7fef2b1adb7bc71aa306"
     MODEL = os.path.expanduser(MODEL)

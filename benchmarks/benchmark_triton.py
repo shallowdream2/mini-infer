@@ -99,7 +99,7 @@ def roofline_analysis(batch, seq_len, num_q_heads, num_kv_heads, head_dim):
 # ---------------------------------------------------------------------------
 
 def run_benchmark(batch, seq_len, num_q_heads=28, num_kv_heads=4, head_dim=128):
-    from mini_infer.triton_attn import (
+    from mini_infer.kernels.triton_attn import (
         triton_decode_attention,
         flash_decode_attention,
         reference_decode_attention,

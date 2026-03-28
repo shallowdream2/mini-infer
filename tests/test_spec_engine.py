@@ -14,10 +14,10 @@ import math
 
 import torch
 
-from mini_infer.config import EngineConfig
-from mini_infer.kv_cache import KVCacheManager
-from mini_infer.request import Request, RequestState, SamplingParams
-from mini_infer.spec_engine import SpecEngine, _rejection_sample, _softmax
+from mini_infer.core.config import EngineConfig
+from mini_infer.cache.kv_cache import KVCacheManager
+from mini_infer.core.request import Request, RequestState, SamplingParams
+from mini_infer.runtime.spec_engine import SpecEngine, _rejection_sample, _softmax
 
 
 # ---------------------------------------------------------------------------

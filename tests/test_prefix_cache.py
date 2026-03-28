@@ -13,10 +13,10 @@ Phase 10 Prefix Cache 测试。
 
 from __future__ import annotations
 
-from mini_infer.config import EngineConfig
-from mini_infer.engine import LLMEngine
-from mini_infer.kv_cache import KVCacheManager
-from mini_infer.request import Request, RequestState, SamplingParams
+from mini_infer.core.config import EngineConfig
+from mini_infer.runtime.engine import LLMEngine
+from mini_infer.cache.kv_cache import KVCacheManager
+from mini_infer.core.request import Request, RequestState, SamplingParams
 
 
 # ---------------------------------------------------------------------------

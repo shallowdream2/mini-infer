@@ -16,8 +16,8 @@ import asyncio
 
 import pytest
 
-from mini_infer.async_engine import AsyncEngine
-from mini_infer.config import EngineConfig
+from mini_infer.runtime.async_engine import AsyncEngine
+from mini_infer.core.config import EngineConfig
 
 
 def _make_engine() -> AsyncEngine:

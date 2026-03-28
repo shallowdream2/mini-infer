@@ -10,11 +10,11 @@ from __future__ import annotations
 import torch.nn as nn
 import transformers
 
-import mini_infer.attention as attention_mod
-import mini_infer.quantization as quant_mod
-from mini_infer.config import EngineConfig
-from mini_infer.kv_cache import KVCacheManager
-from mini_infer.model_runner import ModelRunner
+import mini_infer.kernels.attention as attention_mod
+import mini_infer.modeling.quantization as quant_mod
+from mini_infer.core.config import EngineConfig
+from mini_infer.cache.kv_cache import KVCacheManager
+from mini_infer.modeling.model_runner import ModelRunner
 
 
 class _FakeTokenizer:

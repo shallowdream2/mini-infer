@@ -22,8 +22,8 @@ import pytest
 import torch
 import torch.nn as nn
 
-from mini_infer.quantization import QuantLinear
-from mini_infer.request import RequestState
+from mini_infer.modeling.quantization import QuantLinear
+from mini_infer.core.request import RequestState
 
 
 _MODULE_PATH = Path(__file__).resolve().parents[1] / "benchmarks" / "benchmark_quant.py"

@@ -33,12 +33,12 @@ def make_qkv(batch, seq_len, num_q_heads, num_kv_heads, head_dim=128, device="cu
 
 def test_import():
     """模块可以正常导入。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton, auto_num_splits  # noqa: F401
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton, auto_num_splits  # noqa: F401
 
 
 def test_auto_num_splits_basic():
     """auto_num_splits 在合理范围内。"""
-    from mini_infer.triton_flash_decode import auto_num_splits
+    from mini_infer.kernels.triton_flash_decode import auto_num_splits
 
     # seq_len=64：每 split 最少 BLOCK_N=64 tokens → max_splits=1
     assert auto_num_splits(64, 12, batch=1) == 1
@@ -61,7 +61,7 @@ def test_auto_num_splits_basic():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_output_shape():
     """输出 shape 与 q 相同。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
 
     q, k, v = make_qkv(2, 256, 12, 2)
     out = flash_decode_triton(q, k, v, num_splits=4)
@@ -72,8 +72,8 @@ def test_output_shape():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_num_splits_1_matches_reference():
     """num_splits=1 时，结果与 reference_decode_attention 的差异 < 1e-3。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     q, k, v = make_qkv(1, 512, 12, 2)
     out_fd  = flash_decode_triton(q, k, v, num_splits=1)
@@ -96,8 +96,8 @@ def test_num_splits_1_matches_reference():
 ])
 def test_correctness_vs_reference(seq_len, num_splits):
     """各 (seq_len, num_splits) 组合，max_diff < 1e-2 vs reference。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     q, k, v = make_qkv(1, seq_len, 12, 2)
     out_fd  = flash_decode_triton(q, k, v, num_splits=num_splits)
@@ -115,8 +115,8 @@ def test_correctness_vs_reference(seq_len, num_splits):
 ])
 def test_correctness_vs_flash_attn(seq_len, num_splits):
     """max_diff < 1e-2 vs flash_attn_with_kvcache。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import flash_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import flash_decode_attention
 
     q, k, v = make_qkv(1, seq_len, 12, 2)
     out_fd    = flash_decode_triton(q, k, v, num_splits=num_splits)
@@ -129,8 +129,8 @@ def test_correctness_vs_flash_attn(seq_len, num_splits):
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_gqa_num_q_ne_kv():
     """GQA：num_q_heads(28) != num_kv_heads(4) 时正确。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     q, k, v = make_qkv(1, 512, 28, 4)
     out_fd  = flash_decode_triton(q, k, v, num_splits=4)
@@ -143,8 +143,8 @@ def test_gqa_num_q_ne_kv():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_batch_size_gt1():
     """batch > 1 时输出正确。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     q, k, v = make_qkv(4, 512, 12, 2)
     out_fd  = flash_decode_triton(q, k, v, num_splits=4)
@@ -157,8 +157,8 @@ def test_batch_size_gt1():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_kv_per_split_less_than_block_n():
     """kv_per_split < BLOCK_N 时最后一块稀疏 mask 仍正确。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     # seq_len=64, num_splits=8 → kv_per_split=8 < BLOCK_N=64，每个循环只有 8 个有效 token
     # 每个 split 都非空，但 block 内大部分 token 被 mask
@@ -173,8 +173,8 @@ def test_kv_per_split_less_than_block_n():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_truly_empty_splits():
     """split_start >= seq_len 的空 split 不影响输出（写 lse=-1e38，权重接近 0）。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     # seq_len=64, num_splits=9 → kv_per_split=ceil(64/9)=8
     # split 8: split_start=64, split_end=min(72,64)=64 → 空 split（split_start==split_end）
@@ -189,8 +189,8 @@ def test_truly_empty_splits():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_seq_len_not_divisible_by_block_n():
     """seq_len 非 BLOCK_N(=64) 整除时，最后一个 partial block 的 masking 正确。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     for seq_len in [100, 513, 1000]:
         q, k, v = make_qkv(1, seq_len, 12, 2)
@@ -203,8 +203,8 @@ def test_seq_len_not_divisible_by_block_n():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="需要 CUDA")
 def test_auto_num_splits_integration():
     """使用 auto_num_splits 默认路径（num_splits=None）结果正确。"""
-    from mini_infer.triton_flash_decode import flash_decode_triton
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_flash_decode import flash_decode_triton
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     q, k, v = make_qkv(1, 2048, 12, 2)
     out_fd  = flash_decode_triton(q, k, v)          # num_splits=None → 自动

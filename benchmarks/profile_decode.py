@@ -29,7 +29,7 @@ import torch
 from torch.profiler import ProfilerActivity, profile
 
 from mini_infer import LLMEngine
-from mini_infer.config import EngineConfig
+from mini_infer.core.config import EngineConfig
 
 _PROMPTS = [
     "The future of large language model inference is",

@@ -18,16 +18,16 @@ from multiprocessing import Queue
 import torch
 from transformers import DynamicCache
 
-from mini_infer.config import EngineConfig
-from mini_infer.kv_transfer import (
+from mini_infer.core.config import EngineConfig
+from mini_infer.cache.kv_transfer import (
     KVPayload,
     KVReceiver,
     KVSender,
     extract_kv_from_past,
     measure_kv_size_bytes,
 )
-from mini_infer.pd_engine import PDEngine
-from mini_infer.pd_worker import (
+from mini_infer.runtime.pd_engine import PDEngine
+from mini_infer.runtime.pd_worker import (
     DecodeResult,
     PrefillRequest,
     _rebuild_dynamic_cache,

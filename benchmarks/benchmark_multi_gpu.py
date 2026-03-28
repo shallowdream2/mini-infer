@@ -24,8 +24,8 @@ from dataclasses import dataclass
 import torch
 
 from mini_infer import EngineConfig, LLMEngine
-from mini_infer.pp_engine import PPEngine
-from mini_infer.replica_engine import ReplicaEngine
+from mini_infer.parallel.pp_engine import PPEngine
+from mini_infer.parallel.replica_engine import ReplicaEngine
 
 # 与 benchmark_mini.py 保持一致的 prompt 集合（8 条）
 PROMPTS = [

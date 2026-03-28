@@ -33,7 +33,7 @@ def _rand_qkv(batch, seq_len, num_q_heads, num_kv_heads, head_dim, device):
 
 def test_import():
     """无 GPU 可以跑：验证三个公开函数均可导入。"""
-    from mini_infer.triton_attn import (
+    from mini_infer.kernels.triton_attn import (
         triton_decode_attention,
         reference_decode_attention,
         flash_decode_attention,
@@ -45,7 +45,7 @@ def test_import():
 
 def test_reference_cpu():
     """无 GPU 可以跑：reference_decode_attention 在 CPU float32 上应能运行。"""
-    from mini_infer.triton_attn import reference_decode_attention
+    from mini_infer.kernels.triton_attn import reference_decode_attention
 
     q = torch.randn(2, 1, 4, 128, dtype=torch.float32)
     k = torch.randn(2, 16, 2, 128, dtype=torch.float32)
@@ -68,7 +68,7 @@ gpu_only = pytest.mark.skipif(
 @gpu_only
 def test_vs_reference_basic():
     """Triton kernel vs PyTorch reference，标准 GQA 配置，max_diff < 1e-2。"""
-    from mini_infer.triton_attn import triton_decode_attention, reference_decode_attention
+    from mini_infer.kernels.triton_attn import triton_decode_attention, reference_decode_attention
 
     batch, seq_len = 2, 128
     num_q_heads, num_kv_heads, head_dim = 28, 4, 128
@@ -88,7 +88,7 @@ def test_vs_reference_basic():
 @gpu_only
 def test_vs_flash():
     """Triton kernel vs flash_attn_with_kvcache，max_diff < 1e-2。"""
-    from mini_infer.triton_attn import triton_decode_attention, flash_decode_attention
+    from mini_infer.kernels.triton_attn import triton_decode_attention, flash_decode_attention
 
     batch, seq_len = 2, 256
     num_q_heads, num_kv_heads, head_dim = 28, 4, 128
@@ -107,7 +107,7 @@ def test_vs_flash():
 @gpu_only
 def test_gqa_qwen_config():
     """Qwen2.5-7B 真实配置：28 Q heads / 4 KV heads / head_dim=128。"""
-    from mini_infer.triton_attn import triton_decode_attention, reference_decode_attention
+    from mini_infer.kernels.triton_attn import triton_decode_attention, reference_decode_attention
 
     batch, seq_len = 1, 512
     num_q_heads, num_kv_heads, head_dim = 28, 4, 128
@@ -126,7 +126,7 @@ def test_gqa_qwen_config():
 @gpu_only
 def test_batch8():
     """batch=8，验证批处理独立性（逐 sample 与 batch=1 结果一致）。"""
-    from mini_infer.triton_attn import triton_decode_attention
+    from mini_infer.kernels.triton_attn import triton_decode_attention
 
     batch, seq_len = 8, 128
     num_q_heads, num_kv_heads, head_dim = 28, 4, 128
@@ -148,7 +148,7 @@ def test_batch8():
 @gpu_only
 def test_long_seq():
     """seq_len=2048，验证跨 32 个 BLOCK_N=64 块的迭代正确性。"""
-    from mini_infer.triton_attn import triton_decode_attention, reference_decode_attention
+    from mini_infer.kernels.triton_attn import triton_decode_attention, reference_decode_attention
 
     batch, seq_len = 1, 2048
     num_q_heads, num_kv_heads, head_dim = 28, 4, 128
@@ -167,7 +167,7 @@ def test_long_seq():
 @gpu_only
 def test_seq_not_multiple_of_block():
     """seq_len=100（非 BLOCK_N=64 整倍数），验证 padding 掩码正确。"""
-    from mini_infer.triton_attn import triton_decode_attention, reference_decode_attention
+    from mini_infer.kernels.triton_attn import triton_decode_attention, reference_decode_attention
 
     batch, seq_len = 2, 100
     num_q_heads, num_kv_heads, head_dim = 4, 4, 128

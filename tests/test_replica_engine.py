@@ -12,9 +12,9 @@ Phase 4 ReplicaEngine 和 PPEngine 的单元测试。覆盖范围：
 
 import pytest
 
-from mini_infer.config import EngineConfig
-from mini_infer.pp_engine import PPEngine
-from mini_infer.replica_engine import ReplicaEngine
+from mini_infer.core.config import EngineConfig
+from mini_infer.parallel.pp_engine import PPEngine
+from mini_infer.parallel.replica_engine import ReplicaEngine
 
 
 def _make_config(device: str) -> EngineConfig:

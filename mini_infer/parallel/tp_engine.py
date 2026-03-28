@@ -5,7 +5,7 @@ Phase 13 真正的 Tensor Parallel 引擎（旧接口已被替换）。
   原 tp_engine.py 是 PPEngine 的别名（device_map="balanced"），实现的是
   Pipeline Parallel（PP）而非真正的 Tensor Parallel（TP）。
   Phase 13 将此文件重写为真 TP 引擎（Megatron-LM 风格，NCCL all-reduce）。
-  如需 PP 功能，请直接使用 mini_infer.pp_engine.PPEngine。
+  如需 PP 功能，请直接使用 mini_infer.parallel.pp_engine.PPEngine。
 
 TPEngine 使用方式：
     engine = TPEngine(
@@ -55,7 +55,7 @@ def _tp_worker(
     所有 rank 同时执行 generate()；all-reduce hook 保证各 rank forward 同步。
     只有 rank 0 把结果写入 result_file（JSON）。
     """
-    from mini_infer.tp_model_runner import TensorParallelModelRunner
+    from mini_infer.parallel.tp_model_runner import TensorParallelModelRunner
 
     init_method = f"file://{rendezvous_file}"
     dist.init_process_group(

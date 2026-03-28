@@ -141,7 +141,7 @@ def _bench_tp(
     dtype: str,
     tp_size: int = 2,
 ) -> dict:
-    from mini_infer.tp_engine import TPEngine
+    from mini_infer.parallel.tp_engine import TPEngine
     from transformers import AutoTokenizer
 
     engine = TPEngine(model_path=model_path, tp_size=tp_size, dtype=dtype)
@@ -187,7 +187,7 @@ def _run_torchrun_tp(
     Rank 0 打印 throughput + per-GPU VRAM。
     """
     import torch.distributed as dist
-    from mini_infer.tp_model_runner import TensorParallelModelRunner
+    from mini_infer.parallel.tp_model_runner import TensorParallelModelRunner
 
     dist.init_process_group(backend="nccl")
     rank = dist.get_rank()

@@ -141,7 +141,7 @@ class ModelRunner:
 
             # Phase 16：W8A8 量化（quant_mode="w8a8" 时原地替换 MLP 线性层）
             if config.quant_mode == "w8a8":
-                import mini_infer.quantization as _quant_mod
+                import mini_infer.modeling.quantization as _quant_mod
                 import torch.nn as _nn
                 _n_before = sum(1 for _, m in self.model.named_modules() if isinstance(m, _nn.Linear))
                 _quant_mod.quantize_model(self.model)
@@ -152,7 +152,7 @@ class ModelRunner:
                 )
 
             # Phase 6：永久 patch attention 层，decode 时走 paged attention 路径
-            import mini_infer.attention as _attn_mod
+            import mini_infer.kernels.attention as _attn_mod
             self._paged_ctx = _attn_mod.patch_model_for_paged_decode(self.model, self.kv_cache)
 
         # Phase 12：CUDA Graph pool（batch_size → CUDAGraph）和静态 buffer

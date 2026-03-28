@@ -21,7 +21,7 @@ import pytest
 
 
 def test_col_shard_shape():
-    from mini_infer.tp_model_runner import col_shard
+    from mini_infer.parallel.tp_model_runner import col_shard
 
     w = torch.randn(8, 4)
     s0 = col_shard(w, 0, 2)
@@ -31,7 +31,7 @@ def test_col_shard_shape():
 
 
 def test_col_shard_reconstruct():
-    from mini_infer.tp_model_runner import col_shard
+    from mini_infer.parallel.tp_model_runner import col_shard
 
     w = torch.randn(8, 4)
     s0 = col_shard(w, 0, 2)
@@ -40,7 +40,7 @@ def test_col_shard_reconstruct():
 
 
 def test_row_shard_shape():
-    from mini_infer.tp_model_runner import row_shard
+    from mini_infer.parallel.tp_model_runner import row_shard
 
     w = torch.randn(4, 8)
     r0 = row_shard(w, 0, 2)
@@ -50,7 +50,7 @@ def test_row_shard_shape():
 
 
 def test_row_shard_reconstruct():
-    from mini_infer.tp_model_runner import row_shard
+    from mini_infer.parallel.tp_model_runner import row_shard
 
     w = torch.randn(4, 8)
     r0 = row_shard(w, 0, 2)
@@ -59,7 +59,7 @@ def test_row_shard_reconstruct():
 
 
 def test_col_shard_not_divisible():
-    from mini_infer.tp_model_runner import col_shard
+    from mini_infer.parallel.tp_model_runner import col_shard
 
     w = torch.randn(5, 4)
     with pytest.raises(ValueError, match="整除"):
@@ -67,7 +67,7 @@ def test_col_shard_not_divisible():
 
 
 def test_row_shard_not_divisible():
-    from mini_infer.tp_model_runner import row_shard
+    from mini_infer.parallel.tp_model_runner import row_shard
 
     w = torch.randn(4, 5)
     with pytest.raises(ValueError, match="整除"):
@@ -81,7 +81,7 @@ def test_row_shard_not_divisible():
 
 def test_tp2_colrow_math_equivalence():
     """TP=2 的 column → row parallel 计算结果与全量 matmul 等价。"""
-    from mini_infer.tp_model_runner import col_shard, row_shard
+    from mini_infer.parallel.tp_model_runner import col_shard, row_shard
 
     torch.manual_seed(42)
     in_dim, mid_dim, out_dim = 8, 6, 4
@@ -107,7 +107,7 @@ def test_tp2_colrow_math_equivalence():
 
 def test_tp1_identity():
     """TP=1 时 col_shard 和 row_shard 返回完整权重。"""
-    from mini_infer.tp_model_runner import col_shard, row_shard
+    from mini_infer.parallel.tp_model_runner import col_shard, row_shard
 
     w = torch.randn(6, 4)
     assert torch.allclose(col_shard(w, 0, 1), w)
@@ -170,7 +170,7 @@ def _make_tiny_model() -> _TinyModel:
 
 def test_shard_weight_shapes_rank0():
     """rank=0 的权重切分后形状符合预期（TP=2）。"""
-    from mini_infer.tp_model_runner import _shard_qwen2_weights
+    from mini_infer.parallel.tp_model_runner import _shard_qwen2_weights
 
     model = _make_tiny_model()
     attn = model.model.layers[0].self_attn
@@ -200,7 +200,7 @@ def test_shard_weight_shapes_rank0():
 
 def test_shard_bias_shapes():
     """q/k/v bias 也随权重一起被 col_shard。"""
-    from mini_infer.tp_model_runner import _shard_qwen2_weights
+    from mini_infer.parallel.tp_model_runner import _shard_qwen2_weights
 
     model = _make_tiny_model()
     q_bias_len = model.model.layers[0].self_attn.q_proj.bias.shape[0]
@@ -213,7 +213,7 @@ def test_shard_bias_shapes():
 
 def test_shard_attn_attrs_updated():
     """权重切分后 attn 的 num_heads / hidden_size 等属性已正确更新。"""
-    from mini_infer.tp_model_runner import _shard_qwen2_weights
+    from mini_infer.parallel.tp_model_runner import _shard_qwen2_weights
 
     model = _make_tiny_model()
     attn = model.model.layers[0].self_attn
@@ -243,7 +243,7 @@ def test_tp2_linear_forward_with_mocked_allreduce():
       3. mock all_reduce 为手动 in-place 加法（模拟两 rank 的归约）
       4. 验证 tp_out ≈ full_out
     """
-    from mini_infer.tp_model_runner import col_shard, row_shard
+    from mini_infer.parallel.tp_model_runner import col_shard, row_shard
 
     torch.manual_seed(7)
     batch, in_d, mid_d, out_d = 3, 16, 12, 8
@@ -274,7 +274,7 @@ def test_tp2_linear_forward_with_mocked_allreduce():
 
 def test_row_parallel_bias_only_rank0():
     """row parallel 层 bias 只在 rank 0 保留，rank 1 清零。"""
-    from mini_infer.tp_model_runner import _shard_qwen2_weights
+    from mini_infer.parallel.tp_model_runner import _shard_qwen2_weights
 
     # 手动给 o_proj 加上 bias 来测试
     model = _make_tiny_model()

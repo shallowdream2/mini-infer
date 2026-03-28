@@ -30,9 +30,9 @@ import math
 import pytest
 
 from mini_infer import EngineConfig, LLMEngine
-from mini_infer.kv_cache import KVCacheManager
-from mini_infer.request import Request, RequestState, SamplingParams
-from mini_infer.scheduler import Scheduler
+from mini_infer.cache.kv_cache import KVCacheManager
+from mini_infer.core.request import Request, RequestState, SamplingParams
+from mini_infer.runtime.scheduler import Scheduler
 
 
 # ---------------------------------------------------------------------------

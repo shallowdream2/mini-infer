@@ -17,7 +17,7 @@ TP 切分方式（以 Qwen2.5 TP=2 为例）：
     rank 1: 14 Q heads（1792 dim），2 KV heads（256 dim）
     每卡权重约 9.1 GB（原 18.2 GB 的 50%）
 
-不依赖 mini_infer.attention 的 paged attention patch；
+不依赖 mini_infer.kernels.attention 的 paged attention patch；
 使用标准 HF DynamicCache 做 KV cache（不集成 Paged KV，专注 TP 正确性验证）。
 使用 attn_implementation='flash_attention_2' 确保正确输出（eager 在 transformers 4.43.4 有 mask bug）。
 """
