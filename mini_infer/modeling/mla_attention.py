@@ -37,13 +37,12 @@ DeepSeek-V2-Lite 超参（来自 config.json）：
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 
 # ──────────────────────────────────────────────
 # 配置

@@ -23,10 +23,9 @@ from typing import Any
 import torch
 from transformers import DynamicCache
 
-from ..core.config import EngineConfig
 from ..cache.kv_transfer import KVPayload, KVSender, extract_kv_from_past
+from ..core.config import EngineConfig
 from ..core.request import SamplingParams
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 消息类型

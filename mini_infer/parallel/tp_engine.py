@@ -33,7 +33,6 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-
 # ──────────────────────────────────────────────
 # Worker 函数（每个 rank 进程运行）
 # ──────────────────────────────────────────────

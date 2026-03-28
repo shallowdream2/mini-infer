@@ -34,12 +34,12 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
-from ..runtime.async_engine import AsyncEngine
 from ..core.config import EngineConfig
+from ..runtime.async_engine import AsyncEngine
 from .openai_schema import (
+    ChatCompletionChoice,
     ChatCompletionChunk,
     ChatCompletionChunkChoice,
-    ChatCompletionChoice,
     ChatCompletionMessage,
     ChatCompletionRequest,
     ChatCompletionResponse,

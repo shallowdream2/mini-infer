@@ -32,10 +32,10 @@ Phase 9 新增：Chunked Prefill（chunk_prefill_size > 0 时启用）：
 import math
 from uuid import uuid4
 
-from ..core.config import EngineConfig
 from ..cache.kv_cache import KVCacheManager
-from ..modeling.model_runner import ModelRunner
+from ..core.config import EngineConfig
 from ..core.request import Request, RequestState, SamplingParams
+from ..modeling.model_runner import ModelRunner
 from .scheduler import Scheduler
 
 

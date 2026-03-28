@@ -17,11 +17,11 @@ FP8 与 Triton INT8 GEMM 作为后续扩展，不计入本阶段。
 
 from __future__ import annotations
 
+from enum import Enum
+from typing import ClassVar, Optional
+
 import torch
 import torch.nn as nn
-from enum import Enum
-from typing import ClassVar
-from typing import Optional
 
 
 class QuantMode(str, Enum):

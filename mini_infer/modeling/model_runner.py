@@ -56,8 +56,8 @@ import math
 import torch
 from transformers import DynamicCache
 
-from ..core.config import EngineConfig
 from ..cache.kv_cache import KVCacheManager
+from ..core.config import EngineConfig
 from ..core.request import RequestState, SamplingParams
 
 
@@ -141,8 +141,9 @@ class ModelRunner:
 
             # Phase 16：W8A8 量化（quant_mode="w8a8" 时原地替换 MLP 线性层）
             if config.quant_mode == "w8a8":
-                import mini_infer.modeling.quantization as _quant_mod
                 import torch.nn as _nn
+
+                import mini_infer.modeling.quantization as _quant_mod
                 _n_before = sum(1 for _, m in self.model.named_modules() if isinstance(m, _nn.Linear))
                 _quant_mod.quantize_model(self.model)
                 _n_after = sum(1 for _, m in self.model.named_modules() if isinstance(m, _quant_mod.QuantLinear))
@@ -217,7 +218,6 @@ class ModelRunner:
                 state.mark_finished("length")
             return
 
-        prompt_len = len(state.prompt_token_ids)
         suffix_ids = state.prompt_token_ids[cached_len:]
 
         # 从 block tensor 重建前缀 KV（DynamicCache 格式）

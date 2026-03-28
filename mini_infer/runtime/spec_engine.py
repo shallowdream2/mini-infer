@@ -34,15 +34,14 @@ v1 局限性（设计文档中已说明）：
 
 from __future__ import annotations
 
-import math
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import torch
 
 from ..core.config import EngineConfig
-from .engine import LLMEngine
 from ..core.request import Request, RequestState, SamplingParams
+from .engine import LLMEngine
 
 if TYPE_CHECKING:
     from ..modeling.model_runner import ModelRunner

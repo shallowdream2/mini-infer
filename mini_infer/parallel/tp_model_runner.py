@@ -24,13 +24,11 @@ TP 切分方式（以 Qwen2.5 TP=2 为例）：
 
 from __future__ import annotations
 
-import os
 from typing import Optional
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-
 
 # ──────────────────────────────────────────────
 # 工具函数：权重切分

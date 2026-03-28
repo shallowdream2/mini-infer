@@ -302,10 +302,10 @@ class KVCacheManager:
 
         block_table = self._block_tables[request_id]
 
-        for l in range(self.num_layers):
+        for li in range(self.num_layers):
             # k: [1, num_kv_heads, prompt_len, head_dim] → squeeze → permute → [prompt_len, heads, dim]
-            k = past_key_values[l][0][0].permute(1, 0, 2)  # [prompt_len, num_kv_heads, head_dim]
-            v = past_key_values[l][1][0].permute(1, 0, 2)
+            k = past_key_values[li][0][0].permute(1, 0, 2)  # [prompt_len, num_kv_heads, head_dim]
+            v = past_key_values[li][1][0].permute(1, 0, 2)
 
             for blk_idx, phys_blk in enumerate(block_table):
                 start = blk_idx * self.block_size
@@ -313,8 +313,8 @@ class KVCacheManager:
                 n = end - start
                 if n <= 0:
                     break
-                self.k_cache[l][phys_blk, :n] = k[start:end]
-                self.v_cache[l][phys_blk, :n] = v[start:end]
+                self.k_cache[li][phys_blk, :n] = k[start:end]
+                self.v_cache[li][phys_blk, :n] = v[start:end]
 
     # ------------------------------------------------------------------
     # KV 读取（decode 阶段：gather 用于 batch forward）
@@ -387,11 +387,11 @@ class KVCacheManager:
         k_batch: list[torch.Tensor] = []
         v_batch: list[torch.Tensor] = []
 
-        for l in range(self.num_layers):
-            # k_cache[l]: [num_gpu_blocks, block_size, num_kv_heads, head_dim]
+        for li in range(self.num_layers):
+            # k_cache[li]: [num_gpu_blocks, block_size, num_kv_heads, head_dim]
             # advanced indexing → [batch, max_seq_len, num_kv_heads, head_dim]
-            k_tokens = self.k_cache[l][phys_blocks, slot_indices] * valid_mask_f
-            v_tokens = self.v_cache[l][phys_blocks, slot_indices] * valid_mask_f
+            k_tokens = self.k_cache[li][phys_blocks, slot_indices] * valid_mask_f
+            v_tokens = self.v_cache[li][phys_blocks, slot_indices] * valid_mask_f
             # permute → [batch, num_kv_heads, max_seq_len, head_dim]
             k_batch.append(k_tokens.permute(0, 2, 1, 3))
             v_batch.append(v_tokens.permute(0, 2, 1, 3))
@@ -411,7 +411,7 @@ class KVCacheManager:
         """
         把 decode forward 输出的新 token KV 写回 block tensor，并递增 seq_len。
 
-        k_new_layers[l] shape: [batch, num_kv_heads, head_dim]
+        k_new_layers[li] shape: [batch, num_kv_heads, head_dim]
         dry_run 模式或 k_new_layers=None 时，仅更新块管理元数据（seq_len + 块分配）。
         """
         for b, rid in enumerate(request_ids):
@@ -425,10 +425,10 @@ class KVCacheManager:
             if not self._dry_run and k_new_layers is not None:
                 slot_idx = token_pos % self.block_size
                 phys_blk = self._block_tables[rid][block_idx]
-                for l in range(self.num_layers):
-                    # k_new_layers[l][b] shape: [num_kv_heads, head_dim]
-                    self.k_cache[l][phys_blk, slot_idx] = k_new_layers[l][b]
-                    self.v_cache[l][phys_blk, slot_idx] = v_new_layers[l][b]  # type: ignore[index]
+                for li in range(self.num_layers):
+                    # k_new_layers[li][b] shape: [num_kv_heads, head_dim]
+                    self.k_cache[li][phys_blk, slot_idx] = k_new_layers[li][b]
+                    self.v_cache[li][phys_blk, slot_idx] = v_new_layers[li][b]  # type: ignore[index]
 
             self._seq_lens[rid] += 1
 
@@ -453,7 +453,7 @@ class KVCacheManager:
             block_table = self._block_tables[request_id]
             kv_dtype = self.k_cache[0].dtype  # 保持与 GPU cache 相同的 dtype（fp16/bf16），避免 2× 内存浪费
             cpu_kv: list[tuple[torch.Tensor, torch.Tensor]] = []
-            for l in range(self.num_layers):
+            for li in range(self.num_layers):
                 k_cpu = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=kv_dtype)
                 v_cpu = torch.zeros(seq_len, self.num_kv_heads, self.head_dim, dtype=kv_dtype)
                 for blk_idx, phys_blk in enumerate(block_table):
@@ -462,8 +462,8 @@ class KVCacheManager:
                     n = end - start
                     if n <= 0:
                         break
-                    k_cpu[start:end] = self.k_cache[l][phys_blk, :n].cpu()
-                    v_cpu[start:end] = self.v_cache[l][phys_blk, :n].cpu()
+                    k_cpu[start:end] = self.k_cache[li][phys_blk, :n].cpu()
+                    v_cpu[start:end] = self.v_cache[li][phys_blk, :n].cpu()
                 cpu_kv.append((k_cpu, v_cpu))
             state.cpu_kv = cpu_kv
 
@@ -492,16 +492,16 @@ class KVCacheManager:
 
         if not self._dry_run and state.cpu_kv is not None:
             block_table = self._block_tables[request_id]
-            for l in range(self.num_layers):
-                k_cpu, v_cpu = state.cpu_kv[l]
+            for li in range(self.num_layers):
+                k_cpu, v_cpu = state.cpu_kv[li]
                 for blk_idx, phys_blk in enumerate(block_table):
                     start = blk_idx * self.block_size
                     end = min(start + self.block_size, seq_len)
                     n = end - start
                     if n <= 0:
                         break
-                    self.k_cache[l][phys_blk, :n] = k_cpu[start:end].to(self.device)
-                    self.v_cache[l][phys_blk, :n] = v_cpu[start:end].to(self.device)
+                    self.k_cache[li][phys_blk, :n] = k_cpu[start:end].to(self.device)
+                    self.v_cache[li][phys_blk, :n] = v_cpu[start:end].to(self.device)
 
         state.cpu_kv = None
 
@@ -652,7 +652,7 @@ class KVCacheManager:
         把 prefill 输出的 past_key_values 中后缀部分（cached_len 之后）写入 block tensor。
 
         前 cached_len 个 token 的 KV 已在共享 block 中，跳过不写，避免覆盖共享数据。
-        past_key_values[l] 形状：(k[1, kv_heads, prompt_len, head_dim],
+        past_key_values[li] 形状：(k[1, kv_heads, prompt_len, head_dim],
                                    v[1, kv_heads, prompt_len, head_dim])
         """
         if self._dry_run:
@@ -663,9 +663,9 @@ class KVCacheManager:
         # 新块从这个索引开始（cached_len 是 block_size 整数倍）
         first_new_block_idx = cached_len // self.block_size
 
-        for l in range(self.num_layers):
-            k = past_key_values[l][0][0].permute(1, 0, 2)  # [prompt_len, kv_heads, head_dim]
-            v = past_key_values[l][1][0].permute(1, 0, 2)
+        for li in range(self.num_layers):
+            k = past_key_values[li][0][0].permute(1, 0, 2)  # [prompt_len, kv_heads, head_dim]
+            v = past_key_values[li][1][0].permute(1, 0, 2)
             for blk_idx in range(first_new_block_idx, len(block_table)):
                 phys_blk = block_table[blk_idx]
                 start = blk_idx * self.block_size
@@ -673,15 +673,15 @@ class KVCacheManager:
                 n = end - start
                 if n <= 0:
                     break
-                self.k_cache[l][phys_blk, :n] = k[start:end]
-                self.v_cache[l][phys_blk, :n] = v[start:end]
+                self.k_cache[li][phys_blk, :n] = k[start:end]
+                self.v_cache[li][phys_blk, :n] = v[start:end]
 
     def get_prefix_kv(self, phys_block_ids: list[int], cached_len: int):
         """
         从 block tensor 重建前缀 KV，返回 DynamicCache（供 HF model forward 作为 past_key_values）。
 
         返回的 DynamicCache 包含 cached_len 个 token 的 KV，形状：
-            key_cache[l]: [1, num_kv_heads, cached_len, head_dim]
+            key_cache[li]: [1, num_kv_heads, cached_len, head_dim]
         只在 dry_run=False 路径使用（dry_run 下无 GPU tensor）。
         """
         if self._dry_run:
@@ -689,10 +689,10 @@ class KVCacheManager:
 
         from transformers import DynamicCache
         cache = DynamicCache()
-        for l in range(self.num_layers):
+        for li in range(self.num_layers):
             k_tensor = torch.zeros(
                 1, self.num_kv_heads, cached_len, self.head_dim,
-                device=self.device, dtype=self.k_cache[l].dtype,
+                device=self.device, dtype=self.k_cache[li].dtype,
             )
             v_tensor = torch.zeros_like(k_tensor)
             for blk_idx, phys_blk in enumerate(phys_block_ids):
@@ -702,9 +702,9 @@ class KVCacheManager:
                 if n <= 0:
                     break
                 # k_cache[l][phys_blk, :n]: [n, kv_heads, head_dim] → [1, kv_heads, n, head_dim]
-                k_tensor[0, :, start:end, :] = self.k_cache[l][phys_blk, :n].permute(1, 0, 2)
-                v_tensor[0, :, start:end, :] = self.v_cache[l][phys_blk, :n].permute(1, 0, 2)
-            cache.update(k_tensor, v_tensor, l)
+                k_tensor[0, :, start:end, :] = self.k_cache[li][phys_blk, :n].permute(1, 0, 2)
+                v_tensor[0, :, start:end, :] = self.v_cache[li][phys_blk, :n].permute(1, 0, 2)
+            cache.update(k_tensor, v_tensor, li)
         return cache
 
     def prefix_cache_size(self) -> int:

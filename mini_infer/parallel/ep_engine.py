@@ -27,14 +27,13 @@ from ..modeling.moe_layer import (
     EPMoELayer,
     GroupedExpertMetadata,
     MoELayer,
+    _validate_comm_mode,
+    _validate_expert_exec_mode,
     build_grouped_expert_metadata_from_local_counts,
     build_grouped_local_expert_counts,
     build_packed_control_plane,
     shard_moe_state_dict,
-    _validate_comm_mode,
-    _validate_expert_exec_mode,
 )
-
 
 _DTYPE_MAP = {
     "float16": torch.float16,

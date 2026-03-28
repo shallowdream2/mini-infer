@@ -100,7 +100,7 @@ class PPEngine:
         dtype = _resolve_torch_dtype(config.dtype)
         # device_map="balanced"：HF accelerate 将层均匀分配到所有可用 GPU
         # Qwen2.5-7B（28层）在 2×RTX 4090 上：每卡约 14 层，每卡 ~8 GB 权重
-        print(f"PPEngine: 使用 device_map='balanced' 加载模型到 2 块 GPU (Pipeline Parallel) ...")
+        print("PPEngine: 使用 device_map='balanced' 加载模型到 2 块 GPU (Pipeline Parallel) ...")
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
             torch_dtype=dtype,
@@ -115,7 +115,7 @@ class PPEngine:
         if hasattr(self.model, "hf_device_map"):
             for k, v in list(self.model.hf_device_map.items())[:5]:
                 print(f"  {k}: {v}")
-            print(f"  ...")
+            print("  ...")
 
     def generate(self, prompts: list[str], max_new_tokens: int = 128) -> list[str]:
         """

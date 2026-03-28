@@ -22,11 +22,11 @@ import time
 import torch
 from transformers import AutoConfig
 
+from mini_infer.cache.kv_cache import KVCacheManager
 from mini_infer.core.config import EngineConfig
 from mini_infer.core.request import Request, RequestState, SamplingParams
-from mini_infer.runtime.engine import LLMEngine
-from mini_infer.cache.kv_cache import KVCacheManager
 from mini_infer.modeling.model_runner import ModelRunner
+from mini_infer.runtime.engine import LLMEngine
 
 # --------------------------------------------------------------------------- #
 DEFAULT_PROMPTS = [

@@ -1102,7 +1102,6 @@ class EPMoELayer(nn.Module):
         layout = None
         leading_shape: tuple[int, ...] = ()
 
-        send_counts = torch.zeros(world_size, dtype=torch.int64, device=device)
         send_hidden = torch.empty((0, self.hidden_size), dtype=hidden_dtype, device=device)
         send_expert_ids = torch.empty((0,), dtype=torch.int64, device=device)
 
@@ -1115,7 +1114,6 @@ class EPMoELayer(nn.Module):
             leading_shape = packed_source_context.leading_shape
             route = packed_source_context.route
             layout = packed_source_context.layout
-            send_counts = layout.send_counts.to(device=device, dtype=torch.int64)
             send_hidden = packed_source_context.dispatched_x.contiguous()
             send_expert_ids = layout.expert_ids.contiguous()
 

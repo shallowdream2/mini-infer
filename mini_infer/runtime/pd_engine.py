@@ -20,12 +20,17 @@ Phase 15：PDEngine — PD 解耦协调层。
 
 from __future__ import annotations
 
-import time
 import multiprocessing as _mp
+import time
 from uuid import uuid4
 
 from ..core.config import EngineConfig
-from .pd_worker import DecodeResult, PrefillRequest, run_decode_worker, run_prefill_worker
+from .pd_worker import (
+    DecodeResult,
+    PrefillRequest,
+    run_decode_worker,
+    run_prefill_worker,
+)
 
 # CUDA 不兼容 fork，必须使用 spawn（Linux 默认 fork 会导致 CUDA 死锁）
 _ctx = _mp.get_context("spawn")
