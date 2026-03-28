@@ -28,7 +28,12 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
-from flash_attn import flash_attn_with_kvcache
+
+try:
+    from flash_attn import flash_attn_with_kvcache
+    _FLASH_ATTN_AVAILABLE = True
+except ImportError:
+    _FLASH_ATTN_AVAILABLE = False
 
 if TYPE_CHECKING:
     from .kv_cache import KVCacheManager
@@ -95,6 +100,11 @@ def paged_decode_attention(
 
     副作用：k_new/v_new 被 flash_attn in-place 写入 k_cache/v_cache 的对应位置。
     """
+    if not _FLASH_ATTN_AVAILABLE:
+        raise ImportError(
+            "flash_attn is required for PagedAttention. "
+            "Install with: pip install 'flash-attn>=2.5.0' --no-build-isolation"
+        )
     head_dim = q.shape[-1]
     softmax_scale = 1.0 / math.sqrt(head_dim)
     return flash_attn_with_kvcache(
