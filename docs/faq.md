@@ -33,10 +33,6 @@ Makefile 默认使用 `conda run -n ai-infra`，外部用户可以通过 `PYTHON
 当前主要验证过 Qwen2.5 系列（0.5B / 1.5B / 7B）和 DeepSeek-V2-Lite（Phase 14 MLA）。
 架构参数（`num_hidden_layers` / `num_kv_heads` / `head_dim`）需在 `EngineConfig` 中明确指定。
 
-### 7B 模型路径为什么不用 snapshot 子目录？
-
-Qwen2.5-7B-Instruct 的 HuggingFace 缓存目录中，snapshot 子目录的部分 shard 软链接缺失，需使用根目录路径。
-
 ### 如何防止 transformers 联网检查？
 
 设置环境变量：
@@ -56,6 +52,20 @@ export HF_HUB_OFFLINE=1
 ### Triton kernel（Phase 6.5 / 12.5）有接入主推理链路吗？
 
 没有。两个 Triton kernel 都是**独立实验性实现**，通过各自的 benchmark 脚本验证，不替换主链路的 `flash_attn`。
+
+Phase 6.5 的 Triton decode attention kernel 在 seq=4096 时比 `flash_attn` 慢约 5.7×，原因是 flash_attn 有高度优化的 CUDA 实现。Phase 12.5 的 Flash Decoding（split-K）专门解决长序列 decode 下 SM 利用率低（9%）的问题，达到 3.31× vs 标准 Triton 单块，但接入主链路需要更完整的 shape dispatch，当前保留为参考实现。
+
+### Chunked Prefill 和 Prefix Caching 能同时开吗？
+
+可以。调度器先匹配 prefix cache，命中的 block 跳过 prefill；未命中的部分按 `chunk_size` 拆分投送。两者不冲突，共同作用于降低首 token 延迟。
+
+### Preemption 是如何触发的？
+
+当 KV block pool 不足以容纳新请求时，调度器选择最低优先级的 running 请求，将其 KV cache swap 到 CPU，释放 GPU block 给更高优先级请求。被抢占的请求进入 swapped 队列，GPU 资源充足时重新加载（swap-in）继续 decode。
+
+### 多请求并发时，decode batch 是怎么组的？
+
+`LLMEngine.step()` 每次把所有 running 状态的请求合进一个 `decode_batch`，用向量化 KV gather 同时 forward。不同请求的 KV cache 存在不同的 block，通过 `block_table` 索引，不需要 padding 到同一长度。
 
 ### SpecEngine / PDEngine / TPEngine 和 LLMEngine 是什么关系？
 
