@@ -60,14 +60,12 @@ curl http://localhost:8000/healthz   # → {"status":"ok","model":"dry",...}
 | **CUDA Graph**（decode_batch 静态捕获） | 1.5B bs=1 decode 延迟 **−28.9%** |
 | **Flash Decoding**（Triton split-K） | seq=4096 延迟 **3.31×** vs 标准 Triton，SM 利用率 9%→103% |
 | **Tensor Parallelism**（NCCL all-reduce，Megatron-LM 风格） | TP=2 greedy 输出与单卡**完全一致**（见注 ¹） |
-| **MLA**（DeepSeek-V2/V3 架构） | latent cache 体积 **−56.25%** vs GQA |
-| **MoE Expert Parallelism**（Grouped Local Execution） | EP grouped / dense = **2.500×** |
 
 **原型实现（correctness-first，有明确边界限制）**
 
 | 技术 | 关键数据 |
 |------|---------|
-| **W8A8 量化**（per-channel int8 + mixed fallback） | 权重显存 **−32.4%**，greedy match 71.8%（见注 ²） |
+|
 | **PD 解耦**（同机双进程） | TTFT 三段分解：prefill 12.3ms / transfer ≈14.7ms / decode 519ms |
 
 完整 benchmark 数据与复现命令见 [docs/benchmarks.md](docs/benchmarks.md)。
@@ -157,9 +155,6 @@ graph TD
 | Flash Decoding（Triton split-K） | 🔬 独立实验 | 3.31× vs 标准 Triton，SM 9%→103% |
 | Triton decode attention kernel | 🔬 独立实验 | 对比 flash_attn，未接入主链路 |
 | Tensor Parallelism（NCCL all-reduce） | 🔬 独立实验 | greedy 输出与单卡一致（正确性验证） |
-| MLA（DeepSeek-V2/V3 latent cache） | 🔬 独立实验 | cache 体积 −56.25% vs GQA |
-| MoE Expert Parallelism（synthetic workload） | 🔬 独立实验 | EP grouped / dense = 2.500× |
-| W8A8 量化（per-channel int8） | 🔧 原型 | 显存 −32.4%，greedy match 71.8% |
 | PD 解耦（同机双进程） | 🔧 原型 | TTFT 三段分解（prefill/transfer/decode） |
 
 > ✅ 主链路：接入完整 serving 路径，可通过 HTTP API 端对端验证
@@ -175,9 +170,9 @@ mini_infer/
 ├─ core/        # EngineConfig、Request、SamplingParams
 ├─ runtime/     # LLMEngine、Scheduler、AsyncEngine、SpecEngine、PDEngine
 ├─ cache/       # KVCacheManager（BlockTable + Prefix Cache）
-├─ modeling/    # ModelRunner、量化、MLA、MoE
+├─ modeling/    # ModelRunner
 ├─ kernels/     # PagedAttention、Triton decode、Flash Decoding
-├─ parallel/    # TP、EP、Replica、PP
+├─ parallel/    # TP、Replica、PP
 └─ serving/     # FastAPI server、OpenAI schema
 
 benchmarks/     # 每项能力对应一个 benchmark 脚本（21 个）
@@ -194,7 +189,7 @@ tests/          # 287 collected items（含参数化展开），大多数支持 
 |------|------|
 | [docs/architecture.md](docs/architecture.md) | 包结构、模块说明、请求生命周期 |
 | [docs/benchmarks.md](docs/benchmarks.md) | 所有能力的 benchmark 数据与复现命令 |
-| [docs/faq.md](docs/faq.md) | 常见问题：安装、环境、CUDA Graph / W8A8 开关 |
+| [docs/faq.md](docs/faq.md) | 常见问题：安装、环境、CUDA Graph |
 | [docs/roadmap.md](docs/roadmap.md) | 后续扩展方向与已知 gap |
 
 ---
@@ -205,8 +200,7 @@ tests/          # 287 collected items（含参数化展开），大多数支持 
 |------|-----------|------|
 | **目标** | 从零实现并测量关键推理机制 | 生产级：高吞吐、多模型、SLO 保障 |
 | **PagedAttention** | 与 vLLM 同路线（flash_attn block_table） | 相同路线，更成熟 |
-| **量化** | W8A8 手工实现，greedy match 71.8% | PTQ / AWQ / GPTQ 完整工具链 |
-| **模型覆盖** | Qwen2.5 / DeepSeek-V2（synthetic MoE） | 数十种架构，自动适配 |
+| **模型覆盖** | Qwen2.5 / DeepSeek-V2 | 数十种架构，自动适配 |
 | **调度器** | 手工实现，四队列 + chunked prefill | 完整 SLO、KV 共享感知 |
 | **部署** | 单机原型 | K8s、多机 RDMA、完整监控 |
 
