@@ -60,19 +60,16 @@ curl http://localhost:8000/healthz   # → {"status":"ok","model":"dry",...}
 | **CUDA Graph**（decode_batch 静态捕获） | 1.5B bs=1 decode 延迟 **−28.9%** |
 | **Flash Decoding**（Triton split-K） | seq=4096 延迟 **3.31×** vs 标准 Triton，SM 利用率 9%→103% |
 | **Tensor Parallelism**（NCCL all-reduce，Megatron-LM 风格） | TP=2 greedy 输出与单卡**完全一致**（见注 ¹） |
+| **PD 解耦**（同机双进程） | TTFT 三段分解：prefill 12.3ms / transfer ≈14.7ms / decode 519ms |
 
 **原型实现（correctness-first，有明确边界限制）**
 
-| 技术 | 关键数据 |
-|------|---------|
-|
-| **PD 解耦**（同机双进程） | TTFT 三段分解：prefill 12.3ms / transfer ≈14.7ms / decode 519ms |
 
 完整 benchmark 数据与复现命令见 [docs/benchmarks.md](docs/benchmarks.md)。
 
-| 主线吞吐演进 | MoE EP 吞吐演进 |
+| 主线吞吐演进 | Chunked Prefill ITL |
 |:-----------:|:--------------:|
-| ![throughput](assets/charts/01_throughput_evolution.png) | ![moe_ep](assets/charts/03_moe_ep_evolution.png) |
+| ![throughput](assets/charts/01_throughput_evolution.png) | ![chunked_prefill](assets/charts/05_chunked_prefill.png) |
 
 | Flash Decoding（seq_len sweep） | CUDA Graph decode 延迟 |
 |:-------------------------------:|:---------------------:|
@@ -80,8 +77,6 @@ curl http://localhost:8000/healthz   # → {"status":"ok","model":"dry",...}
 
 > ¹ **TP 说明**：1.5B 模型规模下，2 卡 NCCL all-reduce 通信开销超过计算节省，吞吐未提升；当前验收结论为 greedy 输出与单卡完全一致（正确性已验证）。TP 适用于单卡显存不足时的大模型横向扩展。
 >
-> ² **W8A8 说明**：decode 路径受限于 `torch._int_mm` 小 M 瓶颈，退回 FP16 mixed fallback（显存节省有效，decode 速度无明显提升）；greedy match 71.8% 为 correctness-first 实现，未做 PTQ/AWQ 校准。
-
 ---
 
 ## 快速开始
@@ -96,8 +91,8 @@ mini-infer-serve --dry-run --port 8000
 # 真实模型（需要 Qwen2.5-7B-Instruct）
 mini-infer-serve --model /path/to/Qwen2.5-7B --port 8000
 
-# 开启 CUDA Graph + W8A8 量化
-mini-infer-serve --model /path/to/Qwen2.5-7B --use-cuda-graph --quant-mode w8a8 --port 8000
+# 开启 CUDA Graph
+mini-infer-serve --model /path/to/Qwen2.5-7B --use-cuda-graph  --port 8000
 ```
 
 ```bash
@@ -121,11 +116,9 @@ graph TD
     C --> F["ModelRunner\nprefill + decode_batch"]
     F --> G["PagedAttention\nflash_attn block_table"]
     F --> H["CUDA Graph\ndecode replay"]
-    F --> I["QuantLinear\nW8A8 / mixed fallback"]
 
     subgraph dist ["分布式扩展"]
         J["TPEngine\nNCCL all-reduce"]
-        K["EPEngine\nMoE all-to-all"]
     end
 
     subgraph algo ["算法扩展"]
