@@ -1,6 +1,6 @@
 # mini-infer
 
-**LLM inference engine built from scratch** — paged KV cache, continuous batching, chunked prefill, prefix caching, speculative decoding, CUDA graph, tensor parallelism, MoE expert parallelism, and OpenAI-compatible HTTP serving. Each mechanism has a dedicated benchmark with quantitative results. Core serving path reaches **100% of HF baseline throughput** at batch=8; concurrent HTTP throughput scales **3.9× (1→8 clients, 55.7→219.1 tok/s)**. Ships with dry-run mode (no model weights needed), `/healthz`, Docker, and CI.
+**LLM inference engine built from scratch** — paged KV cache, continuous batching, chunked prefill, prefix caching, speculative decoding, CUDA graph, tensor parallelism, and OpenAI-compatible HTTP serving. Each mechanism has a dedicated benchmark with quantitative results. Core serving path reaches **100% of HF baseline throughput** at batch=8; concurrent HTTP throughput scales **3.9× (1→8 clients, 55.7→219.1 tok/s)**. Ships with dry-run mode (no model weights needed), `/healthz`, Docker, and CI.
 
 > 从零实现的 LLM 推理引擎。核心 serving 路径（PagedAttention + Continuous Batching + OpenAI HTTP API）在 Qwen2.5-7B 达到 HF Transformers **100% 吞吐**，支持 `--dry-run` 无权重启动验证。
 
@@ -105,56 +105,6 @@ Python 完整示例（streaming / 多轮对话）见 [`examples/openai_client.py
 
 ---
 
-## 架构
-
-```mermaid
-graph TD
-    A["HTTP / CLI 请求"] --> B["AsyncEngine\n后台 step loop"]
-    B --> C["LLMEngine\nContinuous Batching 主循环"]
-    C --> D["Scheduler\nwaiting / running / swapped / prefilling"]
-    C --> E["KVCacheManager\nBlockTable + FreeBlockPool + Prefix Cache"]
-    C --> F["ModelRunner\nprefill + decode_batch"]
-    F --> G["PagedAttention\nflash_attn block_table"]
-    F --> H["CUDA Graph\ndecode replay"]
-
-    subgraph dist ["分布式扩展"]
-        J["TPEngine\nNCCL all-reduce"]
-    end
-
-    subgraph algo ["算法扩展"]
-        L["SpecEngine\ndraft + target"]
-        M["PDEngine\nPrefill/Decode split"]
-    end
-
-    C --> dist
-    C --> algo
-```
-
-详细模块说明见 [docs/architecture.md](docs/architecture.md)。
-
----
-
-## 能力状态
-
-| 能力 | 状态 | 关键数据 |
-|------|------|---------|
-| Paged KV Cache + Continuous Batching | ✅ 主链路 | 主推理路径核心 |
-| Chunked Prefill | ✅ 主链路 | ITL spike −57%–67% |
-| Prefix Caching（block-level hash + LRU） | ✅ 主链路 | TTFT −22% |
-| True PagedAttention（flash_attn block_table） | ✅ 主链路 | batch=8 达到 HF **100%** |
-| OpenAI Chat Completions HTTP API | ✅ 主链路 | SSE streaming / non-streaming |
-| Speculative Decoding（0.5B draft + 7B target） | 🔬 独立实验 | acceptance 55.85%（SpecEngine，未接入 serve CLI） |
-| CUDA Graph（decode_batch 静态捕获） | 🔬 独立实验 | decode 延迟 −28.9%（`--use-cuda-graph` 实验开关） |
-| Flash Decoding（Triton split-K） | 🔬 独立实验 | 3.31× vs 标准 Triton，SM 9%→103% |
-| Triton decode attention kernel | 🔬 独立实验 | 对比 flash_attn，未接入主链路 |
-| Tensor Parallelism（NCCL all-reduce） | 🔬 独立实验 | greedy 输出与单卡一致（正确性验证） |
-| PD 解耦（同机双进程） | 🔧 原型 | TTFT 三段分解（prefill/transfer/decode） |
-
-> ✅ 主链路：接入完整 serving 路径，可通过 HTTP API 端对端验证
-> 🔬 独立实验：独立 benchmark 脚本，有量化数据，未接入主 serving 链路
-> 🔧 原型：功能已实现，correctness-first，有边界限制（见注 ¹²）
-
----
 
 ## 目录结构
 
