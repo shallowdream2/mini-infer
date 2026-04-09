@@ -25,22 +25,6 @@ curl http://localhost:8000/healthz   # → {"status":"ok","model":"dry",...}
 
 ---
 
-## 如何阅读这个仓库
-
-5 个文件覆盖核心推理机制，建议按序阅读：
-
-| 文件 | 内容 |
-|------|------|
-| [`mini_infer/cache/kv_cache.py`](mini_infer/cache/kv_cache.py) | Paged KV Cache：BlockTable、FreeBlockPool、prefix cache LRU eviction |
-| [`mini_infer/runtime/scheduler.py`](mini_infer/runtime/scheduler.py) | 四队列调度器：waiting / running / swapped / prefilling，preemption，chunked prefill |
-| [`mini_infer/runtime/async_engine.py`](mini_infer/runtime/async_engine.py) | Continuous batching：后台 step loop + asyncio.Queue，HTTP 请求合并入同一 decode_batch |
-| [`mini_infer/serving/server.py`](mini_infer/serving/server.py) | OpenAI Chat Completions HTTP API：SSE streaming、non-streaming、`/healthz` |
-| [`mini_infer/parallel/tp_engine.py`](mini_infer/parallel/tp_engine.py) | Tensor Parallelism：NCCL all-reduce，Megatron-LM 风格列/行并行 |
-
-分布式 / 量化扩展另见 [`mini_infer/modeling/quantization.py`](mini_infer/modeling/quantization.py)、[`mini_infer/parallel/ep_engine.py`](mini_infer/parallel/ep_engine.py)。
-
----
-
 ## 核心成果
 
 **主 serving 路径（`mini-infer-serve` 默认启动）**
