@@ -21,3 +21,8 @@ htmlcov/
 .codex/
 CLAUDE.md
 CODEX.md
+
+# MoE / EP GitHub 不再跟踪
+mini_infer/modeling/moe_layer.py
+mini_infer/modeling/moe_model.py
+mini_infer/parallel/ep_engine.py
