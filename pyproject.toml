@@ -88,6 +88,9 @@ include = ["mini_infer*"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 asyncio_mode = "strict"
+markers = [
+    "real_model: 需要真实模型权重（用 --model /path/to/model 指定）",
+]
 filterwarnings = [
     "ignore:builtin type swigvarlink has no __module__ attribute:DeprecationWarning",
     "ignore:builtin type SwigPyPacked has no __module__ attribute:DeprecationWarning",
