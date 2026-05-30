@@ -71,6 +71,27 @@ def _resolve_torch_dtype(dtype: str) -> torch.dtype:
     return mapping[dtype]
 
 
+def _validate_runtime_device(device: str) -> None:
+    """在真实模型加载前检查目标设备是否可用。"""
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError("配置要求 CUDA 设备，但当前环境未检测到可用 GPU。")
+    if device == "mps":
+        mps_backend = getattr(torch.backends, "mps", None)
+        if mps_backend is None or not torch.backends.mps.is_available():
+            raise RuntimeError("配置要求 MPS 设备，但当前 PyTorch 未检测到可用 MPS 后端。")
+
+
+def _load_model_kwargs(device: str, dtype: torch.dtype) -> dict:
+    """为不同设备生成 from_pretrained 参数。"""
+    kwargs = {
+        "torch_dtype": dtype,
+        "trust_remote_code": True,
+    }
+    if device.startswith("cuda"):
+        kwargs["device_map"] = device
+    return kwargs
+
+
 def _sample_token(logits: torch.Tensor, params: SamplingParams) -> int:
     """从最后一个位置的 logits 采样下一个 token，支持 greedy（temperature=0）和 top-p。"""
     if params.temperature == 0.0:
@@ -115,8 +136,7 @@ class ModelRunner:
         else:
             from transformers import AutoModelForCausalLM, AutoTokenizer
 
-            if config.device.startswith("cuda") and not torch.cuda.is_available():
-                raise RuntimeError("配置要求 CUDA 设备，但当前环境未检测到可用 GPU。")
+            _validate_runtime_device(config.device)
 
             tokenizer_name = config.tokenizer_name if config.tokenizer_name is not None else config.model_name
             self.tokenizer = AutoTokenizer.from_pretrained(
@@ -130,13 +150,13 @@ class ModelRunner:
             self.eos_token_id = eos_id if eos_id is not None else -1
 
             dtype = _resolve_torch_dtype(config.dtype)
-            # 使用 device_map 直接加载到目标 GPU，避免 CPU 中转导致的峰值显存 ×2
+            # CUDA 使用 device_map 直接放置；CPU 默认加载；MPS 先加载到 CPU 再迁移。
             self.model = AutoModelForCausalLM.from_pretrained(
                 config.model_name,
-                torch_dtype=dtype,
-                trust_remote_code=True,
-                device_map=config.device,
+                **_load_model_kwargs(config.device, dtype),
             )
+            if config.device == "mps":
+                self.model.to("mps")
             self.model.eval()
 
             # Phase 16：W8A8 量化（quant_mode="w8a8" 时原地替换 MLP 线性层）

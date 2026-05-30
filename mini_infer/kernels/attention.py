@@ -28,6 +28,7 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -36,7 +37,7 @@ except ImportError:
     _FLASH_ATTN_AVAILABLE = False
 
 if TYPE_CHECKING:
-    from .kv_cache import KVCacheManager
+    from ..cache.kv_cache import KVCacheManager
 
 
 class PagedDecodeContext:
@@ -100,10 +101,9 @@ def paged_decode_attention(
 
     副作用：k_new/v_new 被 flash_attn in-place 写入 k_cache/v_cache 的对应位置。
     """
-    if not _FLASH_ATTN_AVAILABLE:
-        raise ImportError(
-            "flash_attn is required for PagedAttention. "
-            "Install with: pip install 'flash-attn>=2.5.0' --no-build-isolation"
+    if not _should_use_flash_attn(q):
+        return sdpa_paged_decode_attention(
+            q, k_new, v_new, k_cache, v_cache, block_table, cache_seqlens
         )
     head_dim = q.shape[-1]
     softmax_scale = 1.0 / math.sqrt(head_dim)
@@ -118,6 +118,126 @@ def paged_decode_attention(
         causal=True,
         softmax_scale=softmax_scale,
     )
+
+
+def _should_use_flash_attn(q: torch.Tensor) -> bool:
+    """CUDA 上优先使用 flash-attn；CPU/MPS 或未安装 flash-attn 时降级到 SDPA。"""
+    return q.is_cuda and _FLASH_ATTN_AVAILABLE
+
+
+def _repeat_kv_for_gqa(x: torch.Tensor, num_q_heads: int) -> torch.Tensor:
+    """把 GQA/MQA 的 KV heads repeat 到 query heads，输入输出均为 [B, H, S, D]。"""
+    num_kv_heads = x.shape[1]
+    if num_kv_heads == num_q_heads:
+        return x
+    if num_q_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"num_q_heads={num_q_heads} 必须能被 num_kv_heads={num_kv_heads} 整除"
+        )
+    return x.repeat_interleave(num_q_heads // num_kv_heads, dim=1)
+
+
+def _write_new_kv_to_paged_cache(
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+) -> None:
+    """SDPA fallback 中模拟 flash_attn_with_kvcache 的 in-place KV 写入副作用。"""
+    block_size = k_cache.shape[1]
+    batch_size = k_new.shape[0]
+    for b in range(batch_size):
+        token_pos = int(cache_seqlens[b].item())
+        block_idx = token_pos // block_size
+        slot_idx = token_pos % block_size
+        phys_block = int(block_table[b, block_idx].item())
+        k_cache[phys_block, slot_idx].copy_(k_new[b, 0])
+        v_cache[phys_block, slot_idx].copy_(v_new[b, 0])
+
+
+def _gather_paged_kv_for_sdpa(
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    从 paged cache gather 出连续 K/V。
+
+    返回:
+        k_batch/v_batch: [B, H_kv, max_len, D]
+        attn_mask:       [B, 1, 1, max_len]，True 表示有效 token
+    """
+    batch_size = block_table.shape[0]
+    block_size = k_cache.shape[1]
+    seq_lens = [int(x.item()) + 1 for x in cache_seqlens]
+    max_len = max(seq_lens)
+
+    k_batch = torch.zeros(
+        batch_size,
+        k_cache.shape[2],
+        max_len,
+        k_cache.shape[3],
+        device=k_cache.device,
+        dtype=k_cache.dtype,
+    )
+    v_batch = torch.zeros_like(k_batch)
+    attn_mask = torch.zeros(
+        batch_size, 1, 1, max_len, device=k_cache.device, dtype=torch.bool
+    )
+
+    for b, seq_len in enumerate(seq_lens):
+        attn_mask[b, :, :, :seq_len] = True
+        for token_pos in range(seq_len):
+            block_idx = token_pos // block_size
+            slot_idx = token_pos % block_size
+            phys_block = int(block_table[b, block_idx].item())
+            k_batch[b, :, token_pos, :] = k_cache[phys_block, slot_idx]
+            v_batch[b, :, token_pos, :] = v_cache[phys_block, slot_idx]
+
+    return k_batch, v_batch, attn_mask
+
+
+def sdpa_paged_decode_attention(
+    q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """
+    CPU/MPS fallback：用 PyTorch SDPA 实现 paged decode attention。
+
+    这个路径保持与 flash_attn_with_kvcache 相同的关键 contract：
+      - 输入 q/k_new/v_new 为 [batch, 1, heads, head_dim]
+      - 先把 k_new/v_new 写入 paged KV cache
+      - 返回 [batch, 1, num_q_heads, head_dim]
+
+    由于输入 K/V 只包含历史 token + 当前 token，不包含未来 token，因此 SDPA 不再开启
+    is_causal，避免 q_len=1 时 causal mask 只保留第一个 key 的问题。
+    """
+    _write_new_kv_to_paged_cache(k_new, v_new, k_cache, v_cache, block_table, cache_seqlens)
+    k_batch, v_batch, attn_mask = _gather_paged_kv_for_sdpa(
+        k_cache, v_cache, block_table, cache_seqlens
+    )
+
+    q_sdpa = q.transpose(1, 2)  # [B, Hq, 1, D]
+    k_sdpa = _repeat_kv_for_gqa(k_batch, q_sdpa.shape[1])
+    v_sdpa = _repeat_kv_for_gqa(v_batch, q_sdpa.shape[1])
+
+    out = F.scaled_dot_product_attention(
+        q_sdpa,
+        k_sdpa,
+        v_sdpa,
+        attn_mask=attn_mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+    return out.transpose(1, 2).contiguous()
 
 
 def patch_model_for_paged_decode(

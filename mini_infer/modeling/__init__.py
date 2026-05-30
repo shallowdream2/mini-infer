@@ -6,14 +6,27 @@ from .mla_attention import (
     MLAAttentionNaive,
 )
 from .model_runner import ModelRunner
-from .moe_layer import EPMoELayer, MoELayer, shard_moe_state_dict
-from .moe_model import SyntheticMoEConfig, SyntheticMoEModel
 from .quantization import QuantLinear, QuantMode, quantize_model
 
 __all__ = [
     "ModelRunner",
     "QuantLinear", "QuantMode", "quantize_model",
-    "MoELayer", "EPMoELayer", "shard_moe_state_dict",
-    "SyntheticMoEConfig", "SyntheticMoEModel",
     "MLAAttentionNaive", "MLAAttentionLatentCache", "MLAAttentionAbsorbed",
 ]
+
+try:
+    from .moe_layer import EPMoELayer, MoELayer, shard_moe_state_dict
+    from .moe_model import SyntheticMoEConfig, SyntheticMoEModel
+except ModuleNotFoundError as exc:
+    if exc.name not in {
+        "mini_infer.modeling.moe_layer",
+        "mini_infer.modeling.moe_model",
+    }:
+        raise
+    # MoE modules are optional in lightweight/CPU-only checkouts.
+    pass
+else:
+    __all__ += [
+        "MoELayer", "EPMoELayer", "shard_moe_state_dict",
+        "SyntheticMoEConfig", "SyntheticMoEModel",
+    ]

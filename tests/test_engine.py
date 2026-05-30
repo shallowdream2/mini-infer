@@ -12,6 +12,7 @@
 
 import pytest
 
+import mini_infer.runtime.engine as engine_mod
 from mini_infer import EngineConfig, LLMEngine
 
 
@@ -113,6 +114,34 @@ def test_real_engine_requires_256_aligned_block_size() -> None:
     config = EngineConfig(model_name="stub", dry_run=False, block_size=16)
     with pytest.raises(ValueError, match="block_size"):
         LLMEngine(config)
+
+
+def test_real_cpu_engine_allows_non_256_block_size(monkeypatch) -> None:
+    """CPU/MPS fallback 不应继承 flash-attn 的 256 对齐限制。"""
+    events: list[int] = []
+
+    class FakeModelRunner:
+        def __init__(self, config, kv_cache):
+            events.append(config.block_size)
+
+    monkeypatch.setattr(engine_mod, "ModelRunner", FakeModelRunner)
+
+    config = EngineConfig(
+        model_name="stub",
+        device="cpu",
+        dtype="float32",
+        dry_run=False,
+        block_size=16,
+        num_gpu_blocks=1,
+        num_hidden_layers=1,
+        num_kv_heads=1,
+        head_dim=1,
+    )
+
+    engine = LLMEngine(config)
+
+    assert engine.config.device == "cpu"
+    assert events == [16]
 
 
 def test_multiple_generate_calls_independent() -> None:

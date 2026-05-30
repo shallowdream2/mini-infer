@@ -9,6 +9,7 @@ class EngineConfig:
 
     model_name: str
     device: str = "cuda:0"
+    # device 支持 cuda/cuda:0、mps、cpu；CUDA 走 flash-attn，CPU/MPS 走 SDPA fallback
     dtype: str = "float16"
     max_batch_size: int = 8
     max_model_len: int = 2048
@@ -47,6 +48,13 @@ class EngineConfig:
             raise ValueError("dtype 只支持 float16、bfloat16 或 float32")
         if not self.device:
             raise ValueError("device 不能为空")
+        if not (
+            self.device == "cpu"
+            or self.device == "mps"
+            or self.device == "cuda"
+            or self.device.startswith("cuda:")
+        ):
+            raise ValueError("device 只支持 cpu、mps、cuda 或 cuda:<index>")
         if self.num_hidden_layers <= 0:
             raise ValueError("num_hidden_layers 必须大于 0")
         if self.num_kv_heads <= 0:
