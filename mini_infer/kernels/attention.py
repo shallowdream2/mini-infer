@@ -28,6 +28,7 @@ import math
 from typing import TYPE_CHECKING
 
 import torch
+import torch.nn.functional as F
 
 try:
     from flash_attn import flash_attn_with_kvcache
@@ -120,9 +121,76 @@ def paged_decode_attention(
     )
 
 
+def cpu_paged_decode_attention(
+    q: torch.Tensor,
+    k_new: torch.Tensor,
+    v_new: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    cache_seqlens: torch.Tensor,
+) -> torch.Tensor:
+    """
+    CPU / MPS 兼容的 paged decode attention，基于 PyTorch SDPA 实现。
+
+    流程：
+      1. 将新 K/V in-place 写入 block cache 对应位置
+      2. 从 block cache 按 block_table 拼装完整历史 KV（gather）
+      3. 对每个请求单独跑 SDPA（decode 时序列长度各异，无法直接 batch）
+      4. 支持 GQA（repeat_interleave 展开 KV heads）
+
+    Args / Returns: 与 paged_decode_attention 完全一致，可无缝替换。
+    """
+    batch, _, num_q_heads, head_dim = q.shape
+    num_kv_heads = k_new.shape[2]
+    block_size = k_cache.shape[1]
+    device = q.device
+
+    outputs: list[torch.Tensor] = []
+    for b in range(batch):
+        seq_len = int(cache_seqlens[b].item())  # 写入前的历史长度
+        total_len = seq_len + 1                 # 写入新 token 后
+
+        # 1. 写新 K/V 到 cache（in-place，与 flash_attn_with_kvcache 行为一致）
+        write_block = int(block_table[b, seq_len // block_size].item())
+        write_pos = seq_len % block_size
+        k_cache[write_block, write_pos] = k_new[b, 0]
+        v_cache[write_block, write_pos] = v_new[b, 0]
+
+        # 2. Gather 完整 KV：[total_len, num_kv_heads, head_dim]
+        num_blocks_needed = math.ceil(total_len / block_size)
+        k_gathered = torch.empty(total_len, num_kv_heads, head_dim, dtype=k_cache.dtype, device=device)
+        v_gathered = torch.empty(total_len, num_kv_heads, head_dim, dtype=v_cache.dtype, device=device)
+        for bl in range(num_blocks_needed):
+            phys = int(block_table[b, bl].item())
+            start = bl * block_size
+            end = min(start + block_size, total_len)
+            k_gathered[start:end] = k_cache[phys, : end - start]
+            v_gathered[start:end] = v_cache[phys, : end - start]
+
+        # 3. SDPA：q/k/v → [1, num_heads, seq, head_dim]
+        q_b = q[b].permute(1, 0, 2).unsqueeze(0)          # [1, num_q_heads, 1, head_dim]
+        k_b = k_gathered.permute(1, 0, 2).unsqueeze(0)    # [1, num_kv_heads, total_len, head_dim]
+        v_b = v_gathered.permute(1, 0, 2).unsqueeze(0)    # [1, num_kv_heads, total_len, head_dim]
+
+        # GQA 展开
+        if num_q_heads != num_kv_heads:
+            repeat = num_q_heads // num_kv_heads
+            k_b = k_b.repeat_interleave(repeat, dim=1)
+            v_b = v_b.repeat_interleave(repeat, dim=1)
+
+        # decode 时 q 只有 1 个位置，无需 causal mask
+        attn_out = F.scaled_dot_product_attention(q_b, k_b, v_b, is_causal=False)
+        # [1, num_q_heads, 1, head_dim] → [num_q_heads, head_dim]
+        outputs.append(attn_out[0, :, 0, :])
+
+    # [batch, num_q_heads, head_dim] → [batch, 1, num_q_heads, head_dim]
+    return torch.stack(outputs, dim=0).unsqueeze(1)
+
+
 def patch_model_for_paged_decode(
     model: torch.nn.Module,
-    kv_manager: KVCacheManager,
+    kv_manager: "KVCacheManager",
 ) -> PagedDecodeContext:
     """
     永久 patch Qwen2 模型的所有 attention 层，decode 时使用 paged attention。
@@ -203,12 +271,21 @@ def patch_model_for_paged_decode(
                 k_fa = k.transpose(1, 2)
                 v_fa = v.transpose(1, 2)
 
-                # 5. Paged decode attention（同时 in-place 写入 k_fa/v_fa 到 block cache）
-                attn_out = paged_decode_attention(
-                    q_fa, k_fa, v_fa,
-                    k_c, v_c,
-                    ctx.block_table, ctx.cache_seqlens,
-                )
+                # 5. Paged decode attention（同时 in-place 写入新 KV 到 block cache）
+                #    CUDA：flash_attn_with_kvcache；CPU/MPS：SDPA gather 路径
+                is_cuda = hidden_states.device.type == "cuda"
+                if is_cuda:
+                    attn_out = paged_decode_attention(
+                        q_fa, k_fa, v_fa,
+                        k_c, v_c,
+                        ctx.block_table, ctx.cache_seqlens,
+                    )
+                else:
+                    attn_out = cpu_paged_decode_attention(
+                        q_fa, k_fa, v_fa,
+                        k_c, v_c,
+                        ctx.block_table, ctx.cache_seqlens,
+                    )
 
                 # 6. 输出投影：[batch, 1, num_heads * head_dim] → [batch, 1, hidden_size]
                 attn_out = attn_out.reshape(bsz, q_len, -1)
