@@ -125,18 +125,32 @@ class ModelRunner:
             if self.tokenizer.pad_token_id is None and self.tokenizer.eos_token_id is not None:
                 self.tokenizer.pad_token = self.tokenizer.eos_token
 
-            # 修复 Phase 1 bug：eos_token_id or 0 在 eos_token_id=None 时静默赋 0
             eos_id = self.tokenizer.eos_token_id
             self.eos_token_id = eos_id if eos_id is not None else -1
 
             dtype = _resolve_torch_dtype(config.dtype)
-            # 使用 device_map 直接加载到目标 GPU，避免 CPU 中转导致的峰值显存 ×2
-            self.model = AutoModelForCausalLM.from_pretrained(
-                config.model_name,
-                torch_dtype=dtype,
-                trust_remote_code=True,
-                device_map=config.device,
-            )
+
+            is_cuda = config.device.startswith("cuda")
+            if is_cuda:
+                # CUDA：device_map 直接加载到目标 GPU，避免 CPU 中转导致峰值显存 ×2
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    config.model_name,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                    device_map=config.device,
+                )
+            else:
+                # CPU / MPS：不能用字符串 device_map，先加载再 .to(device)
+                # float16 在 CPU 上无原生计算支持，自动升为 bfloat16（如果支持）或 float32
+                if dtype == torch.float16:
+                    dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() or config.device == "mps" else torch.float32
+                    print(f"[CPU/MPS] float16 不支持 CPU 计算，已自动切换为 {dtype}")
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    config.model_name,
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                )
+                self.model = self.model.to(config.device)
             self.model.eval()
 
             # Phase 16：W8A8 量化（quant_mode="w8a8" 时原地替换 MLP 线性层）
