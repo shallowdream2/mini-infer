@@ -39,6 +39,41 @@ from ..modeling.model_runner import ModelRunner
 from .scheduler import Scheduler
 
 
+def _sync_cache_config_from_model(config: EngineConfig) -> None:
+    """Load model architecture metadata before allocating KV cache tensors."""
+    if config.dry_run:
+        return
+
+    from transformers import AutoConfig
+
+    hf_config = AutoConfig.from_pretrained(config.model_name, trust_remote_code=True)
+
+    num_hidden_layers = getattr(hf_config, "num_hidden_layers", None)
+    num_attention_heads = getattr(hf_config, "num_attention_heads", None)
+    num_kv_heads = getattr(hf_config, "num_key_value_heads", num_attention_heads)
+    head_dim = getattr(hf_config, "head_dim", None)
+    if head_dim is None:
+        hidden_size = getattr(hf_config, "hidden_size", None)
+        if hidden_size is not None and num_attention_heads is not None:
+            head_dim = hidden_size // num_attention_heads
+
+    missing = [
+        name
+        for name, value in (
+            ("num_hidden_layers", num_hidden_layers),
+            ("num_key_value_heads/num_attention_heads", num_kv_heads),
+            ("head_dim or hidden_size/num_attention_heads", head_dim),
+        )
+        if value is None
+    ]
+    if missing:
+        raise ValueError(f"无法从模型配置推导 KV cache 参数: {', '.join(missing)}")
+
+    config.num_hidden_layers = int(num_hidden_layers)
+    config.num_kv_heads = int(num_kv_heads)
+    config.head_dim = int(head_dim)
+
+
 class LLMEngine:
     """提供 generate 接口，实现 continuous batching + preemption 推理调度。"""
 
@@ -54,6 +89,7 @@ class LLMEngine:
                 f"block_size 必须是 256 的倍数，当前为 {config.block_size}。"
                 "CPU/MPS 路径无此限制，可使用任意 block_size（建议 16 或 32）。"
             )
+        _sync_cache_config_from_model(config)
         self.kv_cache = KVCacheManager(config=config)
         self.scheduler = Scheduler(max_batch_size=config.max_batch_size)
         self.model_runner = ModelRunner(config=config, kv_cache=self.kv_cache)

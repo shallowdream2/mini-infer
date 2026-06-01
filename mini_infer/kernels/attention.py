@@ -24,6 +24,7 @@ RoPE 策略：
 
 from __future__ import annotations
 
+import inspect
 import math
 from typing import TYPE_CHECKING
 
@@ -225,11 +226,15 @@ def patch_model_for_paged_decode(
             v_c: torch.Tensor,
             orig_fwd,
         ):
+            returns_two_values = "past_key_values" in inspect.signature(orig_fwd).parameters
+
             def patched_forward(
                 hidden_states: torch.Tensor,
                 attention_mask=None,
                 position_ids=None,
+                position_embeddings=None,
                 past_key_value=None,
+                past_key_values=None,
                 output_attentions: bool = False,
                 use_cache: bool = False,
                 cache_position=None,
@@ -237,16 +242,21 @@ def patch_model_for_paged_decode(
             ):
                 # prefill 路径：ctx.block_table 未设置，使用原始 HF forward
                 if ctx.block_table is None:
-                    return orig_fwd(
-                        hidden_states,
-                        attention_mask=attention_mask,
-                        position_ids=position_ids,
-                        past_key_value=past_key_value,
-                        output_attentions=output_attentions,
-                        use_cache=use_cache,
-                        cache_position=cache_position,
+                    call_kwargs = {
+                        "attention_mask": attention_mask,
+                        "position_ids": position_ids,
+                        "output_attentions": output_attentions,
+                        "use_cache": use_cache,
+                        "cache_position": cache_position,
                         **kwargs,
-                    )
+                    }
+                    if position_embeddings is not None:
+                        call_kwargs["position_embeddings"] = position_embeddings
+                    if past_key_values is not None:
+                        call_kwargs["past_key_values"] = past_key_values
+                    else:
+                        call_kwargs["past_key_value"] = past_key_value
+                    return orig_fwd(hidden_states, **call_kwargs)
 
                 # decode 路径：paged attention
                 bsz, q_len, _ = hidden_states.shape
@@ -257,14 +267,25 @@ def patch_model_for_paged_decode(
                 v = attn_module.v_proj(hidden_states)
 
                 # 2. reshape → [batch, num_heads, seq=1, head_dim]（HF 约定）
-                q = q.view(bsz, q_len, attn_module.num_heads, attn_module.head_dim).transpose(1, 2)
-                k = k.view(bsz, q_len, attn_module.num_key_value_heads, attn_module.head_dim).transpose(1, 2)
-                v = v.view(bsz, q_len, attn_module.num_key_value_heads, attn_module.head_dim).transpose(1, 2)
+                head_dim = int(getattr(attn_module, "head_dim", k_c.shape[-1]))
+                num_heads = getattr(attn_module, "num_heads", None)
+                if num_heads is None:
+                    num_heads = q.shape[-1] // head_dim
+                num_key_value_heads = getattr(attn_module, "num_key_value_heads", None)
+                if num_key_value_heads is None:
+                    num_key_value_heads = k.shape[-1] // head_dim
+                q = q.view(bsz, q_len, int(num_heads), head_dim).transpose(1, 2)
+                k = k.view(bsz, q_len, int(num_key_value_heads), head_dim).transpose(1, 2)
+                v = v.view(bsz, q_len, int(num_key_value_heads), head_dim).transpose(1, 2)
 
                 # 3. RoPE：cos/sin 需要覆盖到当前批次的最大 token 位置
                 #    max_kv_len 由 decode_batch() 预计算并存入 ctx（避免每层调用 .item() 同步）
-                cos, sin = attn_module.rotary_emb(v, seq_len=ctx.max_kv_len)
-                q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
+                if position_embeddings is not None:
+                    cos, sin = position_embeddings
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin)
+                else:
+                    cos, sin = attn_module.rotary_emb(v, seq_len=ctx.max_kv_len)
+                    q, k = apply_rotary_pos_emb(q, k, cos, sin, position_ids)
 
                 # 4. 转换为 flash_attn 格式：[batch, seq=1, num_heads, head_dim]
                 q_fa = q.transpose(1, 2)
@@ -291,6 +312,8 @@ def patch_model_for_paged_decode(
                 attn_out = attn_out.reshape(bsz, q_len, -1)
                 attn_out = attn_module.o_proj(attn_out)
 
+                if returns_two_values:
+                    return attn_out, None
                 return attn_out, None, None
 
             return patched_forward

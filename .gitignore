@@ -26,3 +26,5 @@ CODEX.md
 mini_infer/modeling/moe_layer.py
 mini_infer/modeling/moe_model.py
 mini_infer/parallel/ep_engine.py
+
+models/
